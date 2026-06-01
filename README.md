@@ -18,7 +18,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 - Compares `.env` with `.env.example` for missing, extra, shared, and duplicate keys
 - Reports layered overrides across actual env files, naming the winning file without exposing secret values
 - Shows framework env profiles for Next.js and Vite projects, including effective load order and missing expected files
-- Builds a value-safe repair queue for missing keys, duplicate keys, placeholders, and layered conflicts
+- Builds a value-safe repair queue for missing keys, duplicate keys, placeholders, and layered conflicts, with safe blank-key insertion for documented missing keys
 - Infers common shapes such as URL/DSN, secret, public frontend variable, bool, int, port, path, list, UUID, JSON, PEM, and provider-specific keys
 - Redacts secret-like values by default
 - Edits one value while preserving comments, order, quote style, multiline values, and adjacent formatting
@@ -72,4 +72,4 @@ fixtures/demo
 
 ## Current Status
 
-The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table, redact likely secrets, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, model Next.js and Vite env load-order profiles, suggest value-safe repair actions, and save a single edited value in the Tauri runtime. Release packaging is still intentionally deferred.
+The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table, redact likely secrets, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, model Next.js and Vite env load-order profiles, suggest value-safe repair actions, add documented missing keys as blank entries, and save a single edited value in the Tauri runtime. Release packaging is still intentionally deferred.

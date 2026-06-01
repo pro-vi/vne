@@ -25,6 +25,15 @@ export async function saveEnvValue(path: string, key: string, value: string): Pr
   return invoke<EnvFile>('save_env_value', { path, key, value });
 }
 
+export async function addEnvKey(path: string, key: string): Promise<EnvFile> {
+  if (!isTauriRuntime()) {
+    await delay(180);
+    throw new Error('Repair actions are available in the Tauri desktop app. Browser preview uses read-only sample data.');
+  }
+
+  return invoke<EnvFile>('add_env_key', { path, key });
+}
+
 export async function pickProjectDirectory(defaultPath: string): Promise<string | null> {
   if (!isTauriRuntime()) {
     return null;

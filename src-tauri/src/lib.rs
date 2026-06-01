@@ -150,11 +150,27 @@ fn save_env_value(path: String, key: String, value: String) -> Result<EnvFile, S
     Ok(parse_env_file(&path, refreshed))
 }
 
+#[tauri::command]
+fn add_env_key(path: String, key: String) -> Result<EnvFile, String> {
+    let path = PathBuf::from(path);
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let updated = append_env_key(&content, &key, "")
+        .ok_or_else(|| format!("Key `{key}` already exists or is not a valid env key"))?;
+
+    atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
+    let refreshed = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    Ok(parse_env_file(&path, refreshed))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![load_project, save_env_value])
+        .invoke_handler(tauri::generate_handler![
+            load_project,
+            save_env_value,
+            add_env_key
+        ])
         .run(tauri::generate_context!())
         .expect("error while running vne");
 }
@@ -315,6 +331,36 @@ pub fn replace_env_value(content: &str, key: &str, value: &str) -> Option<String
 
     output.push_str(&content[cursor..]);
     replaced.then_some(output)
+}
+
+pub fn append_env_key(content: &str, key: &str, value: &str) -> Option<String> {
+    if !is_valid_env_key(key)
+        || parse_env_entries(content)
+            .iter()
+            .any(|entry| entry.key == key)
+    {
+        return None;
+    }
+
+    let mut output = String::with_capacity(content.len() + key.len() + value.len() + 4);
+    output.push_str(content);
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(key);
+    output.push('=');
+    if !value.is_empty() {
+        if needs_quotes(value) {
+            output.push('"');
+            output.push_str(&escape_double_quoted_value(value));
+            output.push('"');
+        } else {
+            output.push_str(value);
+        }
+    }
+    output.push('\n');
+
+    Some(output)
 }
 
 pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
@@ -1362,6 +1408,12 @@ fn is_key_continue(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
 }
 
+fn is_valid_env_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    bytes.first().is_some_and(|first| is_key_start(*first))
+        && bytes.iter().skip(1).all(|byte| is_key_continue(*byte))
+}
+
 fn needs_quotes(value: &str) -> bool {
     value.is_empty()
         || value.contains(char::is_whitespace)
@@ -1468,6 +1520,24 @@ mod tests {
             file.entries[0].value,
             "-----BEGIN KEY-----\nnew\n-----END KEY-----"
         );
+    }
+
+    #[test]
+    fn appends_missing_key_without_rewriting_existing_content() {
+        let content = "# keep\nPORT=1420";
+        let updated = append_env_key(content, "REDIS_URL", "").unwrap();
+
+        assert_eq!(updated, "# keep\nPORT=1420\nREDIS_URL=\n");
+        let file = parse_env_file(Path::new(".env"), updated);
+        assert_eq!(file.entries[0].key, "PORT");
+        assert_eq!(file.entries[1].key, "REDIS_URL");
+        assert_eq!(file.entries[1].value, "");
+    }
+
+    #[test]
+    fn refuses_to_append_duplicate_or_invalid_keys() {
+        assert!(append_env_key("PORT=1420\n", "PORT", "").is_none());
+        assert!(append_env_key("PORT=1420\n", "1INVALID", "").is_none());
     }
 
     #[test]

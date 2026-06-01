@@ -11,8 +11,8 @@
     Search,
     ShieldCheck
   } from '@lucide/svelte';
-  import { isTauriRuntime, loadProject, pickProjectDirectory, saveEnvValue } from './lib/tauri';
-  import type { EnvEntry, EnvFile, FrameworkEnvProfile, ProjectSnapshot } from './lib/types';
+  import { addEnvKey, isTauriRuntime, loadProject, pickProjectDirectory, saveEnvValue } from './lib/tauri';
+  import type { EnvEntry, EnvFile, EnvRepairAction, FrameworkEnvProfile, ProjectSnapshot } from './lib/types';
   import { keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
   type Notice = {
@@ -119,6 +119,31 @@
     }
   }
 
+  async function applyRepairAction(action: EnvRepairAction): Promise<void> {
+    if (!canApplyRepairAction(action) || !action.filePath || !action.key) {
+      return;
+    }
+
+    notice = { kind: 'loading', message: `Adding ${action.key}...` };
+    try {
+      await addEnvKey(action.filePath, action.key);
+      const loaded = await loadProject(snapshot?.root ?? (projectPath.trim() || '.'));
+      snapshot = loaded;
+      selectedPath = action.filePath;
+      selectedKey = action.key;
+      const refreshedFile = loaded.files.find((file) => file.path === action.filePath);
+      const refreshedEntry = refreshedFile?.entries.find((entry) => entry.key === action.key);
+      editValue = refreshedEntry?.value ?? '';
+      notice = { kind: 'success', message: `${action.key} was added as a blank value.` };
+    } catch (error) {
+      notice = { kind: 'error', message: errorMessage(error) };
+    }
+  }
+
+  function canApplyRepairAction(action: EnvRepairAction): boolean {
+    return isTauriRuntime() && action.actionKind === 'add-missing-key' && Boolean(action.filePath && action.key);
+  }
+
   function displayValue(entry: EnvEntry): string {
     if (showSecrets || !entry.shape.redactedByDefault) {
       return entry.value || '(empty)';
@@ -223,6 +248,11 @@
               <li class:warning={action.severity === 'warning'}>
                 <strong>{action.title}</strong>
                 <span>{action.detail}</span>
+                {#if action.actionKind === 'add-missing-key'}
+                  <button type="button" class="mini-action" disabled={!canApplyRepairAction(action)} onclick={() => void applyRepairAction(action)}>
+                    Add blank
+                  </button>
+                {/if}
               </li>
             {/each}
           </ul>

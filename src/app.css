@@ -182,6 +182,15 @@ textarea:focus {
   padding: 0;
 }
 
+.mini-action {
+  width: fit-content;
+  min-height: 28px;
+  padding: 0 9px;
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .status-strip {
   display: flex;
   align-items: center;
