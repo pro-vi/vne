@@ -21,7 +21,7 @@
 - Secret-like values and credential-bearing URLs/DSNs are redacted by default before they reach normal display fields.
 - Repair actions include key names and file names, not raw values.
 - Layer conflict summaries name the effective file without showing competing values.
-- Save operations update one key at a time and use atomic write with permission preservation where practical.
+- Save operations update one selected key occurrence at a time and use atomic write with permission preservation where practical.
 - Blank-key repair only appends `KEY=` for a documented missing key; it refuses duplicate or invalid keys.
 - Write commands resolve the active project root and reject file paths outside that root.
 - Browser preview uses sample data and cannot save or apply repair actions.

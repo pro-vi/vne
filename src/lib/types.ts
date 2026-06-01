@@ -18,6 +18,7 @@ export interface EnvFile {
 }
 
 export interface EnvEntry {
+  id: string;
   key: string;
   value: string;
   displayValue: string;

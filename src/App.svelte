@@ -23,7 +23,7 @@
   let projectPath = '.';
   let snapshot: ProjectSnapshot | null = null;
   let selectedPath = '';
-  let selectedKey = '';
+  let selectedEntryId = '';
   let editValue = '';
   let filter = '';
   let filterInput: HTMLInputElement | null = null;
@@ -35,7 +35,7 @@
   };
 
   $: selectedFile = snapshot?.files.find((file) => file.path === selectedPath) ?? snapshot?.files[0] ?? null;
-  $: selectedEntry = selectedFile?.entries.find((entry) => entry.key === selectedKey) ?? selectedFile?.entries[0] ?? null;
+  $: selectedEntry = selectedFile?.entries.find((entry) => entry.id === selectedEntryId) ?? selectedFile?.entries[0] ?? null;
   $: visibleEntries = selectedFile ? filterEntries(selectedFile, filter) : [];
   $: selectedValueHidden = selectedEntry ? isEntryValueHidden(selectedEntry, showSecrets) : false;
   $: selectedFileHasHiddenSecrets = Boolean(selectedFile?.entries.some((entry) => isEntryValueHidden(entry, showSecrets)));
@@ -54,7 +54,7 @@
       const loaded = await loadProject(projectPath.trim() || '.');
       snapshot = loaded;
       selectedPath = loaded.files[0]?.path ?? '';
-      selectedKey = loaded.files[0]?.entries[0]?.key ?? '';
+      selectedEntryId = loaded.files[0]?.entries[0]?.id ?? '';
       editValue = loaded.files[0]?.entries[0]?.value ?? '';
       notice = {
         kind: 'success',
@@ -92,12 +92,12 @@
   function chooseFile(file: EnvFile): void {
     selectedPath = file.path;
     const firstEntry = file.entries[0];
-    selectedKey = firstEntry?.key ?? '';
+    selectedEntryId = firstEntry?.id ?? '';
     editValue = firstEntry?.value ?? '';
   }
 
   function chooseEntry(entry: EnvEntry): void {
-    selectedKey = entry.key;
+    selectedEntryId = entry.id;
     editValue = entry.value;
   }
 
@@ -106,7 +106,7 @@
       return;
     }
 
-    const foundIndex = visibleEntries.findIndex((entry) => entry.key === selectedKey);
+    const foundIndex = visibleEntries.findIndex((entry) => entry.id === selectedEntryId);
     const currentIndex = foundIndex === -1 ? (delta > 0 ? -1 : 0) : foundIndex;
     const nextIndex = Math.min(Math.max(currentIndex + delta, 0), visibleEntries.length - 1);
     chooseEntry(visibleEntries[nextIndex]);
@@ -149,7 +149,13 @@
 
     notice = { kind: 'loading', message: `Saving ${selectedEntry.key}...` };
     try {
-      const refreshed = await saveEnvValue(snapshot?.root ?? (projectPath.trim() || '.'), selectedFile.path, selectedEntry.key, editValue);
+      const refreshed = await saveEnvValue(
+        snapshot?.root ?? (projectPath.trim() || '.'),
+        selectedFile.path,
+        selectedEntry.key,
+        selectedEntry.lineNumber,
+        editValue
+      );
       snapshot = snapshot
         ? {
             ...snapshot,
@@ -157,8 +163,8 @@
           }
         : null;
       selectedPath = refreshed.path;
-      selectedKey = selectedEntry.key;
-      const refreshedEntry = refreshed.entries.find((entry) => entry.key === selectedEntry.key);
+      const refreshedEntry = refreshed.entries.find((entry) => entry.id === selectedEntry.id);
+      selectedEntryId = refreshedEntry?.id ?? selectedEntry.id;
       editValue = refreshedEntry?.value ?? editValue;
       notice = { kind: 'success', message: `${selectedEntry.key} saved without rewriting the full file view.` };
     } catch (error) {
@@ -178,9 +184,9 @@
       const loaded = await loadProject(root);
       snapshot = loaded;
       selectedPath = action.filePath;
-      selectedKey = action.key;
       const refreshedFile = loaded.files.find((file) => file.path === action.filePath);
       const refreshedEntry = refreshedFile?.entries.find((entry) => entry.key === action.key);
+      selectedEntryId = refreshedEntry?.id ?? '';
       editValue = refreshedEntry?.value ?? '';
       notice = { kind: 'success', message: `${action.key} was added as a blank value.` };
     } catch (error) {
@@ -414,7 +420,7 @@
             {@const status = keyStatus(selectedFile, entry, snapshot?.comparison ?? null)}
             <button
               class="key-row"
-              class:selected={entry.key === selectedKey}
+              class:selected={entry.id === selectedEntryId}
               class:warn={status !== 'ok'}
               data-row-index={rowIndex}
               type="button"

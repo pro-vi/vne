@@ -30,6 +30,7 @@ pub struct EnvFile {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvEntry {
+    pub id: String,
     pub key: String,
     pub value: String,
     pub display_value: String,
@@ -143,12 +144,13 @@ fn save_env_value(
     root: String,
     path: String,
     key: String,
+    line_number: usize,
     value: String,
 ) -> Result<EnvFile, String> {
     let path = resolve_project_file(&root, &path)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let updated = replace_env_value(&content, &key, &value)
-        .ok_or_else(|| format!("Key `{key}` was not found"))?;
+    let updated = replace_env_value_at(&content, &key, line_number, &value)
+        .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))?;
 
     atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
     let refreshed = fs::read_to_string(&path).map_err(|error| error.to_string())?;
@@ -281,6 +283,7 @@ fn parse_env_file_with_reasons(
         };
 
         entries.push(EnvEntry {
+            id: entry_id(&parsed.key, parsed.line_number),
             key: parsed.key,
             value: parsed.value,
             display_value,
@@ -312,12 +315,30 @@ fn parse_env_file_with_reasons(
 }
 
 pub fn replace_env_value(content: &str, key: &str, value: &str) -> Option<String> {
+    replace_env_entry(content, value, |parsed| parsed.key == key)
+}
+
+pub fn replace_env_value_at(
+    content: &str,
+    key: &str,
+    line_number: usize,
+    value: &str,
+) -> Option<String> {
+    replace_env_entry(content, value, |parsed| {
+        parsed.key == key && parsed.line_number == line_number
+    })
+}
+
+fn replace_env_entry<F>(content: &str, value: &str, matches_entry: F) -> Option<String>
+where
+    F: Fn(&ParsedLine) -> bool,
+{
     let mut output = String::with_capacity(content.len() + value.len());
     let mut replaced = false;
     let mut cursor = 0;
 
     for parsed in parse_env_entries(content) {
-        if parsed.key == key {
+        if matches_entry(&parsed) {
             let replacement = match parsed.quote {
                 Some('"') => escape_double_quoted_value(value),
                 Some('\'') => escape_single_quoted_value(value),
@@ -1395,6 +1416,10 @@ fn shape(
     }
 }
 
+fn entry_id(key: &str, line_number: usize) -> String {
+    format!("{key}@{line_number}")
+}
+
 fn provider_reason(upper: &str) -> Option<String> {
     let provider = if upper.starts_with("AWS_") {
         "AWS"
@@ -1611,6 +1636,7 @@ mod tests {
 
         assert_eq!(file.content, content);
         assert_eq!(file.entries.len(), 2);
+        assert_eq!(file.entries[0].id, "DATABASE_URL@2");
         assert_eq!(file.entries[0].key, "DATABASE_URL");
         assert_eq!(file.entries[0].value, "postgres://localhost/app");
         assert_eq!(file.entries[0].quote.as_deref(), Some("\""));
@@ -1641,6 +1667,18 @@ mod tests {
             updated,
             "# keep\nDATABASE_URL=\"postgres://new/app\" # local\nPORT=3000\n"
         );
+    }
+
+    #[test]
+    fn replaces_duplicate_key_by_selected_line_number() {
+        let content = "FEATURE_ENABLED=true\nFEATURE_ENABLED=false\nPORT=1420\n";
+        let updated = replace_env_value_at(content, "FEATURE_ENABLED", 2, "maybe").unwrap();
+
+        assert_eq!(
+            updated,
+            "FEATURE_ENABLED=true\nFEATURE_ENABLED=maybe\nPORT=1420\n"
+        );
+        assert!(replace_env_value_at(content, "FEATURE_ENABLED", 3, "maybe").is_none());
     }
 
     #[test]

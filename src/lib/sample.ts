@@ -206,6 +206,7 @@ function entry(
   diagnostics: string[] = []
 ) {
   return {
+    id: `${key}@${lineNumber}`,
     key,
     value,
     displayValue: redacted ? '********' : value,
