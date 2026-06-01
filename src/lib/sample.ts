@@ -169,7 +169,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         title: 'Add `STRIPE_SECRET_KEY` to .env',
         detail: '`STRIPE_SECRET_KEY` is documented in .env.example but missing from .env.',
         evidence: [],
-        mutationPreview: 'Append `STRIPE_SECRET_KEY=` to .env.',
+        mutationPreview: 'Append `STRIPE_SECRET_KEY=<value>` to .env.',
         filePath: basePath,
         key: 'STRIPE_SECRET_KEY',
         lineNumber: null,

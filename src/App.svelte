@@ -28,6 +28,7 @@
   let filter = '';
   let filterInput: HTMLInputElement | null = null;
   let showRaw = false;
+  let missingKeyDrafts: Record<string, string> = {};
   let revealedEntryRef = '';
   let revealedValue: string | null = null;
   let notice: Notice = {
@@ -178,12 +179,14 @@
       return;
     }
 
+    const value = missingKeyDraft(finding).trim();
     notice = { kind: 'loading', message: `Adding ${finding.key}...` };
     try {
       const root = snapshot?.root ?? (projectPath.trim() || '.');
-      const loaded = await addEnvKey(root, finding.filePath, finding.key);
+      const loaded = await addEnvKey(root, finding.filePath, finding.key, value);
+      deleteMissingKeyDraft(finding);
       applySnapshotSelection(loaded, finding.filePath, '', finding.key);
-      notice = { kind: 'success', message: `${finding.key} was added as a blank value.` };
+      notice = { kind: 'success', message: `${finding.key} was added and project diagnostics rescanned.` };
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
     }
@@ -245,7 +248,7 @@
   }
 
   function canAddMissingKey(finding: EnvFinding): boolean {
-    return isTauriRuntime() && isAddMissingKeyFinding(finding);
+    return isTauriRuntime() && isAddMissingKeyFinding(finding) && missingKeyDraft(finding).trim().length > 0;
   }
 
   function canInspectFinding(finding: EnvFinding): boolean {
@@ -254,6 +257,32 @@
 
   function currentProjectRoot(): string {
     return snapshot?.root ?? (projectPath.trim() || '.');
+  }
+
+  function missingKeyDraft(finding: EnvFinding): string {
+    return missingKeyDrafts[missingKeyDraftRef(finding)] ?? '';
+  }
+
+  function setMissingKeyDraft(finding: EnvFinding, value: string): void {
+    missingKeyDrafts = { ...missingKeyDrafts, [missingKeyDraftRef(finding)]: value };
+  }
+
+  function deleteMissingKeyDraft(finding: EnvFinding): void {
+    const next = { ...missingKeyDrafts };
+    delete next[missingKeyDraftRef(finding)];
+    missingKeyDrafts = next;
+  }
+
+  function missingKeyDraftRef(finding: EnvFinding): string {
+    return `${finding.filePath ?? ''}\u0000${finding.key ?? ''}`;
+  }
+
+  function missingKeyInputType(finding: EnvFinding): 'password' | 'text' {
+    const key = finding.key?.toUpperCase() ?? '';
+    const secretLike = ['SECRET', 'TOKEN', 'PASSWORD', 'API_KEY', 'PRIVATE_KEY', 'ACCESS_KEY', 'CLIENT_SECRET', 'WEBHOOK_SECRET'].some(
+      (part) => key.includes(part)
+    );
+    return secretLike ? 'password' : 'text';
   }
 
   function applySnapshotSelection(loaded: ProjectSnapshot, preferredPath: string, preferredEntryId: string, preferredKey: string): void {
@@ -432,8 +461,17 @@
                 {#if finding.mutationPreview}
                   <small class="mutation-preview">{finding.mutationPreview}</small>
                 {/if}
+                <input
+                  class="missing-key-value"
+                  type={missingKeyInputType(finding)}
+                  value={missingKeyDraft(finding)}
+                  placeholder="Value required"
+                  autocomplete="off"
+                  spellcheck="false"
+                  oninput={(event) => setMissingKeyDraft(finding, event.currentTarget.value)}
+                />
                 <button type="button" class="mini-action" disabled={!canAddMissingKey(finding)} onclick={() => void addMissingKey(finding)}>
-                  Add blank
+                  Add value
                 </button>
               </li>
             {/each}

@@ -196,14 +196,20 @@ fn save_env_value(
 }
 
 #[tauri::command]
-fn add_env_key(root: String, path: String, key: String) -> Result<ProjectSnapshot, String> {
+fn add_env_key(
+    root: String,
+    path: String,
+    key: String,
+    value: String,
+) -> Result<ProjectSnapshot, String> {
     let root_path = Path::new(&root)
         .canonicalize()
         .map_err(|error| error.to_string())?;
     let path = resolve_project_file(&root, &path)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let updated = append_env_key(&content, &key, "")
-        .ok_or_else(|| format!("Key `{key}` already exists or is not a valid env key"))?;
+    let updated = append_env_key(&content, &key, &value).ok_or_else(|| {
+        format!("Key `{key}` already exists, has an empty value, or is not a valid env key")
+    })?;
 
     atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
     snapshot_project(&root_path)
@@ -450,6 +456,7 @@ where
 
 pub fn append_env_key(content: &str, key: &str, value: &str) -> Option<String> {
     if !is_valid_env_key(key)
+        || value.trim().is_empty()
         || parse_env_entries(content)
             .iter()
             .any(|entry| entry.key == key)
@@ -1115,7 +1122,7 @@ fn build_findings(
                 ),
                 evidence: Vec::new(),
                 mutation_preview: Some(format!(
-                    "Append `{key}=` to {}.",
+                    "Append `{key}=<value>` to {}.",
                     file_label(&comparison.base_path)
                 )),
                 file_path: Some(comparison.base_path.clone()),
@@ -2047,21 +2054,26 @@ mod tests {
     }
 
     #[test]
-    fn appends_missing_key_without_rewriting_existing_content() {
+    fn appends_missing_key_value_without_rewriting_existing_content() {
         let content = "# keep\nPORT=1420";
-        let updated = append_env_key(content, "REDIS_URL", "").unwrap();
+        let updated = append_env_key(content, "REDIS_URL", "redis://localhost:6379").unwrap();
 
-        assert_eq!(updated, "# keep\nPORT=1420\nREDIS_URL=\n");
+        assert_eq!(
+            updated,
+            "# keep\nPORT=1420\nREDIS_URL=redis://localhost:6379\n"
+        );
         let file = parse_env_file(Path::new(".env"), updated);
         assert_eq!(file.entries[0].key, "PORT");
         assert_eq!(file.entries[1].key, "REDIS_URL");
-        assert_eq!(file.entries[1].value, "");
+        assert_eq!(file.entries[1].value, "redis://localhost:6379");
     }
 
     #[test]
-    fn refuses_to_append_duplicate_or_invalid_keys() {
-        assert!(append_env_key("PORT=1420\n", "PORT", "").is_none());
-        assert!(append_env_key("PORT=1420\n", "1INVALID", "").is_none());
+    fn refuses_to_append_duplicate_invalid_or_empty_keys() {
+        assert!(append_env_key("PORT=1420\n", "PORT", "1421").is_none());
+        assert!(append_env_key("PORT=1420\n", "1INVALID", "value").is_none());
+        assert!(append_env_key("PORT=1420\n", "REDIS_URL", "").is_none());
+        assert!(append_env_key("PORT=1420\n", "REDIS_URL", "   ").is_none());
     }
 
     #[test]
@@ -2356,6 +2368,7 @@ mod tests {
             dir.path().to_string_lossy().to_string(),
             env_path.to_string_lossy().to_string(),
             "REDIS_URL".to_string(),
+            "redis://localhost:6379".to_string(),
         )
         .unwrap();
         let refreshed_env = after.files.iter().find(|file| file.name == ".env").unwrap();
@@ -2364,6 +2377,13 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.key == "REDIS_URL"));
+        let refreshed_redis = refreshed_env
+            .entries
+            .iter()
+            .find(|entry| entry.key == "REDIS_URL")
+            .unwrap();
+        assert_eq!(refreshed_redis.value, "");
+        assert_eq!(refreshed_redis.display_value, "********");
         assert!(!after.findings.iter().any(|finding| {
             finding.action_kind == "add-missing-key" && finding.key.as_deref() == Some("REDIS_URL")
         }));
@@ -2469,7 +2489,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             missing_finding.mutation_preview.as_deref(),
-            Some("Append `REDIS_URL=` to .env.")
+            Some("Append `REDIS_URL=<value>` to .env.")
         );
         assert!(findings
             .iter()

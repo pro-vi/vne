@@ -46,13 +46,13 @@ export async function saveEnvValue(
   return invoke<ProjectSnapshot>('save_env_value', { root, path, key, lineNumber, value });
 }
 
-export async function addEnvKey(root: string, path: string, key: string): Promise<ProjectSnapshot> {
+export async function addEnvKey(root: string, path: string, key: string, value: string): Promise<ProjectSnapshot> {
   if (!isTauriRuntime()) {
     await delay(180);
     throw new Error('Adding missing keys is available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
-  return invoke<ProjectSnapshot>('add_env_key', { root, path, key });
+  return invoke<ProjectSnapshot>('add_env_key', { root, path, key, value });
 }
 
 export async function pickProjectDirectory(defaultPath: string): Promise<string | null> {
