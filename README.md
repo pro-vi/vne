@@ -26,6 +26,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 - Shows structured source context such as duplicate occurrence, export prefix, quote style, inline comment, and parser diagnostics
 - Supports fast key scanning with filter focus and arrow-key row movement
 - Edits one selected key occurrence while preserving comments, order, quote style, multiline values, and adjacent formatting
+- Parser/write tests cover CRLF, UTF-8 BOM, empty values, inline comments, hashes inside values, quoted values, multiline values, invalid keys, duplicates, and quote-requiring replacements
 
 ## Privacy
 

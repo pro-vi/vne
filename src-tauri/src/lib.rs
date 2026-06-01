@@ -628,6 +628,10 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
     let bytes = line_body.as_bytes();
     let mut index = 0;
 
+    if line_start == 0 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        index = 3;
+    }
+
     skip_spaces(bytes, &mut index);
     if index >= bytes.len() || bytes[index] == b'#' {
         return None;
@@ -1891,6 +1895,41 @@ mod tests {
 
         assert_eq!(file.entries[0].value, "1420");
         assert_eq!(file.entries[0].comment.as_deref(), Some("# dev server"));
+    }
+
+    #[test]
+    fn parses_dotenv_dialect_matrix_and_preserves_unrelated_bytes() {
+        let content = "\u{feff}export EMPTY=\r\nHASHED=\"abc#def\"\r\nUNQUOTED_HASH=abc#def\r\nESCAPED_HASH=abc\\#def\r\nCOMMENTED=value # trailing\r\nSINGLE='can\\'t'\r\nJSON={\"a\":1}\r\nINVALID KEY=no\r\nDUP=one\r\nDUP=two\r\nMULTILINE=\"one\r\ntwo\"\r\nNEEDS_QUOTES=plain\r\n";
+        let file = parse_env_file(Path::new(".env"), content.to_string());
+        let entry = |key: &str| {
+            file.entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("EMPTY").value, "");
+        assert!(entry("EMPTY").exported);
+        assert_eq!(entry("HASHED").value, "abc#def");
+        assert_eq!(entry("UNQUOTED_HASH").value, "abc#def");
+        assert_eq!(entry("ESCAPED_HASH").value, "abc\\#def");
+        assert_eq!(entry("COMMENTED").value, "value");
+        assert_eq!(entry("COMMENTED").comment.as_deref(), Some("# trailing"));
+        assert_eq!(entry("SINGLE").quote, Some("'".to_string()));
+        assert_eq!(entry("MULTILINE").value, "one\r\ntwo");
+        assert!(file.entries.iter().all(|entry| entry.key != "INVALID"));
+        assert_eq!(file.duplicate_keys, vec!["DUP"]);
+
+        let updated = replace_env_value_at(
+            content,
+            "NEEDS_QUOTES",
+            entry("NEEDS_QUOTES").line_number,
+            "hello world #1",
+        )
+        .unwrap();
+        assert!(updated.starts_with('\u{feff}'));
+        assert!(updated.contains("COMMENTED=value # trailing\r\n"));
+        assert!(updated.contains("NEEDS_QUOTES=\"hello world #1\"\r\n"));
     }
 
     #[test]

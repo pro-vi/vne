@@ -28,6 +28,7 @@
 - Save operations update one selected key occurrence at a time, use atomic write with permission preservation where practical, and return a fresh project snapshot so diagnostics do not stay stale after writes.
 - Blank-key repair only appends `KEY=` for a documented missing key; it refuses duplicate or invalid keys and returns a fresh project snapshot.
 - Write commands resolve the active project root and reject file paths outside that root.
+- Parser/write regression tests include CRLF, UTF-8 BOM, empty values, inline comments, hashes inside values, quoted values, multiline values, invalid keys, duplicates, and quote-requiring replacements.
 - Browser preview uses sample data and cannot save or apply safe edits.
 - The app has no accounts, telemetry, sync, hosted validation, or cloud calls for env data.
 - `scripts/security-check.sh` fails on obvious network client APIs, telemetry SDK imports, raw logging calls, updater surfaces, broad dialog permissions, and non-local Tauri dev URLs. It warns on the current null CSP.
