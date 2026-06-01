@@ -19,7 +19,7 @@
 ## Current Controls
 
 - Secret-like values and credential-bearing URLs/DSNs are redacted by default before they reach normal display fields.
-- Findings include key names and file names, not raw values.
+- Findings include key names, file names, and framework load-order evidence, not raw values.
 - Layer conflict summaries name the effective file without showing competing values.
 - Save operations update one selected key occurrence at a time and use atomic write with permission preservation where practical.
 - Blank-key repair only appends `KEY=` for a documented missing key; it refuses duplicate or invalid keys.

@@ -117,6 +117,7 @@ pub struct EnvFinding {
     pub action_kind: String,
     pub title: String,
     pub detail: String,
+    pub evidence: Vec<String>,
     pub file_path: Option<String>,
     pub key: Option<String>,
 }
@@ -230,7 +231,7 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     let comparison = compare_actual_to_example(&files);
     let layer_report = build_layer_report(&files);
     let framework_profiles = build_framework_profiles(&root, &files);
-    let findings = build_findings(comparison.as_ref(), &layer_report);
+    let findings = build_findings(comparison.as_ref(), &layer_report, &framework_profiles);
 
     Ok(ProjectSnapshot {
         root: root.to_string_lossy().to_string(),
@@ -963,6 +964,7 @@ fn is_mode_name(mode: &str) -> bool {
 fn build_findings(
     comparison: Option<&EnvComparison>,
     layer_report: &EnvLayerReport,
+    framework_profiles: &[FrameworkEnvProfile],
 ) -> Vec<EnvFinding> {
     let mut findings = Vec::new();
 
@@ -977,6 +979,7 @@ fn build_findings(
                     file_label(&comparison.example_path),
                     file_label(&comparison.base_path)
                 ),
+                evidence: Vec::new(),
                 file_path: Some(comparison.base_path.clone()),
                 key: Some(key.clone()),
             });
@@ -992,6 +995,7 @@ fn build_findings(
                     file_label(&comparison.base_path),
                     file_label(&comparison.example_path)
                 ),
+                evidence: Vec::new(),
                 file_path: Some(comparison.base_path.clone()),
                 key: Some(key.clone()),
             });
@@ -1007,6 +1011,7 @@ fn build_findings(
                 action_kind: "resolve-duplicate-key".to_string(),
                 title: format!("Resolve duplicate `{key}`"),
                 detail: format!("`{file_name}` defines `{key}` more than once."),
+                evidence: Vec::new(),
                 file_path: None,
                 key: Some(key),
             });
@@ -1023,6 +1028,7 @@ fn build_findings(
             action_kind: "replace-placeholder".to_string(),
             title: format!("Replace placeholder `{key}`"),
             detail: format!("`{file_name}` has a placeholder-like value for `{key}`."),
+            evidence: Vec::new(),
             file_path: None,
             key: Some(key),
         });
@@ -1043,12 +1049,43 @@ fn build_findings(
                 override_row.key,
                 override_row.effective_file
             ),
+            evidence: framework_evidence_for_files(framework_profiles, &override_row.files),
             file_path: None,
             key: Some(override_row.key.clone()),
         });
     }
 
     findings
+}
+
+fn framework_evidence_for_files(
+    framework_profiles: &[FrameworkEnvProfile],
+    file_names: &[String],
+) -> Vec<String> {
+    let file_names = file_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    framework_profiles
+        .iter()
+        .filter_map(|profile| {
+            let ordered = profile
+                .ordered_files
+                .iter()
+                .filter(|file| file_names.contains(file.name.as_str()))
+                .map(|file| file.name.as_str())
+                .collect::<Vec<_>>();
+            (ordered.len() >= 2).then(|| {
+                format!(
+                    "{} {} load order: {}",
+                    profile.framework,
+                    profile.mode,
+                    ordered.join(" -> ")
+                )
+            })
+        })
+        .take(3)
+        .collect()
 }
 
 fn file_label(path: &str) -> String {
@@ -1927,8 +1964,29 @@ mod tests {
         let files = vec![base, local, example];
         let comparison = compare_actual_to_example(&files);
         let layer_report = build_layer_report(&files);
+        let framework_profiles = vec![FrameworkEnvProfile {
+            framework: "Next.js".to_string(),
+            mode: "development".to_string(),
+            evidence: Vec::new(),
+            ordered_files: vec![
+                FrameworkEnvFile {
+                    path: ".env.local".to_string(),
+                    name: ".env.local".to_string(),
+                    layer_kind: "local".to_string(),
+                    rank: 2,
+                },
+                FrameworkEnvFile {
+                    path: ".env".to_string(),
+                    name: ".env".to_string(),
+                    layer_kind: "base".to_string(),
+                    rank: 4,
+                },
+            ],
+            missing_files: Vec::new(),
+            notes: Vec::new(),
+        }];
 
-        let findings = build_findings(comparison.as_ref(), &layer_report);
+        let findings = build_findings(comparison.as_ref(), &layer_report, &framework_profiles);
 
         assert!(findings
             .iter()
@@ -1946,6 +2004,17 @@ mod tests {
             .iter()
             .any(|finding| finding.action_kind == "review-layer-conflict"
                 && finding.key.as_deref() == Some("JWT_SECRET")));
+        let layer_finding = findings
+            .iter()
+            .find(|finding| {
+                finding.action_kind == "review-layer-conflict"
+                    && finding.key.as_deref() == Some("JWT_SECRET")
+            })
+            .unwrap();
+        assert!(layer_finding
+            .evidence
+            .iter()
+            .any(|evidence| evidence.contains("Next.js development load order")));
 
         let rendered = findings
             .iter()

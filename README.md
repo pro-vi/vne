@@ -17,7 +17,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 - Finds env files referenced by common project config, including `package.json` scripts using `--env-file`, `dotenv -e`, `env-cmd -f`, or `DOTENV_CONFIG_PATH`, plus Docker Compose `env_file`
 - Compares `.env` with `.env.example` for missing, extra, shared, and duplicate keys
 - Reports layered overrides across actual env files, naming the winning file without exposing secret values
-- Shows framework env profiles for Next.js and Vite projects, including effective load order and missing expected files
+- Uses Next.js and Vite env load-order knowledge as evidence on related findings
 - Shows value-safe findings for missing keys, duplicate keys, placeholders, and layered conflicts, with safe blank-key insertion for documented missing keys
 - Infers common shapes such as credential URL/DSN, URL, secret, public frontend variable, bool, int, port, path, list, UUID, JSON, PEM, and provider-specific keys
 - Redacts secret-like values and credential-bearing URLs by default
@@ -75,4 +75,4 @@ fixtures/demo
 
 ## Current Status
 
-The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table, redact likely secrets and credential-bearing URLs, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, model Next.js and Vite env load-order profiles, show value-safe findings, add documented missing keys as blank entries, support keyboard scanning, and save one selected key occurrence in the Tauri runtime. Release packaging is still intentionally deferred.
+The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table, redact likely secrets and credential-bearing URLs, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, attach Next.js and Vite load-order evidence to related findings, show value-safe findings, add documented missing keys as blank entries, support keyboard scanning, and save one selected key occurrence in the Tauri runtime. Release packaging is still intentionally deferred.

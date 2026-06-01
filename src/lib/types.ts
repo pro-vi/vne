@@ -89,6 +89,7 @@ export interface EnvFinding {
   actionKind: string;
   title: string;
   detail: string;
+  evidence: string[];
   filePath: string | null;
   key: string | null;
 }

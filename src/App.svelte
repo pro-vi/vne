@@ -12,7 +12,7 @@
     ShieldCheck
   } from '@lucide/svelte';
   import { addEnvKey, isTauriRuntime, loadProject, pickProjectDirectory, saveEnvValue } from './lib/tauri';
-  import type { EnvEntry, EnvFile, EnvFinding, FrameworkEnvProfile, ProjectSnapshot } from './lib/types';
+  import type { EnvEntry, EnvFile, EnvFinding, ProjectSnapshot } from './lib/types';
   import { isEntryValueHidden, keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
   type Notice = {
@@ -42,7 +42,6 @@
   $: issueCount = totalIssueCount(snapshot);
   $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && !selectedValueHidden && editValue !== selectedEntry.value);
   $: layerConflicts = snapshot?.layerReport.overrides.filter((override) => override.conflict) ?? [];
-  $: frameworkMissingCount = snapshot?.frameworkProfiles.reduce((total, profile) => total + profile.missingFiles.length, 0) ?? 0;
   $: findings = snapshot?.findings ?? [];
   $: safeEditFindings = findings.filter(isSafeEditFinding);
   $: advisoryFindings = findings.filter((finding) => !isSafeEditFinding(finding));
@@ -227,10 +226,6 @@
     });
   }
 
-  function profileOrder(profile: FrameworkEnvProfile): string {
-    return profile.orderedFiles.map((file) => file.name).join(' -> ') || 'No matching env files';
-  }
-
   function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
   }
@@ -327,6 +322,13 @@
               <li class:warning={finding.severity === 'warning'}>
                 <strong>{finding.title}</strong>
                 <span>{finding.detail}</span>
+                {#if finding.evidence.length > 0}
+                  <ul class="evidence-list">
+                    {#each finding.evidence.slice(0, 2) as evidence}
+                      <li>{evidence}</li>
+                    {/each}
+                  </ul>
+                {/if}
               </li>
             {/each}
           </ul>
@@ -383,29 +385,6 @@
         </div>
       {/if}
 
-      {#if snapshot && snapshot.frameworkProfiles.length > 0}
-        <div class="comparison-block">
-          <h2>Framework profiles</h2>
-          <dl>
-            <div>
-              <dt>Profiles</dt>
-              <dd>{snapshot.frameworkProfiles.length}</dd>
-            </div>
-            <div>
-              <dt>Missing files</dt>
-              <dd>{frameworkMissingCount}</dd>
-            </div>
-          </dl>
-          <ul class="profile-list">
-            {#each snapshot.frameworkProfiles.slice(0, 4) as profile}
-              <li>
-                <strong>{profile.framework} / {profile.mode}</strong>
-                <span>{profileOrder(profile)}</span>
-              </li>
-            {/each}
-          </ul>
-        </div>
-      {/if}
     </aside>
 
     <section class="table-zone" aria-label="Environment keys">

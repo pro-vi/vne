@@ -164,6 +164,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         actionKind: 'add-missing-key',
         title: 'Add `STRIPE_SECRET_KEY` to .env',
         detail: '`STRIPE_SECRET_KEY` is documented in .env.example but missing from .env.',
+        evidence: [],
         filePath: basePath,
         key: 'STRIPE_SECRET_KEY'
       },
@@ -172,6 +173,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         actionKind: 'resolve-duplicate-key',
         title: 'Resolve duplicate `FEATURE_ENABLED`',
         detail: '`.env` defines `FEATURE_ENABLED` more than once.',
+        evidence: [],
         filePath: null,
         key: 'FEATURE_ENABLED'
       },
@@ -180,6 +182,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         actionKind: 'review-layer-conflict',
         title: 'Review layered `DATABASE_URL`',
         detail: '.env, .env.local set `DATABASE_URL` in multiple env layers; .env.local currently wins.',
+        evidence: ['Next.js development load order: .env.local -> .env'],
         filePath: null,
         key: 'DATABASE_URL'
       }

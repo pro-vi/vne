@@ -320,8 +320,7 @@ textarea:focus {
 }
 
 .action-list,
-.override-list,
-.profile-list {
+.override-list {
   display: grid;
   gap: 8px;
   margin: 12px 0 0;
@@ -329,9 +328,8 @@ textarea:focus {
   list-style: none;
 }
 
-.action-list li,
-.override-list li,
-.profile-list li {
+.action-list > li,
+.override-list > li {
   display: grid;
   gap: 3px;
   padding: 8px;
@@ -340,13 +338,12 @@ textarea:focus {
   background: #fff;
 }
 
-.action-list li.warning {
+.action-list > li.warning {
   border-left: 3px solid var(--warning);
 }
 
 .action-list strong,
-.override-list strong,
-.profile-list strong {
+.override-list strong {
   min-width: 0;
   overflow: hidden;
   color: var(--ink-soft);
@@ -357,10 +354,23 @@ textarea:focus {
 }
 
 .action-list span,
-.override-list span,
-.profile-list span {
+.override-list span {
   color: var(--muted);
   font-size: 12px;
+  line-height: 1.35;
+}
+
+.evidence-list {
+  display: grid;
+  gap: 2px;
+  margin: 3px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.evidence-list li {
+  color: var(--ink-soft);
+  font-size: 11px;
   line-height: 1.35;
 }
 
