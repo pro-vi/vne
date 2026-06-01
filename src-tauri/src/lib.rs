@@ -405,19 +405,47 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
         return shape("pem", "PEM / certificate", "high", true, reasons);
     }
 
+    let url_like = upper.ends_with("_URL") || upper.ends_with("_URI") || trimmed.contains("://");
+    if upper.contains("DSN") {
+        reasons.push("DSN-like key name".to_string());
+        if url_like {
+            reasons.push("URL-like name or value".to_string());
+        }
+        return shape("dsn", "Credential URL / DSN", "high", true, reasons);
+    }
+
+    if url_like && is_credential_url_key(&upper) {
+        reasons.push("credential-bearing URL key name".to_string());
+        reasons.push("URL-like name or value".to_string());
+        return shape(
+            "credential-url",
+            "Credential URL / DSN",
+            "high",
+            true,
+            reasons,
+        );
+    }
+
+    if url_like && url_value_has_secretish_parts(trimmed) {
+        reasons.push("credential-like URL value".to_string());
+        reasons.push("URL-like name or value".to_string());
+        return shape(
+            "credential-url",
+            "Credential URL / DSN",
+            "high",
+            true,
+            reasons,
+        );
+    }
+
     if public_prefix {
         reasons.push("frontend-exposed prefix".to_string());
         return shape("public", "Public frontend variable", "high", false, reasons);
     }
 
-    if upper.ends_with("_URL") || upper.ends_with("_URI") || trimmed.contains("://") {
+    if url_like {
         reasons.push("URL-like name or value".to_string());
         return shape("url", "URL / DSN", "high", false, reasons);
-    }
-
-    if upper.contains("DSN") {
-        reasons.push("DSN-like key name".to_string());
-        return shape("dsn", "DSN", "high", true, reasons);
     }
 
     if upper.ends_with("_PORT") || key == "PORT" || trimmed.parse::<u16>().is_ok() {
@@ -1393,6 +1421,94 @@ fn provider_reason(upper: &str) -> Option<String> {
     Some(format!("{provider} convention"))
 }
 
+fn is_credential_url_key(upper: &str) -> bool {
+    let url_key =
+        upper.ends_with("_URL") || upper.ends_with("_URI") || upper == "URL" || upper == "URI";
+    if !url_key {
+        return false;
+    }
+
+    upper == "DB_URL"
+        || upper == "DB_URI"
+        || upper.ends_with("_DB_URL")
+        || upper.ends_with("_DB_URI")
+        || contains_any(
+            upper,
+            &[
+                "DATABASE",
+                "POSTGRES",
+                "POSTGRESQL",
+                "MYSQL",
+                "MARIADB",
+                "REDIS",
+                "VALKEY",
+                "MONGO",
+                "MONGODB",
+                "SQLSERVER",
+                "MSSQL",
+                "RABBITMQ",
+                "AMQP",
+                "SMTP",
+                "WEBHOOK",
+                "CLICKHOUSE",
+                "ELASTICSEARCH",
+                "OPENSEARCH",
+                "KAFKA",
+                "NEON",
+                "PLANETSCALE",
+            ],
+        )
+}
+
+fn url_value_has_secretish_parts(value: &str) -> bool {
+    let Some((_, after_scheme)) = value.trim().split_once("://") else {
+        return false;
+    };
+
+    let authority_end = after_scheme
+        .find(|character| matches!(character, '/' | '?' | '#'))
+        .unwrap_or(after_scheme.len());
+    if after_scheme[..authority_end].contains('@') {
+        return true;
+    }
+
+    let Some(query_start) = after_scheme.find('?') else {
+        return false;
+    };
+    let query = after_scheme[query_start + 1..]
+        .split('#')
+        .next()
+        .unwrap_or_default();
+
+    query.split('&').any(|parameter| {
+        let name = parameter
+            .split_once('=')
+            .map(|(name, _)| name)
+            .unwrap_or(parameter)
+            .to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            "api_key"
+                | "apikey"
+                | "access_key"
+                | "access_token"
+                | "auth"
+                | "authorization"
+                | "client_secret"
+                | "key"
+                | "password"
+                | "passwd"
+                | "pwd"
+                | "secret"
+                | "signature"
+                | "sig"
+                | "token"
+        ) || name.ends_with("_key")
+            || name.ends_with("_secret")
+            || name.ends_with("_token")
+    })
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -1578,12 +1694,39 @@ mod tests {
     fn infers_common_key_shapes_and_redaction() {
         assert_eq!(infer_key_shape("OPENAI_API_KEY", "sk-test").kind, "secret");
         assert!(infer_key_shape("OPENAI_API_KEY", "sk-test").redacted_by_default);
-        assert_eq!(
-            infer_key_shape("REDIS_URL", "redis://localhost:6379").kind,
-            "url"
-        );
+        let redis = infer_key_shape("REDIS_URL", "redis://localhost:6379");
+        assert_eq!(redis.kind, "credential-url");
+        assert!(redis.redacted_by_default);
         assert_eq!(infer_key_shape("FEATURE_ENABLED", "true").kind, "bool");
         assert_eq!(infer_key_shape("PORT", "5173").kind, "port");
+    }
+
+    #[test]
+    fn redacts_credential_bearing_urls_and_dsns() {
+        let database = infer_key_shape("DATABASE_URL", "postgres://user:pass@localhost/app");
+        assert_eq!(database.kind, "credential-url");
+        assert!(database.redacted_by_default);
+
+        let webhook = infer_key_shape("WEBHOOK_URL", "https://example.com/hook?token=abc");
+        assert_eq!(webhook.kind, "credential-url");
+        assert!(webhook.redacted_by_default);
+
+        let sentry = infer_key_shape("SENTRY_DSN", "https://public@sentry.example/1");
+        assert_eq!(sentry.kind, "dsn");
+        assert!(sentry.redacted_by_default);
+
+        let public_url = infer_key_shape("NEXT_PUBLIC_SITE_URL", "https://example.com");
+        assert_eq!(public_url.kind, "public");
+        assert!(!public_url.redacted_by_default);
+
+        let public_with_token =
+            infer_key_shape("VITE_CALLBACK_URL", "https://example.com/hook?token=abc");
+        assert_eq!(public_with_token.kind, "credential-url");
+        assert!(public_with_token.redacted_by_default);
+
+        let api_url = infer_key_shape("API_BASE_URL", "https://api.example.com");
+        assert_eq!(api_url.kind, "url");
+        assert!(!api_url.redacted_by_default);
     }
 
     #[test]
@@ -1717,6 +1860,7 @@ mod tests {
             .unwrap();
         assert_eq!(database.effective_file, ".env.local");
         assert!(database.conflict);
+        assert!(database.redacted);
         assert!(!database.summary.contains("postgres://"));
 
         let secret = report

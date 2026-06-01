@@ -18,8 +18,14 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         content:
           '# local development\nDATABASE_URL="postgres://localhost/vne"\nREDIS_URL=redis://localhost:6379\nOPENAI_API_KEY=sk-local-redacted\nPRIVATE_KEY="-----BEGIN KEY-----\nabc123\n-----END KEY-----"\nNEXT_PUBLIC_SITE_URL=http://localhost:1420\nPORT=1420\nFEATURE_ENABLED=true\nFEATURE_ENABLED=false\n',
         entries: [
-          entry('DATABASE_URL', 'postgres://localhost/vne', 'URL / DSN', 'url', false, 2, ['URL-like name or value']),
-          entry('REDIS_URL', 'redis://localhost:6379', 'URL / DSN', 'url', false, 3, ['URL-like name or value']),
+          entry('DATABASE_URL', 'postgres://localhost/vne', 'Credential URL / DSN', 'credential-url', true, 2, [
+            'credential-bearing URL key name',
+            'URL-like name or value'
+          ]),
+          entry('REDIS_URL', 'redis://localhost:6379', 'Credential URL / DSN', 'credential-url', true, 3, [
+            'credential-bearing URL key name',
+            'URL-like name or value'
+          ]),
           entry('OPENAI_API_KEY', 'sk-local-redacted', 'Secret', 'secret', true, 4, ['OpenAI convention', 'secret-like key name']),
           entry('PRIVATE_KEY', '-----BEGIN KEY-----\nabc123\n-----END KEY-----', 'Secret', 'secret', true, 5, [
             'secret-like key name'
@@ -40,8 +46,14 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         duplicateKeys: [],
         content: 'DATABASE_URL=\nREDIS_URL=\nSTRIPE_SECRET_KEY=\nNEXT_PUBLIC_SITE_URL=\nPORT=1420\n',
         entries: [
-          entry('DATABASE_URL', '', 'URL / DSN', 'url', false, 1, ['URL-like name or value']),
-          entry('REDIS_URL', '', 'URL / DSN', 'url', false, 2, ['URL-like name or value']),
+          entry('DATABASE_URL', '', 'Credential URL / DSN', 'credential-url', true, 1, [
+            'credential-bearing URL key name',
+            'URL-like name or value'
+          ]),
+          entry('REDIS_URL', '', 'Credential URL / DSN', 'credential-url', true, 2, [
+            'credential-bearing URL key name',
+            'URL-like name or value'
+          ]),
           entry('STRIPE_SECRET_KEY', '', 'Secret', 'secret', true, 3, ['Stripe convention', 'secret-like key name']),
           entry('NEXT_PUBLIC_SITE_URL', '', 'Public frontend variable', 'public', false, 4, ['frontend-exposed prefix']),
           entry('PORT', '1420', 'Port', 'port', false, 5, ['port-like key or numeric port value'])
@@ -55,7 +67,10 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         duplicateKeys: [],
         content: 'DATABASE_URL="postgres://localhost/vne_local"\nOPENAI_API_KEY=sk-local-override\n',
         entries: [
-          entry('DATABASE_URL', 'postgres://localhost/vne_local', 'URL / DSN', 'url', false, 1, ['URL-like name or value']),
+          entry('DATABASE_URL', 'postgres://localhost/vne_local', 'Credential URL / DSN', 'credential-url', true, 1, [
+            'credential-bearing URL key name',
+            'URL-like name or value'
+          ]),
           entry('OPENAI_API_KEY', 'sk-local-override', 'Secret', 'secret', true, 2, [
             'OpenAI convention',
             'secret-like key name'
@@ -102,7 +117,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
           files: ['.env', '.env.local'],
           effectiveFile: '.env.local',
           conflict: true,
-          redacted: false,
+          redacted: true,
           summary: '2 layers set different values; `.env.local` currently wins.'
         },
         {

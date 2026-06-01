@@ -18,7 +18,7 @@
 
 ## Current Controls
 
-- Secret-like values are redacted by default before they reach normal display fields.
+- Secret-like values and credential-bearing URLs/DSNs are redacted by default before they reach normal display fields.
 - Repair actions include key names and file names, not raw values.
 - Layer conflict summaries name the effective file without showing competing values.
 - Save operations update one key at a time and use atomic write with permission preservation where practical.
@@ -37,7 +37,7 @@
 ## Known Residual Risks
 
 - Reveal mode intentionally shows secrets to the local user.
-- Raw preview intentionally shows the full selected env file when the user asks for it.
+- Raw preview intentionally shows the full selected env file after reveal mode when hidden secrets are present.
 - A malicious local project can use misleading key names or comments; `vne` treats env files as data and does not execute them.
 - Active project root checks reduce accidental path escape, but they are not a substitute for operating-system file permissions or user caution when opening untrusted projects.
 - Screenshot or browser-inspection proof is still unavailable in this session because only navigation, not screenshot or DOM inspection, was exposed.
