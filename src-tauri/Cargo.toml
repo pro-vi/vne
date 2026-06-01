@@ -1,0 +1,22 @@
+[package]
+name = "vne"
+version = "0.1.0"
+description = "A local private .env viewer and editor"
+authors = ["vne contributors"]
+edition = "2021"
+rust-version = "1.82"
+
+[lib]
+name = "vne_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.1", features = [] }
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tauri = { version = "2.11.2", features = [] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,30 @@
+{
+  "name": "vne",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@lucide/svelte": "1.17.0",
+    "@tauri-apps/api": "2.11.0",
+    "svelte": "5.56.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.1.2",
+    "@tauri-apps/cli": "2.11.2",
+    "@tsconfig/svelte": "5.0.8",
+    "@types/node": "25.9.1",
+    "svelte-check": "4.4.8",
+    "typescript": "6.0.3",
+    "vite": "8.0.15",
+    "vitest": "4.1.7"
+  }
+}
