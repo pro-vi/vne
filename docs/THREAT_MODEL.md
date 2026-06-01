@@ -30,6 +30,7 @@
 - Write commands resolve the active project root and reject file paths outside that root.
 - Browser preview uses sample data and cannot save or apply safe edits.
 - The app has no accounts, telemetry, sync, hosted validation, or cloud calls for env data.
+- `scripts/security-check.sh` fails on obvious network client APIs, telemetry SDK imports, raw logging calls, updater surfaces, broad dialog permissions, and non-local Tauri dev URLs. It warns on the current null CSP.
 
 ## Non-Goals
 
@@ -46,11 +47,14 @@
 - A malicious local project can use misleading key names or comments; `vne` treats env files as data and does not execute them.
 - Active project root checks reduce accidental path escape, but they are not a substitute for operating-system file permissions or user caution when opening untrusted projects.
 - Screenshot or browser-inspection proof is still unavailable in this session because only navigation, not screenshot or DOM inspection, was exposed.
+- The security check is intentionally narrow. It is a regression harness for obvious source/config surfaces, not a dependency sandbox, runtime network monitor, or proof that all transitive dependencies are inert.
 
 ## Release Checklist Before Public Distribution
 
 - Re-run source scans for network clients, telemetry SDKs, and logging of raw values.
+- Run `scripts/security-check.sh` and review any warning or false-positive adjustment.
 - Re-check path-scope behavior around write commands after any command-surface change.
+- Replace or justify the current null CSP before a public packaged release.
 - Verify raw values are absent from structured logs and error paths.
 - Verify macOS signing/notarization choices with explicit user approval.
 - Capture screenshots using a local browser-control surface.

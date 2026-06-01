@@ -5,3 +5,4 @@ npm run check
 npm run build
 npm run test
 npm run test:rust
+scripts/security-check.sh
