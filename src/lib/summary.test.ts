@@ -4,7 +4,7 @@ import { keyStatus, totalIssueCount } from './summary';
 
 describe('env summary helpers', () => {
   it('counts comparison and diagnostic issues', () => {
-    expect(totalIssueCount(sampleProject())).toBe(5);
+    expect(totalIssueCount(sampleProject())).toBe(6);
   });
 
   it('marks extra and missing comparison keys in the relevant files', () => {

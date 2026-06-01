@@ -176,6 +176,7 @@
             <button class:active={file.path === selectedPath} type="button" onclick={() => chooseFile(file)}>
               <span>{file.name}</span>
               <small>{file.entries.length} keys</small>
+              <em>{file.discoveryReasons[0] ?? 'opened directly'}</em>
             </button>
           {/each}
         </div>
@@ -262,6 +263,7 @@
 
         <h2>{selectedEntry.key}</h2>
         <p>{selectedEntry.shape.label} / {selectedEntry.shape.confidence} confidence / line {selectedEntry.lineNumber}</p>
+        <p>File found by: {selectedFile.discoveryReasons.join(', ')}</p>
 
         <label class="editor-label" for="value-editor">Value</label>
         <textarea id="value-editor" bind:value={editValue} spellcheck="false" rows="5"></textarea>

@@ -14,10 +14,11 @@ The project is intentionally small:
 Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 
 - Detects common files such as `.env`, `.env.local`, `.env.production`, `.env.example`, `.env.sample`, `.envrc`, and `.flaskenv`
+- Finds env files referenced by common project config, including `package.json` scripts using `--env-file`, `dotenv -e`, `env-cmd -f`, or `DOTENV_CONFIG_PATH`, plus Docker Compose `env_file`
 - Compares `.env` with `.env.example` for missing, extra, shared, and duplicate keys
 - Infers common shapes such as URL/DSN, secret, public frontend variable, bool, int, port, path, list, UUID, JSON, PEM, and provider-specific keys
 - Redacts secret-like values by default
-- Edits one value while preserving comments, order, quote style, and adjacent formatting
+- Edits one value while preserving comments, order, quote style, multiline values, and adjacent formatting
 
 ## Privacy
 
@@ -68,4 +69,4 @@ fixtures/demo
 
 ## Current Status
 
-The first slice can scan a directory, parse common env files, show a structured key table, redact likely secrets, compare actual vs example files, and save a single edited value in the Tauri runtime. Native directory picking, deeper framework config discovery, multiline editing affordances, and release packaging are still intentionally deferred.
+The first slice can scan a directory, parse common env files, show a structured key table, redact likely secrets, compare actual vs example files, discover env files referenced by common config, and save a single edited value in the Tauri runtime. Native directory picking, deeper framework-specific config discovery, and release packaging are still intentionally deferred.

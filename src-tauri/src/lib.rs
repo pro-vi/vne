@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ pub struct ProjectSnapshot {
 pub struct EnvFile {
     pub path: String,
     pub name: String,
+    pub discovery_reasons: Vec<String>,
     pub entries: Vec<EnvEntry>,
     pub diagnostics: Vec<String>,
     pub duplicate_keys: Vec<String>,
@@ -66,6 +67,7 @@ struct ParsedLine {
     quote: Option<char>,
     value_start: usize,
     value_end: usize,
+    next_start: usize,
     diagnostic: Option<String>,
 }
 
@@ -96,33 +98,46 @@ pub fn run() {
 
 pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     let root = root.canonicalize()?;
-    let mut env_paths = Vec::new();
+    let mut discovered = BTreeMap::<PathBuf, BTreeSet<String>>::new();
 
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
         if entry.file_type()?.is_file() {
             let name = entry.file_name().to_string_lossy().to_string();
             if is_env_file_name(&name) {
-                env_paths.push(entry.path());
+                add_discovered_env_file(
+                    &root,
+                    entry.path(),
+                    format!("direct env filename `{name}`"),
+                    &mut discovered,
+                );
             }
         }
     }
 
-    env_paths.sort_by_key(|path| {
-        env_file_sort_key(
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .as_ref(),
+    discover_package_json_env_files(&root, &mut discovered);
+    discover_compose_env_files(&root, &mut discovered);
+
+    let mut env_paths = discovered.into_iter().collect::<Vec<_>>();
+    env_paths.sort_by_key(|(path, _)| {
+        let relative = path.strip_prefix(&root).unwrap_or(path);
+        (
+            env_file_sort_key(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+            relative.to_string_lossy().to_string(),
         )
     });
 
     let files = env_paths
         .into_iter()
-        .filter_map(|path| {
-            fs::read_to_string(&path)
-                .ok()
-                .map(|content| parse_env_file(&path, content))
+        .filter_map(|(path, reasons)| {
+            fs::read_to_string(&path).ok().map(|content| {
+                parse_env_file_with_reasons(&path, content, reasons.into_iter().collect())
+            })
         })
         .collect::<Vec<_>>();
 
@@ -136,38 +151,55 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
 }
 
 pub fn parse_env_file(path: &Path, content: String) -> EnvFile {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let discovery_reasons = if is_env_file_name(&name) {
+        vec![format!("direct env filename `{name}`")]
+    } else {
+        vec!["opened directly".to_string()]
+    };
+
+    parse_env_file_with_reasons(path, content, discovery_reasons)
+}
+
+fn parse_env_file_with_reasons(
+    path: &Path,
+    content: String,
+    discovery_reasons: Vec<String>,
+) -> EnvFile {
     let mut entries = Vec::new();
     let mut diagnostics = Vec::new();
     let mut seen = BTreeSet::new();
     let mut duplicate_keys = BTreeSet::new();
 
-    for (index, line) in content.split_inclusive('\n').enumerate() {
-        if let Some(parsed) = parse_env_line(line, index + 1) {
-            if !seen.insert(parsed.key.clone()) {
-                duplicate_keys.insert(parsed.key.clone());
-            }
-            if let Some(diagnostic) = &parsed.diagnostic {
-                diagnostics.push(format!("Line {}: {diagnostic}", parsed.line_number));
-            }
-
-            let shape = infer_key_shape(&parsed.key, &parsed.value);
-            let display_value = if shape.redacted_by_default {
-                "********".to_string()
-            } else {
-                parsed.value.clone()
-            };
-
-            entries.push(EnvEntry {
-                key: parsed.key,
-                value: parsed.value,
-                display_value,
-                line_number: parsed.line_number,
-                exported: parsed.exported,
-                quote: parsed.quote.map(|quote| quote.to_string()),
-                shape,
-                diagnostics: parsed.diagnostic.into_iter().collect(),
-            });
+    for parsed in parse_env_entries(&content) {
+        if !seen.insert(parsed.key.clone()) {
+            duplicate_keys.insert(parsed.key.clone());
         }
+        if let Some(diagnostic) = &parsed.diagnostic {
+            diagnostics.push(format!("Line {}: {diagnostic}", parsed.line_number));
+        }
+
+        let shape = infer_key_shape(&parsed.key, &parsed.value);
+        let display_value = if shape.redacted_by_default {
+            "********".to_string()
+        } else {
+            parsed.value.clone()
+        };
+
+        entries.push(EnvEntry {
+            key: parsed.key,
+            value: parsed.value,
+            display_value,
+            line_number: parsed.line_number,
+            exported: parsed.exported,
+            quote: parsed.quote.map(|quote| quote.to_string()),
+            shape,
+            diagnostics: parsed.diagnostic.into_iter().collect(),
+        });
     }
 
     for key in &duplicate_keys {
@@ -181,6 +213,7 @@ pub fn parse_env_file(path: &Path, content: String) -> EnvFile {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string(),
+        discovery_reasons,
         entries,
         diagnostics,
         duplicate_keys: duplicate_keys.into_iter().collect(),
@@ -191,33 +224,27 @@ pub fn parse_env_file(path: &Path, content: String) -> EnvFile {
 pub fn replace_env_value(content: &str, key: &str, value: &str) -> Option<String> {
     let mut output = String::with_capacity(content.len() + value.len());
     let mut replaced = false;
+    let mut cursor = 0;
 
-    for (index, line) in content.split_inclusive('\n').enumerate() {
-        if !replaced {
-            if let Some(parsed) = parse_env_line(line, index + 1) {
-                if parsed.key == key {
-                    let replacement = match parsed.quote {
-                        Some('"') => escape_double_quoted_value(value),
-                        Some('\'') => escape_single_quoted_value(value),
-                        Some(_) => escape_double_quoted_value(value),
-                        None if needs_quotes(value) => {
-                            format!("\"{}\"", escape_double_quoted_value(value))
-                        }
-                        None => value.to_string(),
-                    };
+    for parsed in parse_env_entries(content) {
+        if parsed.key == key {
+            let replacement = match parsed.quote {
+                Some('"') => escape_double_quoted_value(value),
+                Some('\'') => escape_single_quoted_value(value),
+                Some(_) => escape_double_quoted_value(value),
+                None if needs_quotes(value) => format!("\"{}\"", escape_double_quoted_value(value)),
+                None => value.to_string(),
+            };
 
-                    output.push_str(&line[..parsed.value_start]);
-                    output.push_str(&replacement);
-                    output.push_str(&line[parsed.value_end..]);
-                    replaced = true;
-                    continue;
-                }
-            }
+            output.push_str(&content[cursor..parsed.value_start]);
+            output.push_str(&replacement);
+            cursor = parsed.value_end;
+            replaced = true;
+            break;
         }
-
-        output.push_str(line);
     }
 
+    output.push_str(&content[cursor..]);
     replaced.then_some(output)
 }
 
@@ -346,8 +373,29 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
     shape("text", "Text", "low", false, reasons)
 }
 
-fn parse_env_line(line: &str, line_number: usize) -> Option<ParsedLine> {
-    let line_body = line.trim_end_matches(['\r', '\n']);
+fn parse_env_entries(content: &str) -> Vec<ParsedLine> {
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    let mut line_number = 1;
+
+    while offset < content.len() {
+        if let Some(parsed) = parse_env_entry_at(content, offset, line_number) {
+            line_number += count_newlines(&content[offset..parsed.next_start]);
+            offset = parsed.next_start;
+            entries.push(parsed);
+        } else {
+            let next = next_line_start(content, offset);
+            line_number += count_newlines(&content[offset..next]);
+            offset = next;
+        }
+    }
+
+    entries
+}
+
+fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> Option<ParsedLine> {
+    let line_end = current_line_body_end(content, line_start);
+    let line_body = &content[line_start..line_end];
     let bytes = line_body.as_bytes();
     let mut index = 0;
 
@@ -387,6 +435,7 @@ fn parse_env_line(line: &str, line_number: usize) -> Option<ParsedLine> {
     let mut quote = None;
     let value_start;
     let value_end;
+    let next_start;
     let value;
 
     match bytes.get(index) {
@@ -394,13 +443,13 @@ fn parse_env_line(line: &str, line_number: usize) -> Option<ParsedLine> {
             let quote_byte = bytes[index];
             quote = Some(quote_byte as char);
             index += 1;
-            value_start = index;
-            let mut cursor = index;
+            value_start = line_start + index;
+            let mut cursor = value_start;
             let mut escaped = false;
             let mut found = false;
-            while cursor < bytes.len() {
-                let byte = bytes[cursor];
-                if quote_byte == b'"' && byte == b'\\' && !escaped {
+            while cursor < content.len() {
+                let byte = content.as_bytes()[cursor];
+                if byte == b'\\' && !escaped {
                     escaped = true;
                     cursor += 1;
                     continue;
@@ -413,13 +462,19 @@ fn parse_env_line(line: &str, line_number: usize) -> Option<ParsedLine> {
                 cursor += 1;
             }
             value_end = cursor;
-            value = line_body[value_start..value_end].to_string();
+            next_start = if found {
+                next_line_start(content, cursor)
+            } else {
+                content.len()
+            };
+            value = content[value_start..value_end].to_string();
             if !found {
-                diagnostic = Some("quoted value is not closed on this line".to_string());
+                diagnostic = Some("quoted value is not closed".to_string());
             }
         }
         _ => {
-            value_start = index;
+            let local_value_start = index;
+            value_start = line_start + local_value_start;
             let mut cursor = index;
             let mut comment_start = bytes.len();
             while cursor < bytes.len() {
@@ -432,11 +487,12 @@ fn parse_env_line(line: &str, line_number: usize) -> Option<ParsedLine> {
                 cursor += 1;
             }
             let mut end = comment_start;
-            while end > value_start && bytes[end - 1].is_ascii_whitespace() {
+            while end > local_value_start && bytes[end - 1].is_ascii_whitespace() {
                 end -= 1;
             }
-            value_end = end;
-            value = line_body[value_start..value_end].to_string();
+            value_end = line_start + end;
+            next_start = next_line_start(content, line_start);
+            value = content[value_start..value_end].to_string();
         }
     }
 
@@ -448,6 +504,7 @@ fn parse_env_line(line: &str, line_number: usize) -> Option<ParsedLine> {
         quote,
         value_start,
         value_end,
+        next_start,
         diagnostic,
     })
 }
@@ -488,6 +545,233 @@ fn compare_actual_to_example(files: &[EnvFile]) -> Option<EnvComparison> {
 
 fn key_set(file: &EnvFile) -> BTreeSet<String> {
     file.entries.iter().map(|entry| entry.key.clone()).collect()
+}
+
+fn add_discovered_env_file(
+    root: &Path,
+    candidate: impl AsRef<Path>,
+    reason: String,
+    discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>,
+) {
+    let candidate = candidate.as_ref();
+    let path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+
+    let Ok(metadata) = fs::metadata(&path) else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+
+    let Ok(canonical) = path.canonicalize() else {
+        return;
+    };
+    if !canonical.starts_with(root) {
+        return;
+    }
+
+    discovered.entry(canonical).or_default().insert(reason);
+}
+
+fn discover_package_json_env_files(
+    root: &Path,
+    discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>,
+) {
+    let path = root.join("package.json");
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+    let Some(scripts) = value.get("scripts").and_then(serde_json::Value::as_object) else {
+        return;
+    };
+
+    for (script_name, script_value) in scripts {
+        let Some(script) = script_value.as_str() else {
+            continue;
+        };
+        for reference in extract_env_path_references(script) {
+            add_discovered_env_file(
+                root,
+                reference,
+                format!("package.json script `{script_name}`"),
+                discovered,
+            );
+        }
+    }
+}
+
+fn discover_compose_env_files(root: &Path, discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>) {
+    for compose_name in [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.yml",
+    ] {
+        let path = root.join(compose_name);
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        for reference in extract_compose_env_file_references(&content) {
+            add_discovered_env_file(
+                root,
+                reference,
+                format!("{compose_name} env_file"),
+                discovered,
+            );
+        }
+    }
+}
+
+fn extract_env_path_references(command: &str) -> Vec<String> {
+    let tokens = shell_tokens(command);
+    let mut references = Vec::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(path) = token.strip_prefix("--env-file=") {
+            push_env_reference(&mut references, path);
+            continue;
+        }
+
+        if let Some(path) = token.strip_prefix("DOTENV_CONFIG_PATH=") {
+            push_env_reference(&mut references, path);
+            continue;
+        }
+
+        if let Some(path) = token.strip_prefix("dotenv_config_path=") {
+            push_env_reference(&mut references, path);
+            continue;
+        }
+
+        if token == "--env-file" {
+            if let Some(path) = tokens.get(index + 1) {
+                push_env_reference(&mut references, path);
+            }
+            continue;
+        }
+
+        if token == "-e"
+            && tokens[..index]
+                .iter()
+                .rev()
+                .take(3)
+                .any(|value| value == "dotenv")
+        {
+            if let Some(path) = tokens.get(index + 1) {
+                push_env_reference(&mut references, path);
+            }
+            continue;
+        }
+
+        if matches!(token.as_str(), "-f" | "--file")
+            && tokens[..index]
+                .iter()
+                .rev()
+                .take(3)
+                .any(|value| value == "env-cmd")
+        {
+            if let Some(path) = tokens.get(index + 1) {
+                push_env_reference(&mut references, path);
+            }
+        }
+    }
+
+    references
+}
+
+fn extract_compose_env_file_references(content: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    let mut in_env_file_block = false;
+    let mut block_indent = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let indent = line.len() - line.trim_start().len();
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("env_file:") {
+            in_env_file_block = rest.trim().is_empty();
+            block_indent = indent;
+            if !in_env_file_block {
+                for part in rest.trim().trim_matches(['[', ']']).split(',') {
+                    push_env_reference(&mut references, part);
+                }
+            }
+            continue;
+        }
+
+        if in_env_file_block {
+            if indent <= block_indent && !trimmed.starts_with('-') {
+                in_env_file_block = false;
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix('-') {
+                let candidate = rest.trim();
+                if let Some(path) = candidate.strip_prefix("path:") {
+                    push_env_reference(&mut references, path);
+                } else {
+                    push_env_reference(&mut references, candidate);
+                }
+            }
+        }
+    }
+
+    references
+}
+
+fn push_env_reference(references: &mut Vec<String>, raw: &str) {
+    let path = raw
+        .trim()
+        .trim_matches(['"', '\'', ',', ';'])
+        .trim_start_matches("./");
+    if path.is_empty() || !path.contains(".env") {
+        return;
+    }
+    if path.contains("://") || path.starts_with("..") {
+        return;
+    }
+
+    references.push(path.to_string());
+}
+
+fn shell_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+
+    for character in input.chars() {
+        match (quote, character) {
+            (Some(active), value) if value == active => quote = None,
+            (None, '"' | '\'') => quote = Some(character),
+            (None, value) if value.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            (None, value) if matches!(value, ',' | '[' | ']' | '{' | '}') => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
 }
 
 fn is_env_file_name(name: &str) -> bool {
@@ -580,6 +864,29 @@ fn skip_spaces(bytes: &[u8], index: &mut usize) {
     }
 }
 
+fn current_line_body_end(content: &str, line_start: usize) -> usize {
+    let line_end = next_line_start(content, line_start);
+    content[line_start..line_end]
+        .trim_end_matches(['\r', '\n'])
+        .len()
+        + line_start
+}
+
+fn next_line_start(content: &str, offset: usize) -> usize {
+    content[offset..]
+        .find('\n')
+        .map(|position| offset + position + 1)
+        .unwrap_or(content.len())
+}
+
+fn count_newlines(value: &str) -> usize {
+    value
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+}
+
 fn is_key_start(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || byte == b'_'
 }
@@ -598,17 +905,11 @@ fn needs_quotes(value: &str) -> bool {
 }
 
 fn escape_double_quoted_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn escape_single_quoted_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', "\\n")
+    value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 fn looks_like_duration(value: &str) -> bool {
@@ -657,6 +958,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_quoted_multiline_values_as_one_entry() {
+        let content = "PRIVATE_KEY=\"-----BEGIN KEY-----\nabc123\n-----END KEY-----\"\nNEXT_PUBLIC_SITE=https://example.com\n";
+        let file = parse_env_file(Path::new(".env"), content.to_string());
+
+        assert_eq!(file.entries.len(), 2);
+        assert_eq!(file.entries[0].key, "PRIVATE_KEY");
+        assert_eq!(
+            file.entries[0].value,
+            "-----BEGIN KEY-----\nabc123\n-----END KEY-----"
+        );
+        assert_eq!(file.entries[1].key, "NEXT_PUBLIC_SITE");
+    }
+
+    #[test]
     fn replaces_one_value_while_preserving_comments_order_and_quote_style() {
         let content = "# keep\nDATABASE_URL=\"postgres://old/app\" # local\nPORT=3000\n";
         let updated = replace_env_value(content, "DATABASE_URL", "postgres://new/app").unwrap();
@@ -664,6 +979,27 @@ mod tests {
         assert_eq!(
             updated,
             "# keep\nDATABASE_URL=\"postgres://new/app\" # local\nPORT=3000\n"
+        );
+    }
+
+    #[test]
+    fn replaces_multiline_value_without_collapsing_lines() {
+        let content = "PRIVATE_KEY=\"-----BEGIN KEY-----\nold\n-----END KEY-----\"\nPORT=1420\n";
+        let updated = replace_env_value(
+            content,
+            "PRIVATE_KEY",
+            "-----BEGIN KEY-----\nnew\n-----END KEY-----",
+        )
+        .unwrap();
+
+        assert_eq!(
+            updated,
+            "PRIVATE_KEY=\"-----BEGIN KEY-----\nnew\n-----END KEY-----\"\nPORT=1420\n"
+        );
+        let file = parse_env_file(Path::new(".env"), updated);
+        assert_eq!(
+            file.entries[0].value,
+            "-----BEGIN KEY-----\nnew\n-----END KEY-----"
         );
     }
 
@@ -719,5 +1055,52 @@ mod tests {
 
         assert_eq!(snapshot.files.len(), 2);
         assert_eq!(snapshot.comparison.unwrap().missing_keys, vec!["REDIS_URL"]);
+    }
+
+    #[test]
+    fn discovers_env_files_referenced_by_common_project_config() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "DATABASE_URL=postgres://local\n").unwrap();
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::create_dir_all(dir.path().join("deploy")).unwrap();
+        fs::write(
+            dir.path().join("config").join("worker.env"),
+            "QUEUE_URL=redis://localhost\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("deploy").join("compose.env"),
+            "COMPOSE_PROJECT_NAME=vne\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"worker":"node --env-file=config/worker.env worker.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  app:\n    env_file:\n      - deploy/compose.env\n",
+        )
+        .unwrap();
+
+        let snapshot = snapshot_project(dir.path()).unwrap();
+        let names = snapshot
+            .files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&".env"));
+        assert!(names.contains(&"worker.env"));
+        assert!(names.contains(&"compose.env"));
+        assert!(snapshot
+            .files
+            .iter()
+            .find(|file| file.name == "worker.env")
+            .unwrap()
+            .discovery_reasons
+            .iter()
+            .any(|reason| reason.contains("package.json")));
     }
 }

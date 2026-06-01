@@ -7,6 +7,7 @@ export interface ProjectSnapshot {
 export interface EnvFile {
   path: string;
   name: string;
+  discoveryReasons: string[];
   entries: EnvEntry[];
   diagnostics: string[];
   duplicateKeys: string[];

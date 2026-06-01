@@ -1,0 +1,5 @@
+{
+  "scripts": {
+    "worker": "node --env-file=config/worker.env worker.js"
+  }
+}

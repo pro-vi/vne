@@ -256,8 +256,8 @@ textarea:focus {
 
 .file-list button {
   width: 100%;
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
   padding: 10px;
   text-align: left;
@@ -271,6 +271,17 @@ textarea:focus {
 
 .file-list small {
   color: var(--muted);
+  white-space: nowrap;
+}
+
+.file-list em {
+  grid-column: 1 / -1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
