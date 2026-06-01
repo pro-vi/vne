@@ -13,7 +13,7 @@
   } from '@lucide/svelte';
   import { addEnvKey, isTauriRuntime, loadProject, pickProjectDirectory, saveEnvValue } from './lib/tauri';
   import type { EnvEntry, EnvFile, EnvRepairAction, FrameworkEnvProfile, ProjectSnapshot } from './lib/types';
-  import { keyStatus, statusLabel, totalIssueCount } from './lib/summary';
+  import { isEntryValueHidden, keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
   type Notice = {
     kind: 'idle' | 'loading' | 'success' | 'error';
@@ -37,11 +37,16 @@
   $: selectedFile = snapshot?.files.find((file) => file.path === selectedPath) ?? snapshot?.files[0] ?? null;
   $: selectedEntry = selectedFile?.entries.find((entry) => entry.key === selectedKey) ?? selectedFile?.entries[0] ?? null;
   $: visibleEntries = selectedFile ? filterEntries(selectedFile, filter) : [];
+  $: selectedValueHidden = selectedEntry ? isEntryValueHidden(selectedEntry, showSecrets) : false;
+  $: selectedFileHasHiddenSecrets = Boolean(selectedFile?.entries.some((entry) => isEntryValueHidden(entry, showSecrets)));
   $: issueCount = totalIssueCount(snapshot);
-  $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && editValue !== selectedEntry.value);
+  $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && !selectedValueHidden && editValue !== selectedEntry.value);
   $: layerConflicts = snapshot?.layerReport.overrides.filter((override) => override.conflict) ?? [];
   $: frameworkMissingCount = snapshot?.frameworkProfiles.reduce((total, profile) => total + profile.missingFiles.length, 0) ?? 0;
   $: repairActions = snapshot?.repairActions ?? [];
+  $: if (selectedFileHasHiddenSecrets && showRaw) {
+    showRaw = false;
+  }
 
   async function openProject(): Promise<void> {
     notice = { kind: 'loading', message: 'Scanning env files...' };
@@ -188,7 +193,7 @@
   }
 
   function displayValue(entry: EnvEntry): string {
-    if (showSecrets || !entry.shape.redactedByDefault) {
+    if (!isEntryValueHidden(entry, showSecrets)) {
       return entry.value || '(empty)';
     }
 
@@ -442,7 +447,11 @@
         <p>File found by: {selectedFile.discoveryReasons.join(', ')}</p>
 
         <label class="editor-label" for="value-editor">Value</label>
-        <textarea id="value-editor" bind:value={editValue} spellcheck="false" rows="5"></textarea>
+        {#if selectedValueHidden}
+          <textarea id="value-editor" value={selectedEntry.displayValue} spellcheck="false" rows="5" readonly></textarea>
+        {:else}
+          <textarea id="value-editor" bind:value={editValue} spellcheck="false" rows="5"></textarea>
+        {/if}
         <button class="primary save-button" type="button" disabled={!canSave} onclick={() => void saveValue()}>
           <Save size={16} aria-hidden="true" />
           <span>Save value</span>
@@ -461,7 +470,7 @@
           {/if}
         </div>
 
-        <button type="button" class="ghost full-width" onclick={() => (showRaw = !showRaw)}>
+        <button type="button" class="ghost full-width" disabled={selectedFileHasHiddenSecrets} onclick={() => (showRaw = !showRaw)}>
           {showRaw ? 'Hide raw preview' : 'Show raw preview'}
         </button>
         {#if showRaw}
