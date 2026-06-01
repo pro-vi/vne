@@ -49,6 +49,8 @@ pub struct KeyShape {
     pub label: String,
     pub confidence: String,
     pub redacted_by_default: bool,
+    pub sensitive: bool,
+    pub exposure: Option<String>,
     pub reasons: Vec<String>,
 }
 
@@ -411,6 +413,9 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
     if let Some(provider) = provider {
         reasons.push(provider);
     }
+    if public_prefix {
+        reasons.push("frontend-exposed prefix".to_string());
+    }
 
     let secretish = contains_any(
         &upper,
@@ -426,7 +431,20 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
         ],
     );
 
-    if secretish && !public_prefix {
+    if secretish && public_prefix {
+        reasons.push("secret-like key name".to_string());
+        return shape_with_context(
+            "public-secret",
+            "Browser-exposed secret",
+            "high",
+            true,
+            true,
+            Some("browser"),
+            reasons,
+        );
+    }
+
+    if secretish {
         reasons.push("secret-like key name".to_string());
         return shape("secret", "Secret", "high", true, reasons);
     }
@@ -442,17 +460,27 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
         if url_like {
             reasons.push("URL-like name or value".to_string());
         }
-        return shape("dsn", "Credential URL / DSN", "high", true, reasons);
+        return shape_with_context(
+            "dsn",
+            "Credential URL / DSN",
+            "high",
+            true,
+            true,
+            public_prefix.then_some("browser"),
+            reasons,
+        );
     }
 
     if url_like && is_credential_url_key(&upper) {
         reasons.push("credential-bearing URL key name".to_string());
         reasons.push("URL-like name or value".to_string());
-        return shape(
+        return shape_with_context(
             "credential-url",
             "Credential URL / DSN",
             "high",
             true,
+            true,
+            public_prefix.then_some("browser"),
             reasons,
         );
     }
@@ -460,18 +488,27 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
     if url_like && url_value_has_secretish_parts(trimmed) {
         reasons.push("credential-like URL value".to_string());
         reasons.push("URL-like name or value".to_string());
-        return shape(
+        return shape_with_context(
             "credential-url",
             "Credential URL / DSN",
             "high",
             true,
+            true,
+            public_prefix.then_some("browser"),
             reasons,
         );
     }
 
     if public_prefix {
-        reasons.push("frontend-exposed prefix".to_string());
-        return shape("public", "Public frontend variable", "high", false, reasons);
+        return shape_with_context(
+            "public",
+            "Public frontend variable",
+            "high",
+            false,
+            false,
+            Some("browser"),
+            reasons,
+        );
     }
 
     if url_like {
@@ -1478,11 +1515,33 @@ fn shape(
     redacted_by_default: bool,
     reasons: Vec<String>,
 ) -> KeyShape {
+    shape_with_context(
+        kind,
+        label,
+        confidence,
+        redacted_by_default,
+        redacted_by_default,
+        None,
+        reasons,
+    )
+}
+
+fn shape_with_context(
+    kind: &str,
+    label: &str,
+    confidence: &str,
+    redacted_by_default: bool,
+    sensitive: bool,
+    exposure: Option<&str>,
+    reasons: Vec<String>,
+) -> KeyShape {
     KeyShape {
         kind: kind.to_string(),
         label: label.to_string(),
         confidence: confidence.to_string(),
         redacted_by_default,
+        sensitive,
+        exposure: exposure.map(str::to_string),
         reasons,
     }
 }
@@ -1843,11 +1902,27 @@ mod tests {
         let public_url = infer_key_shape("NEXT_PUBLIC_SITE_URL", "https://example.com");
         assert_eq!(public_url.kind, "public");
         assert!(!public_url.redacted_by_default);
+        assert!(!public_url.sensitive);
+        assert_eq!(public_url.exposure.as_deref(), Some("browser"));
 
         let public_with_token =
             infer_key_shape("VITE_CALLBACK_URL", "https://example.com/hook?token=abc");
         assert_eq!(public_with_token.kind, "credential-url");
         assert!(public_with_token.redacted_by_default);
+        assert!(public_with_token.sensitive);
+        assert_eq!(public_with_token.exposure.as_deref(), Some("browser"));
+
+        let public_secret = infer_key_shape("NEXT_PUBLIC_API_KEY", "sk-browser-leak");
+        assert_eq!(public_secret.kind, "public-secret");
+        assert!(public_secret.redacted_by_default);
+        assert!(public_secret.sensitive);
+        assert_eq!(public_secret.exposure.as_deref(), Some("browser"));
+        assert!(public_secret
+            .reasons
+            .contains(&"frontend-exposed prefix".to_string()));
+        assert!(public_secret
+            .reasons
+            .contains(&"secret-like key name".to_string()));
 
         let api_url = infer_key_shape("API_BASE_URL", "https://api.example.com");
         assert_eq!(api_url.kind, "url");

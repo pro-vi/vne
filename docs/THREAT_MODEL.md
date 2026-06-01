@@ -11,14 +11,15 @@
 ## Trust Boundaries
 
 - Rust parser and writer: trusted local code that reads and writes files selected by the user.
-- Svelte UI: trusted local code that renders parsed values and sends explicit commands to the Tauri backend.
+- Svelte UI: trusted local code that renders parsed values and sends explicit commands to the Tauri backend. Current redaction is a normal-UI presentation safeguard, not isolation from the local webview process.
 - Tauri command boundary: only local UI invokes project scan, value save, and blank-key insertion.
 - Native dialog: used only to pick a local directory.
 - Network: not part of the product path for env contents.
 
 ## Current Controls
 
-- Secret-like values and credential-bearing URLs/DSNs are redacted by default before they reach normal display fields.
+- Secret-like values, credential-bearing URLs/DSNs, and public-prefixed secret-looking names are redacted by default before they reach normal display fields.
+- Key-shape metadata separates sensitive-looking values from browser-exposed public prefixes, so names such as `NEXT_PUBLIC_API_KEY` are not treated as safe public values.
 - Findings include key names, file names, and framework load-order evidence, not raw values.
 - Source context shows structural metadata such as quote style, export prefix, comments, and diagnostics without adding network or logging paths.
 - Safe-edit mutation previews include only key names, file names, and the narrow edit shape.
@@ -40,6 +41,7 @@
 ## Known Residual Risks
 
 - Reveal mode intentionally shows secrets to the local user.
+- Parsed raw values are present inside the trusted local Tauri/Svelte process in this slice; redaction hides them from normal rendering but is not a separate secret-isolation boundary.
 - Raw preview intentionally shows the full selected env file after reveal mode when hidden secrets are present.
 - A malicious local project can use misleading key names or comments; `vne` treats env files as data and does not execute them.
 - Active project root checks reduce accidental path escape, but they are not a substitute for operating-system file permissions or user caution when opening untrusted projects.

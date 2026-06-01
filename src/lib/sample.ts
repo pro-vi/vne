@@ -16,7 +16,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         diagnostics: ['Duplicate key `FEATURE_ENABLED`'],
         duplicateKeys: ['FEATURE_ENABLED'],
         content:
-          '# local development\nDATABASE_URL="postgres://localhost/vne"\nREDIS_URL=redis://localhost:6379\nOPENAI_API_KEY=sk-local-redacted\nPRIVATE_KEY="-----BEGIN KEY-----\nabc123\n-----END KEY-----"\nNEXT_PUBLIC_SITE_URL=http://localhost:1420\nPORT=1420 # dev server\nFEATURE_ENABLED=true\nFEATURE_ENABLED=false\n',
+          '# local development\nDATABASE_URL="postgres://localhost/vne"\nREDIS_URL=redis://localhost:6379\nOPENAI_API_KEY=sk-local-redacted\nPRIVATE_KEY="-----BEGIN KEY-----\nabc123\n-----END KEY-----"\nNEXT_PUBLIC_SITE_URL=http://localhost:1420\nNEXT_PUBLIC_API_KEY=sk-browser-leak\nPORT=1420 # dev server\nFEATURE_ENABLED=true\nFEATURE_ENABLED=false\n',
         entries: [
           entry('DATABASE_URL', 'postgres://localhost/vne', 'Credential URL / DSN', 'credential-url', true, 2, [
             'credential-bearing URL key name',
@@ -33,9 +33,13 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
           entry('NEXT_PUBLIC_SITE_URL', 'http://localhost:1420', 'Public frontend variable', 'public', false, 8, [
             'frontend-exposed prefix'
           ]),
-          entry('PORT', '1420', 'Port', 'port', false, 9, ['port-like key or numeric port value'], [], '# dev server'),
-          entry('FEATURE_ENABLED', 'true', 'Boolean', 'bool', false, 10, ['boolean-like value'], ['Duplicate key']),
-          entry('FEATURE_ENABLED', 'false', 'Boolean', 'bool', false, 11, ['boolean-like value'], ['Duplicate key'])
+          entry('NEXT_PUBLIC_API_KEY', 'sk-browser-leak', 'Browser-exposed secret', 'public-secret', true, 9, [
+            'frontend-exposed prefix',
+            'secret-like key name'
+          ]),
+          entry('PORT', '1420', 'Port', 'port', false, 10, ['port-like key or numeric port value'], [], '# dev server'),
+          entry('FEATURE_ENABLED', 'true', 'Boolean', 'bool', false, 11, ['boolean-like value'], ['Duplicate key']),
+          entry('FEATURE_ENABLED', 'false', 'Boolean', 'bool', false, 12, ['boolean-like value'], ['Duplicate key'])
         ]
       },
       {
@@ -194,7 +198,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
       basePath,
       examplePath,
       missingKeys: ['STRIPE_SECRET_KEY'],
-      extraKeys: ['OPENAI_API_KEY', 'PRIVATE_KEY', 'FEATURE_ENABLED'],
+      extraKeys: ['OPENAI_API_KEY', 'PRIVATE_KEY', 'NEXT_PUBLIC_API_KEY', 'FEATURE_ENABLED'],
       sharedKeys: ['DATABASE_URL', 'NEXT_PUBLIC_SITE_URL', 'PORT', 'REDIS_URL'],
       duplicateKeys: ['.env:FEATURE_ENABLED']
     }
@@ -212,6 +216,8 @@ function entry(
   diagnostics: string[] = [],
   comment: string | null = null
 ) {
+  const exposure = reasons.includes('frontend-exposed prefix') ? 'browser' : null;
+
   return {
     id: `${key}@${lineNumber}`,
     key,
@@ -227,6 +233,8 @@ function entry(
       label,
       confidence: kind === 'text' ? 'low' : 'high',
       redactedByDefault: redacted,
+      sensitive: redacted,
+      exposure,
       reasons
     }
   };

@@ -35,6 +35,8 @@ export interface KeyShape {
   label: string;
   confidence: 'low' | 'medium' | 'high' | string;
   redactedByDefault: boolean;
+  sensitive: boolean;
+  exposure: string | null;
   reasons: string[];
 }
 

@@ -249,6 +249,14 @@
     return entry.diagnostics.length ? entry.diagnostics.join(', ') : 'none';
   }
 
+  function exposureLabel(entry: EnvEntry): string {
+    return entry.shape.exposure === 'browser' ? 'browser-exposed' : 'local process';
+  }
+
+  function sensitivityLabel(entry: EnvEntry): string {
+    return entry.shape.sensitive ? 'sensitive-looking' : 'normal display';
+  }
+
   function displayValue(entry: EnvEntry): string {
     if (!isEntryValueHidden(entry, showSecrets)) {
       return entry.value || '(empty)';
@@ -267,7 +275,9 @@
       return (
         entry.key.toLowerCase().includes(normalized) ||
         entry.shape.label.toLowerCase().includes(normalized) ||
-        entry.shape.kind.toLowerCase().includes(normalized)
+        entry.shape.kind.toLowerCase().includes(normalized) ||
+        (entry.shape.exposure?.toLowerCase().includes(normalized) ?? false) ||
+        (entry.shape.sensitive && 'sensitive'.includes(normalized))
       );
     });
   }
@@ -534,6 +544,14 @@
             <div>
               <dt>Diagnostics</dt>
               <dd>{diagnosticsLabel(selectedEntry)}</dd>
+            </div>
+            <div>
+              <dt>Exposure</dt>
+              <dd>{exposureLabel(selectedEntry)}</dd>
+            </div>
+            <div>
+              <dt>Sensitivity</dt>
+              <dd>{sensitivityLabel(selectedEntry)}</dd>
             </div>
           </dl>
         </div>

@@ -20,15 +20,16 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 - Uses Next.js and Vite env load-order knowledge as evidence on related findings
 - Shows value-safe findings for missing keys, duplicate keys, placeholders, and layered conflicts, with previewed blank-key insertion for documented missing keys
 - Lets targetable advisory findings jump to the relevant file and key without mutating the env file
-- Infers common shapes such as credential URL/DSN, URL, secret, public frontend variable, bool, int, port, path, list, UUID, JSON, PEM, and provider-specific keys
+- Infers common shapes such as credential URL/DSN, URL, secret, browser-exposed secret-looking variable, public frontend variable, bool, int, port, path, list, UUID, JSON, PEM, and provider-specific keys
 - Redacts secret-like values and credential-bearing URLs by default
+- Flags public-prefixed secret-looking names such as `NEXT_PUBLIC_API_KEY` as browser-exposed and sensitive-looking instead of treating them as safe public values
 - Shows structured source context such as duplicate occurrence, export prefix, quote style, inline comment, and parser diagnostics
 - Supports fast key scanning with filter focus and arrow-key row movement
 - Edits one selected key occurrence while preserving comments, order, quote style, multiline values, and adjacent formatting
 
 ## Privacy
 
-Env contents stay local. The current app has no network path for env data and no telemetry. Secret-like values are redacted in the UI and should not be logged.
+Env contents stay local. The current app has no network path for env data and no telemetry. Redaction is a presentation safeguard inside the trusted local app: secret-like values are hidden in normal UI until Reveal is active, but parsed values are still handled by the local Tauri/Svelte process.
 
 See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the current local-only threat model and release safety checklist.
 
@@ -77,4 +78,4 @@ fixtures/demo
 
 ## Current Status
 
-The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table and source context, redact likely secrets and credential-bearing URLs, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, attach Next.js and Vite load-order evidence to related findings, show value-safe findings, add documented missing keys as blank entries, support keyboard scanning, and save one selected key occurrence in the Tauri runtime. Release packaging is still intentionally deferred.
+The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table and source context, redact likely secrets, credential-bearing URLs, and public-prefixed secret-looking keys, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, attach Next.js and Vite load-order evidence to related findings, show value-safe findings, add documented missing keys as blank entries, support keyboard scanning, and save one selected key occurrence in the Tauri runtime. Release packaging is still intentionally deferred.
