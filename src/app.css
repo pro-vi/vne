@@ -310,6 +310,7 @@ textarea:focus {
   font-weight: 800;
 }
 
+.action-list,
 .override-list,
 .profile-list {
   display: grid;
@@ -319,6 +320,7 @@ textarea:focus {
   list-style: none;
 }
 
+.action-list li,
 .override-list li,
 .profile-list li {
   display: grid;
@@ -329,6 +331,11 @@ textarea:focus {
   background: #fff;
 }
 
+.action-list li.warning {
+  border-left: 3px solid var(--warning);
+}
+
+.action-list strong,
 .override-list strong,
 .profile-list strong {
   min-width: 0;
@@ -340,6 +347,7 @@ textarea:focus {
   white-space: nowrap;
 }
 
+.action-list span,
 .override-list span,
 .profile-list span {
   color: var(--muted);

@@ -12,6 +12,7 @@ pub struct ProjectSnapshot {
     pub comparison: Option<EnvComparison>,
     pub layer_report: EnvLayerReport,
     pub framework_profiles: Vec<FrameworkEnvProfile>,
+    pub repair_actions: Vec<EnvRepairAction>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -108,6 +109,17 @@ pub struct FrameworkEnvFile {
     pub rank: usize,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvRepairAction {
+    pub severity: String,
+    pub action_kind: String,
+    pub title: String,
+    pub detail: String,
+    pub file_path: Option<String>,
+    pub key: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedLine {
     key: String,
@@ -195,6 +207,7 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     let comparison = compare_actual_to_example(&files);
     let layer_report = build_layer_report(&files);
     let framework_profiles = build_framework_profiles(&root, &files);
+    let repair_actions = build_repair_actions(comparison.as_ref(), &layer_report);
 
     Ok(ProjectSnapshot {
         root: root.to_string_lossy().to_string(),
@@ -202,6 +215,7 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
         comparison,
         layer_report,
         framework_profiles,
+        repair_actions,
     })
 }
 
@@ -844,6 +858,105 @@ fn is_mode_name(mode: &str) -> bool {
         && mode
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+fn build_repair_actions(
+    comparison: Option<&EnvComparison>,
+    layer_report: &EnvLayerReport,
+) -> Vec<EnvRepairAction> {
+    let mut actions = Vec::new();
+
+    if let Some(comparison) = comparison {
+        for key in &comparison.missing_keys {
+            actions.push(EnvRepairAction {
+                severity: "warning".to_string(),
+                action_kind: "add-missing-key".to_string(),
+                title: format!("Add `{key}` to {}", file_label(&comparison.base_path)),
+                detail: format!(
+                    "`{key}` is documented in {} but missing from {}.",
+                    file_label(&comparison.example_path),
+                    file_label(&comparison.base_path)
+                ),
+                file_path: Some(comparison.base_path.clone()),
+                key: Some(key.clone()),
+            });
+        }
+
+        for key in &comparison.extra_keys {
+            actions.push(EnvRepairAction {
+                severity: "info".to_string(),
+                action_kind: "document-or-remove-key".to_string(),
+                title: format!("Document or remove `{key}`"),
+                detail: format!(
+                    "`{key}` exists in {} but not in {}.",
+                    file_label(&comparison.base_path),
+                    file_label(&comparison.example_path)
+                ),
+                file_path: Some(comparison.base_path.clone()),
+                key: Some(key.clone()),
+            });
+        }
+
+        for duplicate in &comparison.duplicate_keys {
+            let (file_name, key) = duplicate
+                .split_once(':')
+                .map(|(file_name, key)| (file_name.to_string(), key.to_string()))
+                .unwrap_or_else(|| ("env file".to_string(), duplicate.clone()));
+            actions.push(EnvRepairAction {
+                severity: "warning".to_string(),
+                action_kind: "resolve-duplicate-key".to_string(),
+                title: format!("Resolve duplicate `{key}`"),
+                detail: format!("`{file_name}` defines `{key}` more than once."),
+                file_path: None,
+                key: Some(key),
+            });
+        }
+    }
+
+    for placeholder in &layer_report.placeholder_keys {
+        let (file_name, key) = placeholder
+            .split_once(':')
+            .map(|(file_name, key)| (file_name.to_string(), key.to_string()))
+            .unwrap_or_else(|| ("env file".to_string(), placeholder.clone()));
+        actions.push(EnvRepairAction {
+            severity: "warning".to_string(),
+            action_kind: "replace-placeholder".to_string(),
+            title: format!("Replace placeholder `{key}`"),
+            detail: format!("`{file_name}` has a placeholder-like value for `{key}`."),
+            file_path: None,
+            key: Some(key),
+        });
+    }
+
+    for override_row in layer_report
+        .overrides
+        .iter()
+        .filter(|override_row| override_row.conflict)
+    {
+        actions.push(EnvRepairAction {
+            severity: "info".to_string(),
+            action_kind: "review-layer-conflict".to_string(),
+            title: format!("Review layered `{}`", override_row.key),
+            detail: format!(
+                "{} sets `{}` in multiple env layers; {} currently wins.",
+                override_row.files.join(", "),
+                override_row.key,
+                override_row.effective_file
+            ),
+            file_path: None,
+            key: Some(override_row.key.clone()),
+        });
+    }
+
+    actions
+}
+
+fn file_label(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string()
 }
 
 fn is_layer_file(file: &EnvFile) -> bool {
@@ -1493,6 +1606,53 @@ mod tests {
             .unwrap();
         assert!(secret.redacted);
         assert!(!secret.summary.contains("local-secret"));
+    }
+
+    #[test]
+    fn builds_repair_actions_without_exposing_values() {
+        let base = parse_env_file(
+            Path::new(".env"),
+            "DATABASE_URL=postgres://base\nJWT_SECRET=base-secret\nEXTRA=yes\nEXTRA=no\nAPI_TOKEN=replace-me\n".to_string(),
+        );
+        let local = parse_env_file(
+            Path::new(".env.local"),
+            "DATABASE_URL=postgres://local\nJWT_SECRET=local-secret\n".to_string(),
+        );
+        let example = parse_env_file(
+            Path::new(".env.example"),
+            "DATABASE_URL=\nJWT_SECRET=\nREDIS_URL=\n".to_string(),
+        );
+        let files = vec![base, local, example];
+        let comparison = compare_actual_to_example(&files);
+        let layer_report = build_layer_report(&files);
+
+        let actions = build_repair_actions(comparison.as_ref(), &layer_report);
+
+        assert!(actions
+            .iter()
+            .any(|action| action.action_kind == "add-missing-key"
+                && action.key.as_deref() == Some("REDIS_URL")));
+        assert!(actions
+            .iter()
+            .any(|action| action.action_kind == "resolve-duplicate-key"
+                && action.key.as_deref() == Some("EXTRA")));
+        assert!(actions
+            .iter()
+            .any(|action| action.action_kind == "replace-placeholder"
+                && action.key.as_deref() == Some("API_TOKEN")));
+        assert!(actions
+            .iter()
+            .any(|action| action.action_kind == "review-layer-conflict"
+                && action.key.as_deref() == Some("JWT_SECRET")));
+
+        let rendered = actions
+            .iter()
+            .map(|action| format!("{} {}", action.title, action.detail))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("base-secret"));
+        assert!(!rendered.contains("local-secret"));
+        assert!(!rendered.contains("postgres://"));
     }
 
     #[test]

@@ -143,6 +143,32 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         ]
       }
     ],
+    repairActions: [
+      {
+        severity: 'warning',
+        actionKind: 'add-missing-key',
+        title: 'Add `STRIPE_SECRET_KEY` to .env',
+        detail: '`STRIPE_SECRET_KEY` is documented in .env.example but missing from .env.',
+        filePath: basePath,
+        key: 'STRIPE_SECRET_KEY'
+      },
+      {
+        severity: 'warning',
+        actionKind: 'resolve-duplicate-key',
+        title: 'Resolve duplicate `FEATURE_ENABLED`',
+        detail: '`.env` defines `FEATURE_ENABLED` more than once.',
+        filePath: null,
+        key: 'FEATURE_ENABLED'
+      },
+      {
+        severity: 'info',
+        actionKind: 'review-layer-conflict',
+        title: 'Review layered `DATABASE_URL`',
+        detail: '.env, .env.local set `DATABASE_URL` in multiple env layers; .env.local currently wins.',
+        filePath: null,
+        key: 'DATABASE_URL'
+      }
+    ],
     comparison: {
       basePath,
       examplePath,

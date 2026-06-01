@@ -40,6 +40,7 @@
   $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && editValue !== selectedEntry.value);
   $: layerConflicts = snapshot?.layerReport.overrides.filter((override) => override.conflict) ?? [];
   $: frameworkMissingCount = snapshot?.frameworkProfiles.reduce((total, profile) => total + profile.missingFiles.length, 0) ?? 0;
+  $: repairActions = snapshot?.repairActions ?? [];
 
   async function openProject(): Promise<void> {
     notice = { kind: 'loading', message: 'Scanning env files...' };
@@ -212,6 +213,20 @@
         </div>
       {:else}
         <p class="empty-copy">No env-like files were found in this directory.</p>
+      {/if}
+
+      {#if repairActions.length > 0}
+        <div class="comparison-block">
+          <h2>Repair queue</h2>
+          <ul class="action-list">
+            {#each repairActions.slice(0, 5) as action}
+              <li class:warning={action.severity === 'warning'}>
+                <strong>{action.title}</strong>
+                <span>{action.detail}</span>
+              </li>
+            {/each}
+          </ul>
+        </div>
       {/if}
 
       {#if snapshot?.comparison}

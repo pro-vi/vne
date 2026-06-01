@@ -4,6 +4,7 @@ export interface ProjectSnapshot {
   comparison: EnvComparison | null;
   layerReport: EnvLayerReport;
   frameworkProfiles: FrameworkEnvProfile[];
+  repairActions: EnvRepairAction[];
 }
 
 export interface EnvFile {
@@ -80,6 +81,15 @@ export interface FrameworkEnvFile {
   name: string;
   layerKind: string;
   rank: number;
+}
+
+export interface EnvRepairAction {
+  severity: 'info' | 'warning' | string;
+  actionKind: string;
+  title: string;
+  detail: string;
+  filePath: string | null;
+  key: string | null;
 }
 
 export type KeyStatus = 'ok' | 'missing' | 'extra' | 'duplicate';
