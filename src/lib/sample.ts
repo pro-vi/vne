@@ -122,7 +122,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
           effectiveFile: '.env.local',
           conflict: true,
           redacted: true,
-          summary: '2 layers set different values; `.env.local` currently wins.'
+          summary: '2 layers set different values; runtime precedence needs framework evidence.'
         },
         {
           key: 'OPENAI_API_KEY',
@@ -130,7 +130,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
           effectiveFile: '.env.local',
           conflict: true,
           redacted: true,
-          summary: '2 layers set different values; `.env.local` currently wins.'
+          summary: '2 layers set different values; runtime precedence needs framework evidence.'
         }
       ],
       placeholderKeys: []
@@ -191,7 +191,8 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         severity: 'info',
         actionKind: 'review-layer-conflict',
         title: 'Review layered `DATABASE_URL`',
-        detail: '.env, .env.local set `DATABASE_URL` in multiple env layers; .env.local currently wins.',
+        detail:
+          '.env, .env.local set `DATABASE_URL` in multiple env layers; attached framework evidence may identify the likely effective value.',
         evidence: ['Next.js development load order: .env.local -> .env'],
         mutationPreview: null,
         filePath: null,

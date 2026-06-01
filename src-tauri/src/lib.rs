@@ -839,14 +839,11 @@ fn build_layer_report(files: &[EnvFile]) -> EnvLayerReport {
             .collect::<Vec<_>>();
         let summary = if conflict {
             format!(
-                "{} layers set different values; `{effective_file}` currently wins.",
+                "{} layers set different values; runtime precedence needs framework evidence.",
                 files.len()
             )
         } else {
-            format!(
-                "{} layers repeat the same value; `{effective_file}` currently wins.",
-                files.len()
-            )
+            format!("{} layers repeat the same value across files.", files.len())
         };
 
         overrides.push(EnvLayerOverride {
@@ -1136,17 +1133,26 @@ fn build_findings(
         .iter()
         .filter(|override_row| override_row.conflict)
     {
+        let evidence = framework_evidence_for_files(framework_profiles, &override_row.files);
+        let detail = if evidence.is_empty() {
+            format!(
+                "{} set `{}` in multiple env layers; runtime precedence is unknown without framework or tool evidence.",
+                override_row.files.join(", "),
+                override_row.key
+            )
+        } else {
+            format!(
+                "{} set `{}` in multiple env layers; attached framework evidence may identify the likely effective value.",
+                override_row.files.join(", "),
+                override_row.key
+            )
+        };
         findings.push(EnvFinding {
             severity: "info".to_string(),
             action_kind: "review-layer-conflict".to_string(),
             title: format!("Review layered `{}`", override_row.key),
-            detail: format!(
-                "{} sets `{}` in multiple env layers; {} currently wins.",
-                override_row.files.join(", "),
-                override_row.key,
-                override_row.effective_file
-            ),
-            evidence: framework_evidence_for_files(framework_profiles, &override_row.files),
+            detail,
+            evidence,
             mutation_preview: None,
             file_path: None,
             key: Some(override_row.key.clone()),
@@ -2253,6 +2259,9 @@ mod tests {
         assert_eq!(database.effective_file, ".env.local");
         assert!(database.conflict);
         assert!(database.redacted);
+        assert!(database
+            .summary
+            .contains("runtime precedence needs framework evidence"));
         assert!(!database.summary.contains("postgres://"));
 
         let secret = report
@@ -2368,6 +2377,8 @@ mod tests {
             .evidence
             .iter()
             .any(|evidence| evidence.contains("Next.js development load order")));
+        assert!(layer_finding.detail.contains("attached framework evidence"));
+        assert!(!layer_finding.detail.contains("currently wins"));
 
         let rendered = findings
             .iter()

@@ -16,7 +16,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 - Detects common files such as `.env`, `.env.local`, `.env.production`, `.env.example`, `.env.sample`, `.envrc`, and `.flaskenv`
 - Finds env files referenced by common project config, including `package.json` scripts using `--env-file`, `dotenv -e`, `env-cmd -f`, or `DOTENV_CONFIG_PATH`, plus Docker Compose `env_file`
 - Compares `.env` with `.env.example` for missing, extra, shared, and duplicate keys
-- Reports layered overrides across actual env files, naming the winning file without exposing secret values
+- Reports layered overrides across actual env files, avoiding generic winner claims unless framework evidence explains precedence
 - Uses Next.js and Vite env load-order knowledge as evidence on related findings
 - Shows value-safe findings for missing keys, duplicate keys, placeholders, and layered conflicts, with previewed blank-key insertion for documented missing keys
 - Lets targetable advisory findings jump to the relevant file and key occurrence without mutating the env file
