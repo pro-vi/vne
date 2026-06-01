@@ -157,8 +157,20 @@ fn load_project(path: String) -> Result<ProjectSnapshot, String> {
 }
 
 #[tauri::command]
-fn reveal_project(path: String) -> Result<ProjectSnapshot, String> {
-    snapshot_project(Path::new(&path)).map_err(|error| error.to_string())
+fn reveal_env_value(
+    root: String,
+    path: String,
+    key: String,
+    line_number: usize,
+) -> Result<String, String> {
+    let path = resolve_project_file(&root, &path)?;
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+
+    parse_env_entries(&content)
+        .into_iter()
+        .find(|entry| entry.key == key && entry.line_number == line_number)
+        .map(|entry| entry.value)
+        .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))
 }
 
 #[tauri::command]
@@ -205,7 +217,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             load_project,
-            reveal_project,
+            reveal_env_value,
             save_env_value,
             add_env_key
         ])
@@ -2221,16 +2233,21 @@ mod tests {
     }
 
     #[test]
-    fn load_project_redacts_secret_values_until_reveal() {
+    fn load_project_redacts_secret_values_until_per_entry_reveal() {
         let dir = tempdir().unwrap();
+        let env_path = dir.path().join(".env");
         fs::write(
-            dir.path().join(".env"),
+            &env_path,
             "API_TOKEN=sk-hidden\nPORT=1420\nDATABASE_URL=postgres://user:pass@localhost/app\n",
         )
         .unwrap();
 
         let hidden = load_project(dir.path().to_string_lossy().to_string()).unwrap();
-        let hidden_file = hidden.files.iter().find(|file| file.name == ".env").unwrap();
+        let hidden_file = hidden
+            .files
+            .iter()
+            .find(|file| file.name == ".env")
+            .unwrap();
         let token = hidden_file
             .entries
             .iter()
@@ -2249,17 +2266,32 @@ mod tests {
         assert!(!hidden_file.content.contains("user:pass"));
         assert!(hidden_file.content.contains("PORT=1420"));
 
-        let revealed = reveal_project(dir.path().to_string_lossy().to_string()).unwrap();
-        let revealed_file = revealed.files.iter().find(|file| file.name == ".env").unwrap();
-        let revealed_token = revealed_file
-            .entries
-            .iter()
-            .find(|entry| entry.key == "API_TOKEN")
-            .unwrap();
+        let revealed_token = reveal_env_value(
+            dir.path().to_string_lossy().to_string(),
+            env_path.to_string_lossy().to_string(),
+            "API_TOKEN".to_string(),
+            1,
+        )
+        .unwrap();
+        let revealed_database = reveal_env_value(
+            dir.path().to_string_lossy().to_string(),
+            env_path.to_string_lossy().to_string(),
+            "DATABASE_URL".to_string(),
+            3,
+        )
+        .unwrap();
 
-        assert_eq!(revealed_token.value, "sk-hidden");
-        assert!(revealed_file.content.contains("API_TOKEN=sk-hidden"));
-        assert!(revealed_file.content.contains("user:pass"));
+        assert_eq!(revealed_token, "sk-hidden");
+        assert_eq!(revealed_database, "postgres://user:pass@localhost/app");
+
+        let still_hidden = load_project(dir.path().to_string_lossy().to_string()).unwrap();
+        let still_hidden_file = still_hidden
+            .files
+            .iter()
+            .find(|file| file.name == ".env")
+            .unwrap();
+        assert!(!still_hidden_file.content.contains("sk-hidden"));
+        assert!(!still_hidden_file.content.contains("user:pass"));
     }
 
     #[test]
@@ -2298,9 +2330,14 @@ mod tests {
                 && finding.key.as_deref() == Some("API_TOKEN")
         }));
 
-        let revealed = reveal_project(dir.path().to_string_lossy().to_string()).unwrap();
-        let revealed_env = revealed.files.iter().find(|file| file.name == ".env").unwrap();
-        assert!(revealed_env.content.contains("API_TOKEN=sk-updated"));
+        let revealed = reveal_env_value(
+            dir.path().to_string_lossy().to_string(),
+            env_path.to_string_lossy().to_string(),
+            "API_TOKEN".to_string(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(revealed, "sk-updated");
     }
 
     #[test]

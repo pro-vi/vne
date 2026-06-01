@@ -1,7 +1,7 @@
 import type { EnvComparison, EnvEntry, EnvFile, KeyStatus, ProjectSnapshot } from './types';
 
-export function isEntryValueHidden(entry: EnvEntry, showSecrets: boolean): boolean {
-  return entry.shape.redactedByDefault && !showSecrets;
+export function isEntryValueHidden(entry: EnvEntry, revealed: boolean): boolean {
+  return entry.shape.redactedByDefault && !revealed;
 }
 
 export function totalIssueCount(snapshot: ProjectSnapshot | null): number {

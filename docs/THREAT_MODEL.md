@@ -11,7 +11,7 @@
 ## Trust Boundaries
 
 - Rust parser and writer: trusted local code that reads and writes files selected by the user.
-- Svelte UI: trusted local code that renders parsed values and sends explicit commands to the Tauri backend. Default snapshots do not include raw secret-like values; Reveal explicitly reloads raw values into the local webview for that session.
+- Svelte UI: trusted local code that renders parsed values and sends explicit commands to the Tauri backend. Default snapshots do not include raw secret-like values in parsed entries; Reveal fetches only one selected key occurrence into the local webview.
 - Tauri command boundary: only local UI invokes project scan, value save, and blank-key insertion.
 - Native dialog: used only to pick a local directory.
 - Network: not part of the product path for env contents.
@@ -20,7 +20,7 @@
 
 - Secret-like values, credential-bearing URLs/DSNs, and public-prefixed secret-looking names are redacted by default before normal Tauri snapshots reach the webview.
 - Default Tauri snapshots clear `entry.value` for redacted keys and scrub raw file preview content for files containing redacted entries.
-- The explicit Reveal command reloads the full local snapshot; Hide reloads the scrubbed snapshot again.
+- The explicit Reveal command fetches one selected key occurrence by file, key, and line number; Hide, selection changes, reloads, and saves clear that revealed value from Svelte state.
 - Key-shape metadata separates sensitive-looking values from browser-exposed public prefixes, so names such as `NEXT_PUBLIC_API_KEY` are not treated as safe public values.
 - Findings include key names, file names, and framework load-order evidence, not raw values.
 - Source context shows structural metadata such as quote style, export prefix, comments, and diagnostics without adding network or logging paths.
@@ -45,9 +45,9 @@
 
 ## Known Residual Risks
 
-- Reveal mode intentionally serializes raw secret values into the trusted local webview and shows them to the local user.
-- Parsed raw values are present inside the trusted Rust process during scans and writes. They enter the Svelte process only after the explicit Reveal command; this is still a local trust boundary, not OS-level secret isolation.
-- Raw preview intentionally shows the full selected env file after reveal mode when hidden secrets are present.
+- Reveal intentionally serializes one selected raw value into the trusted local webview and shows it to the local user.
+- Parsed raw values are present inside the trusted Rust process during scans, writes, and per-entry reveal. A selected raw value enters the Svelte process only after the explicit Reveal command; this is still a local trust boundary, not OS-level secret isolation.
+- Raw preview remains disabled while the selected file has hidden redacted entries. Default raw preview content is scrubbed for parsed secret-like values, but comments and malformed lines can still contain sensitive text if a local project stores secrets there.
 - A malicious local project can use misleading key names or comments; `vne` treats env files as data and does not execute them.
 - Active project root checks reduce accidental path escape, but they are not a substitute for operating-system file permissions or user caution when opening untrusted projects.
 - Screenshot or browser-inspection proof is still unavailable in this session because only navigation, not screenshot or DOM inspection, was exposed.

@@ -30,7 +30,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 
 ## Privacy
 
-Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Default Tauri snapshots scrub secret-like entry values and raw file previews before they reach the webview; Reveal explicitly reloads the full local snapshot for that session.
+Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Default Tauri snapshots scrub secret-like entry values and raw file previews before they reach the webview; Reveal fetches only the selected key occurrence into the local webview and clears it on hide, selection change, reload, or save.
 
 See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the current local-only threat model and release safety checklist.
 
@@ -80,4 +80,4 @@ fixtures/demo
 
 ## Current Status
 
-The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table and source context, redact likely secrets, credential-bearing URLs, and public-prefixed secret-looking keys at the Tauri command boundary until Reveal is active, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, attach Next.js and Vite load-order evidence to related findings, separate actionable missing-key insertion from advisory findings, support keyboard scanning, and save one selected key occurrence while rescanning project diagnostics in the Tauri runtime. Release packaging is still intentionally deferred.
+The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table and source context, redact likely secrets, credential-bearing URLs, and public-prefixed secret-looking keys at the Tauri command boundary, reveal one selected key occurrence on demand, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, attach Next.js and Vite load-order evidence to related findings, separate actionable missing-key insertion from advisory findings, support keyboard scanning, and save one selected key occurrence while rescanning project diagnostics in the Tauri runtime. Release packaging is still intentionally deferred.

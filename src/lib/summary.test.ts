@@ -18,7 +18,7 @@ describe('env summary helpers', () => {
     );
   });
 
-  it('hides secret values unless reveal is active', () => {
+  it('hides secret values unless that entry is revealed', () => {
     const snapshot = sampleProject();
     const secret = snapshot.files[0].entries.find((entry) => entry.key === 'OPENAI_API_KEY')!;
     const publicEntry = snapshot.files[0].entries.find((entry) => entry.key === 'NEXT_PUBLIC_SITE_URL')!;

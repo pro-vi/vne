@@ -11,7 +11,7 @@
     Search,
     ShieldCheck
   } from '@lucide/svelte';
-  import { addEnvKey, isTauriRuntime, loadProject, pickProjectDirectory, revealProject, saveEnvValue } from './lib/tauri';
+  import { addEnvKey, isTauriRuntime, loadProject, pickProjectDirectory, revealEnvValue, saveEnvValue } from './lib/tauri';
   import type { EnvEntry, EnvFile, EnvFinding, ProjectSnapshot } from './lib/types';
   import { isEntryValueHidden, keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
@@ -28,7 +28,8 @@
   let filter = '';
   let filterInput: HTMLInputElement | null = null;
   let showRaw = false;
-  let showSecrets = false;
+  let revealedEntryRef = '';
+  let revealedValue: string | null = null;
   let notice: Notice = {
     kind: 'idle',
     message: isTauriRuntime() ? 'Open a project directory to inspect env files.' : 'Browser preview is using local sample data.'
@@ -37,10 +38,14 @@
   $: selectedFile = snapshot?.files.find((file) => file.path === selectedPath) ?? snapshot?.files[0] ?? null;
   $: selectedEntry = selectedFile?.entries.find((entry) => entry.id === selectedEntryId) ?? selectedFile?.entries[0] ?? null;
   $: visibleEntries = selectedFile ? filterEntries(selectedFile, filter) : [];
-  $: selectedValueHidden = selectedEntry ? isEntryValueHidden(selectedEntry, showSecrets) : false;
-  $: selectedFileHasHiddenSecrets = Boolean(selectedFile?.entries.some((entry) => isEntryValueHidden(entry, showSecrets)));
+  $: selectedEntryRevealed = Boolean(selectedFile && selectedEntry && isEntryRevealed(selectedFile, selectedEntry));
+  $: selectedEntryValue = selectedFile && selectedEntry ? entryValue(selectedFile, selectedEntry) : '';
+  $: selectedValueHidden = selectedEntry ? isEntryValueHidden(selectedEntry, selectedEntryRevealed) : false;
+  $: selectedFileHasHiddenSecrets = Boolean(
+    selectedFile?.entries.some((entry) => isEntryValueHidden(entry, isEntryRevealed(selectedFile, entry)))
+  );
   $: issueCount = totalIssueCount(snapshot);
-  $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && !selectedValueHidden && editValue !== selectedEntry.value);
+  $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && !selectedValueHidden && editValue !== selectedEntryValue);
   $: layerConflicts = snapshot?.layerReport.overrides.filter((override) => override.conflict) ?? [];
   $: findings = snapshot?.findings ?? [];
   $: missingKeyFindings = findings.filter(isAddMissingKeyFinding);
@@ -53,8 +58,8 @@
     notice = { kind: 'loading', message: 'Scanning env files...' };
     try {
       const loaded = await loadProject(projectPath.trim() || '.');
-      showSecrets = false;
       showRaw = false;
+      clearRevealedEntry();
       const firstFile = loaded.files[0];
       const firstEntry = firstFile?.entries[0];
       applySnapshotSelection(loaded, firstFile?.path ?? '', firstEntry?.id ?? '', firstEntry?.key ?? '');
@@ -92,6 +97,7 @@
   }
 
   function chooseFile(file: EnvFile): void {
+    clearRevealedEntry();
     selectedPath = file.path;
     const firstEntry = file.entries[0];
     selectedEntryId = firstEntry?.id ?? '';
@@ -99,8 +105,12 @@
   }
 
   function chooseEntry(entry: EnvEntry): void {
+    const nextRef = selectedFile ? entryRevealRef(selectedFile, entry) : '';
+    if (nextRef !== revealedEntryRef) {
+      clearRevealedEntry();
+    }
     selectedEntryId = entry.id;
-    editValue = entry.value;
+    editValue = selectedFile ? entryValue(selectedFile, entry) : entry.value;
   }
 
   function moveSelection(delta: number): void {
@@ -156,8 +166,7 @@
       const savedEntryId = selectedEntry.id;
       const savedKey = selectedEntry.key;
       const saved = await saveEnvValue(root, savedPath, savedKey, selectedEntry.lineNumber, editValue);
-      const loaded = showSecrets ? await revealProject(root) : saved;
-      applySnapshotSelection(loaded, savedPath, savedEntryId, savedKey);
+      applySnapshotSelection(saved, savedPath, savedEntryId, savedKey);
       notice = { kind: 'success', message: `${savedKey} saved and project diagnostics rescanned.` };
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
@@ -173,37 +182,39 @@
     try {
       const root = snapshot?.root ?? (projectPath.trim() || '.');
       const loaded = await addEnvKey(root, finding.filePath, finding.key);
-      const refreshed = showSecrets ? await revealProject(root) : loaded;
-      applySnapshotSelection(refreshed, finding.filePath, '', finding.key);
+      applySnapshotSelection(loaded, finding.filePath, '', finding.key);
       notice = { kind: 'success', message: `${finding.key} was added as a blank value.` };
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
     }
   }
 
-  async function toggleSecrets(): Promise<void> {
-    if (!snapshot) {
-      showSecrets = !showSecrets;
+  async function toggleSelectedReveal(): Promise<void> {
+    if (!snapshot || !selectedFile || !selectedEntry || !selectedEntry.shape.redactedByDefault) {
       return;
     }
 
-    const reveal = !showSecrets;
+    if (selectedEntryRevealed) {
+      clearRevealedEntry();
+      editValue = selectedEntry.value;
+      showRaw = false;
+      notice = { kind: 'success', message: `${selectedEntry.key} hidden.` };
+      return;
+    }
+
     const root = currentProjectRoot();
-    const path = selectedPath;
-    const entryId = selectedEntryId;
-    const key = selectedEntry?.key ?? '';
-    notice = { kind: 'loading', message: reveal ? 'Revealing secret values...' : 'Hiding secret values...' };
+    const filePath = selectedFile.path;
+    const { key, lineNumber } = selectedEntry;
+    notice = { kind: 'loading', message: `Revealing ${key}...` };
 
     try {
-      const loaded = reveal ? await revealProject(root) : await loadProject(root);
-      showSecrets = reveal;
-      if (!reveal) {
-        showRaw = false;
-      }
-      applySnapshotSelection(loaded, path, entryId, key);
+      const value = await revealEnvValue(root, filePath, key, lineNumber);
+      revealedEntryRef = entryRevealRef(selectedFile, selectedEntry);
+      revealedValue = value;
+      editValue = value;
       notice = {
         kind: 'success',
-        message: reveal ? 'Secret values revealed for this session.' : 'Secret values hidden and snapshot reloaded.'
+        message: `${key} revealed until selection, hide, reload, or save.`
       };
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
@@ -246,6 +257,7 @@
   }
 
   function applySnapshotSelection(loaded: ProjectSnapshot, preferredPath: string, preferredEntryId: string, preferredKey: string): void {
+    clearRevealedEntry();
     snapshot = loaded;
     const refreshedFile = loaded.files.find((file) => file.path === preferredPath) ?? loaded.files[0] ?? null;
     selectedPath = refreshedFile?.path ?? preferredPath;
@@ -256,6 +268,27 @@
       null;
     selectedEntryId = refreshedEntry?.id ?? '';
     editValue = refreshedEntry?.value ?? '';
+  }
+
+  function clearRevealedEntry(): void {
+    revealedEntryRef = '';
+    revealedValue = null;
+  }
+
+  function entryRevealRef(file: EnvFile, entry: EnvEntry): string {
+    return `${file.path}\u0000${entry.id}`;
+  }
+
+  function isEntryRevealed(file: EnvFile, entry: EnvEntry): boolean {
+    return revealedValue !== null && revealedEntryRef === entryRevealRef(file, entry);
+  }
+
+  function entryValue(file: EnvFile, entry: EnvEntry): string {
+    if (isEntryRevealed(file, entry)) {
+      return revealedValue ?? '';
+    }
+
+    return entry.value;
   }
 
   function occurrenceLabel(file: EnvFile, entry: EnvEntry): string {
@@ -292,9 +325,9 @@
     return entry.shape.sensitive ? 'sensitive-looking' : 'normal display';
   }
 
-  function displayValue(entry: EnvEntry): string {
-    if (!isEntryValueHidden(entry, showSecrets)) {
-      return entry.value || '(empty)';
+  function displayValue(file: EnvFile, entry: EnvEntry): string {
+    if (!isEntryValueHidden(entry, isEntryRevealed(file, entry))) {
+      return entryValue(file, entry) || '(empty)';
     }
 
     return entry.displayValue;
@@ -490,13 +523,18 @@
           <Search size={16} aria-hidden="true" />
           <input bind:this={filterInput} bind:value={filter} placeholder="Filter keys or shapes" />
         </div>
-        <button type="button" class="ghost" disabled={notice.kind === 'loading'} onclick={() => void toggleSecrets()}>
-          {#if showSecrets}
+        <button
+          type="button"
+          class="ghost"
+          disabled={notice.kind === 'loading' || !selectedEntry?.shape.redactedByDefault}
+          onclick={() => void toggleSelectedReveal()}
+        >
+          {#if selectedEntryRevealed}
             <EyeOff size={16} aria-hidden="true" />
-            <span>Hide secrets</span>
+            <span>Hide selected</span>
           {:else}
             <Eye size={16} aria-hidden="true" />
-            <span>Reveal</span>
+            <span>Reveal selected</span>
           {/if}
         </button>
       </div>
@@ -524,7 +562,9 @@
             >
               <span class="key-name" role="cell">{entry.key}</span>
               <span class="shape-pill" role="cell">{entry.shape.label}</span>
-              <span class:redacted={entry.shape.redactedByDefault && !showSecrets} class="value-cell" role="cell">{displayValue(entry)}</span>
+              <span class:redacted={isEntryValueHidden(entry, isEntryRevealed(selectedFile, entry))} class="value-cell" role="cell">
+                {displayValue(selectedFile, entry)}
+              </span>
               <span class={`status ${status}`} role="cell">{statusLabel(status)}</span>
             </button>
           {/each}

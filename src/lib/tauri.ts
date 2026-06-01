@@ -10,19 +10,25 @@ export function isTauriRuntime(): boolean {
 export async function loadProject(path: string): Promise<ProjectSnapshot> {
   if (!isTauriRuntime()) {
     await delay(180);
-    return sampleProject(path || '/demo/project');
+    return redactProject(sampleProject(path || '/demo/project'));
   }
 
   return invoke<ProjectSnapshot>('load_project', { path });
 }
 
-export async function revealProject(path: string): Promise<ProjectSnapshot> {
+export async function revealEnvValue(root: string, path: string, key: string, lineNumber: number): Promise<string> {
   if (!isTauriRuntime()) {
     await delay(180);
-    return sampleProject(path || '/demo/project');
+    const snapshot = sampleProject(root || '/demo/project');
+    const file = snapshot.files.find((candidate) => candidate.path === path);
+    const entry = file?.entries.find((candidate) => candidate.key === key && candidate.lineNumber === lineNumber);
+    if (!entry) {
+      throw new Error(`Key \`${key}\` at line ${lineNumber} was not found`);
+    }
+    return entry.value;
   }
 
-  return invoke<ProjectSnapshot>('reveal_project', { path });
+  return invoke<string>('reveal_env_value', { root, path, key, lineNumber });
 }
 
 export async function saveEnvValue(
@@ -66,4 +72,26 @@ export async function pickProjectDirectory(defaultPath: string): Promise<string 
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function redactProject(snapshot: ProjectSnapshot): ProjectSnapshot {
+  return {
+    ...snapshot,
+    files: snapshot.files.map((file) => {
+      let content = file.content;
+      const entries = file.entries.map((entry) => {
+        if (!entry.shape.redactedByDefault) {
+          return entry;
+        }
+
+        if (entry.value) {
+          content = content.split(entry.value).join('********');
+        }
+
+        return { ...entry, value: '' };
+      });
+
+      return { ...file, content, entries };
+    })
+  };
 }
