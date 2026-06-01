@@ -16,22 +16,22 @@ export async function loadProject(path: string): Promise<ProjectSnapshot> {
   return invoke<ProjectSnapshot>('load_project', { path });
 }
 
-export async function saveEnvValue(path: string, key: string, value: string): Promise<EnvFile> {
+export async function saveEnvValue(root: string, path: string, key: string, value: string): Promise<EnvFile> {
   if (!isTauriRuntime()) {
     await delay(180);
     throw new Error('Saving is available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
-  return invoke<EnvFile>('save_env_value', { path, key, value });
+  return invoke<EnvFile>('save_env_value', { root, path, key, value });
 }
 
-export async function addEnvKey(path: string, key: string): Promise<EnvFile> {
+export async function addEnvKey(root: string, path: string, key: string): Promise<EnvFile> {
   if (!isTauriRuntime()) {
     await delay(180);
     throw new Error('Repair actions are available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
-  return invoke<EnvFile>('add_env_key', { path, key });
+  return invoke<EnvFile>('add_env_key', { root, path, key });
 }
 
 export async function pickProjectDirectory(defaultPath: string): Promise<string | null> {

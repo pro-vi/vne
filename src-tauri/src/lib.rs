@@ -139,8 +139,13 @@ fn load_project(path: String) -> Result<ProjectSnapshot, String> {
 }
 
 #[tauri::command]
-fn save_env_value(path: String, key: String, value: String) -> Result<EnvFile, String> {
-    let path = PathBuf::from(path);
+fn save_env_value(
+    root: String,
+    path: String,
+    key: String,
+    value: String,
+) -> Result<EnvFile, String> {
+    let path = resolve_project_file(&root, &path)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let updated = replace_env_value(&content, &key, &value)
         .ok_or_else(|| format!("Key `{key}` was not found"))?;
@@ -151,8 +156,8 @@ fn save_env_value(path: String, key: String, value: String) -> Result<EnvFile, S
 }
 
 #[tauri::command]
-fn add_env_key(path: String, key: String) -> Result<EnvFile, String> {
-    let path = PathBuf::from(path);
+fn add_env_key(root: String, path: String, key: String) -> Result<EnvFile, String> {
+    let path = resolve_project_file(&root, &path)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let updated = append_env_key(&content, &key, "")
         .ok_or_else(|| format!("Key `{key}` already exists or is not a valid env key"))?;
@@ -1090,6 +1095,27 @@ fn add_discovered_env_file(
     discovered.entry(canonical).or_default().insert(reason);
 }
 
+fn resolve_project_file(root: &str, path: &str) -> Result<PathBuf, String> {
+    let root = Path::new(root)
+        .canonicalize()
+        .map_err(|error| format!("Project root is not accessible: {error}"))?;
+    if !root.is_dir() {
+        return Err("Project root is not a directory".to_string());
+    }
+
+    let path = Path::new(path)
+        .canonicalize()
+        .map_err(|error| format!("Env file is not accessible: {error}"))?;
+    if !path.is_file() {
+        return Err("Env path is not a file".to_string());
+    }
+    if !path.starts_with(&root) {
+        return Err("Env file is outside the active project root".to_string());
+    }
+
+    Ok(path)
+}
+
 fn discover_package_json_env_files(
     root: &Path,
     discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>,
@@ -1639,6 +1665,30 @@ mod tests {
             .discovery_reasons
             .iter()
             .any(|reason| reason.contains("package.json")));
+    }
+
+    #[test]
+    fn resolves_write_paths_only_inside_project_root() {
+        let project = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let inside_file = project.path().join(".env");
+        let outside_file = outside.path().join(".env");
+        fs::write(&inside_file, "PORT=1420\n").unwrap();
+        fs::write(&outside_file, "PORT=1420\n").unwrap();
+
+        assert_eq!(
+            resolve_project_file(
+                project.path().to_str().unwrap(),
+                inside_file.to_str().unwrap()
+            )
+            .unwrap(),
+            inside_file.canonicalize().unwrap()
+        );
+        assert!(resolve_project_file(
+            project.path().to_str().unwrap(),
+            outside_file.to_str().unwrap()
+        )
+        .is_err());
     }
 
     #[test]

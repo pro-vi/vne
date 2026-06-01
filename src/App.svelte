@@ -144,7 +144,7 @@
 
     notice = { kind: 'loading', message: `Saving ${selectedEntry.key}...` };
     try {
-      const refreshed = await saveEnvValue(selectedFile.path, selectedEntry.key, editValue);
+      const refreshed = await saveEnvValue(snapshot?.root ?? (projectPath.trim() || '.'), selectedFile.path, selectedEntry.key, editValue);
       snapshot = snapshot
         ? {
             ...snapshot,
@@ -168,8 +168,9 @@
 
     notice = { kind: 'loading', message: `Adding ${action.key}...` };
     try {
-      await addEnvKey(action.filePath, action.key);
-      const loaded = await loadProject(snapshot?.root ?? (projectPath.trim() || '.'));
+      const root = snapshot?.root ?? (projectPath.trim() || '.');
+      await addEnvKey(root, action.filePath, action.key);
+      const loaded = await loadProject(root);
       snapshot = loaded;
       selectedPath = action.filePath;
       selectedKey = action.key;

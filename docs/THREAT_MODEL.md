@@ -23,6 +23,7 @@
 - Layer conflict summaries name the effective file without showing competing values.
 - Save operations update one key at a time and use atomic write with permission preservation where practical.
 - Blank-key repair only appends `KEY=` for a documented missing key; it refuses duplicate or invalid keys.
+- Write commands resolve the active project root and reject file paths outside that root.
 - Browser preview uses sample data and cannot save or apply repair actions.
 - The app has no accounts, telemetry, sync, hosted validation, or cloud calls for env data.
 
@@ -38,13 +39,13 @@
 - Reveal mode intentionally shows secrets to the local user.
 - Raw preview intentionally shows the full selected env file when the user asks for it.
 - A malicious local project can use misleading key names or comments; `vne` treats env files as data and does not execute them.
-- Custom Tauri commands currently accept paths from the local UI. The UI only passes scanned or selected paths, but command hardening should eventually restrict writes to the active project root.
+- Active project root checks reduce accidental path escape, but they are not a substitute for operating-system file permissions or user caution when opening untrusted projects.
 - Screenshot or browser-inspection proof is still unavailable in this session because only navigation, not screenshot or DOM inspection, was exposed.
 
 ## Release Checklist Before Public Distribution
 
 - Re-run source scans for network clients, telemetry SDKs, and logging of raw values.
-- Add path-scope checks around write commands.
+- Re-check path-scope behavior around write commands after any command-surface change.
 - Verify raw values are absent from structured logs and error paths.
 - Verify macOS signing/notarization choices with explicit user approval.
 - Capture screenshots using a local browser-control surface.
