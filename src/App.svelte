@@ -29,6 +29,7 @@
   let filterInput: HTMLInputElement | null = null;
   let showRaw = false;
   let missingKeyDrafts: Record<string, string> = {};
+  let duplicateSaveChoices: Record<string, string> = {};
   let revealedEntryRef = '';
   let revealedValue: string | null = null;
   let notice: Notice = {
@@ -42,11 +43,16 @@
   $: selectedEntryRevealed = Boolean(selectedFile && selectedEntry && isEntryRevealed(selectedFile, selectedEntry));
   $: selectedEntryValue = selectedFile && selectedEntry ? entryValue(selectedFile, selectedEntry) : '';
   $: selectedValueHidden = selectedEntry ? isEntryValueHidden(selectedEntry, selectedEntryRevealed) : false;
+  $: selectedEntryDuplicate = Boolean(selectedFile && selectedEntry && selectedFile.duplicateKeys.includes(selectedEntry.key));
+  $: duplicateSaveAllowed =
+    !selectedEntryDuplicate || Boolean(selectedFile && selectedEntry && duplicateSaveChoice(selectedFile, selectedEntry) === 'this-occurrence');
   $: selectedFileHasHiddenSecrets = Boolean(
     selectedFile?.entries.some((entry) => isEntryValueHidden(entry, isEntryRevealed(selectedFile, entry)))
   );
   $: issueCount = totalIssueCount(snapshot);
-  $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && !selectedValueHidden && editValue !== selectedEntryValue);
+  $: canSave = Boolean(
+    isTauriRuntime() && selectedFile && selectedEntry && !selectedValueHidden && duplicateSaveAllowed && editValue !== selectedEntryValue
+  );
   $: layerConflicts = snapshot?.layerReport.overrides.filter((override) => override.conflict) ?? [];
   $: findings = snapshot?.findings ?? [];
   $: missingKeyFindings = findings.filter(isAddMissingKeyFinding);
@@ -285,8 +291,21 @@
     return secretLike ? 'password' : 'text';
   }
 
+  function duplicateSaveChoice(file: EnvFile, entry: EnvEntry): string {
+    return duplicateSaveChoices[duplicateSaveRef(file, entry)] ?? '';
+  }
+
+  function setDuplicateSaveChoice(file: EnvFile, entry: EnvEntry, value: string): void {
+    duplicateSaveChoices = { ...duplicateSaveChoices, [duplicateSaveRef(file, entry)]: value };
+  }
+
+  function duplicateSaveRef(file: EnvFile, entry: EnvEntry): string {
+    return `${file.path}\u0000${entry.id}`;
+  }
+
   function applySnapshotSelection(loaded: ProjectSnapshot, preferredPath: string, preferredEntryId: string, preferredKey: string): void {
     clearRevealedEntry();
+    duplicateSaveChoices = {};
     snapshot = loaded;
     const refreshedFile = loaded.files.find((file) => file.path === preferredPath) ?? loaded.files[0] ?? null;
     selectedPath = refreshedFile?.path ?? preferredPath;
@@ -629,6 +648,17 @@
           <textarea id="value-editor" value={selectedEntry.displayValue} spellcheck="false" rows="5" readonly></textarea>
         {:else}
           <textarea id="value-editor" bind:value={editValue} spellcheck="false" rows="5"></textarea>
+        {/if}
+        {#if selectedEntryDuplicate}
+          <label class="editor-label" for="duplicate-save-target">Duplicate save target</label>
+          <select
+            id="duplicate-save-target"
+            value={duplicateSaveChoice(selectedFile, selectedEntry)}
+            onchange={(event) => setDuplicateSaveChoice(selectedFile, selectedEntry, event.currentTarget.value)}
+          >
+            <option value="">Choose target</option>
+            <option value="this-occurrence">This occurrence only ({occurrenceLabel(selectedFile, selectedEntry)})</option>
+          </select>
         {/if}
         <button class="primary save-button" type="button" disabled={!canSave} onclick={() => void saveValue()}>
           <Save size={16} aria-hidden="true" />

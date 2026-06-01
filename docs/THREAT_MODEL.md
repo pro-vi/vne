@@ -28,6 +28,7 @@
 - Advisory finding inspection changes only UI selection state; targetable findings carry entry id and line number where an exact occurrence exists, and inspection does not mutate files.
 - Layer conflict summaries avoid generic winner claims; framework load-order evidence is attached to findings when available without showing competing values.
 - Save operations update one selected key occurrence at a time, use atomic write with permission preservation where practical, and return a fresh project snapshot so diagnostics do not stay stale after writes.
+- Duplicate-key saves require an explicit "this occurrence only" choice in the UI before the save button is enabled.
 - Missing-key insertion requires an explicit non-empty value; it refuses duplicate, invalid, or empty keys and returns a fresh project snapshot.
 - Write commands resolve the active project root and reject file paths outside that root.
 - Parser/write regression tests include CRLF, UTF-8 BOM, empty values, inline comments, hashes inside values, quoted values, multiline values, invalid keys, duplicates, and quote-requiring replacements.

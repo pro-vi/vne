@@ -25,6 +25,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 - Flags public-prefixed secret-looking names such as `NEXT_PUBLIC_API_KEY` as browser-exposed and sensitive-looking instead of treating them as safe public values
 - Shows structured source context such as duplicate occurrence, export prefix, quote style, inline comment, and parser diagnostics
 - Supports fast key scanning with filter focus and arrow-key row movement
+- Requires an explicit occurrence choice before saving duplicate keys
 - Edits one selected key occurrence while preserving comments, order, quote style, multiline values, and adjacent formatting
 - Parser/write tests cover CRLF, UTF-8 BOM, empty values, inline comments, hashes inside values, quoted values, multiline values, invalid keys, duplicates, and quote-requiring replacements
 
