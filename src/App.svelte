@@ -150,24 +150,22 @@
 
     notice = { kind: 'loading', message: `Saving ${selectedEntry.key}...` };
     try {
-      const refreshed = await saveEnvValue(
-        snapshot?.root ?? (projectPath.trim() || '.'),
-        selectedFile.path,
-        selectedEntry.key,
-        selectedEntry.lineNumber,
-        editValue
-      );
-      snapshot = snapshot
-        ? {
-            ...snapshot,
-            files: snapshot.files.map((file) => (file.path === refreshed.path ? refreshed : file))
-          }
-        : null;
-      selectedPath = refreshed.path;
-      const refreshedEntry = refreshed.entries.find((entry) => entry.id === selectedEntry.id);
-      selectedEntryId = refreshedEntry?.id ?? selectedEntry.id;
-      editValue = refreshedEntry?.value ?? editValue;
-      notice = { kind: 'success', message: `${selectedEntry.key} saved without rewriting the full file view.` };
+      const root = snapshot?.root ?? (projectPath.trim() || '.');
+      const savedPath = selectedFile.path;
+      const savedEntryId = selectedEntry.id;
+      const savedKey = selectedEntry.key;
+      const loaded = await saveEnvValue(root, savedPath, savedKey, selectedEntry.lineNumber, editValue);
+      snapshot = loaded;
+      const refreshedFile = loaded.files.find((file) => file.path === savedPath) ?? loaded.files[0] ?? null;
+      selectedPath = refreshedFile?.path ?? savedPath;
+      const refreshedEntry =
+        refreshedFile?.entries.find((entry) => entry.id === savedEntryId) ??
+        refreshedFile?.entries.find((entry) => entry.key === savedKey) ??
+        refreshedFile?.entries[0] ??
+        null;
+      selectedEntryId = refreshedEntry?.id ?? '';
+      editValue = refreshedEntry?.value ?? '';
+      notice = { kind: 'success', message: `${savedKey} saved and project diagnostics rescanned.` };
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
     }
@@ -181,8 +179,7 @@
     notice = { kind: 'loading', message: `Adding ${finding.key}...` };
     try {
       const root = snapshot?.root ?? (projectPath.trim() || '.');
-      await addEnvKey(root, finding.filePath, finding.key);
-      const loaded = await loadProject(root);
+      const loaded = await addEnvKey(root, finding.filePath, finding.key);
       snapshot = loaded;
       selectedPath = finding.filePath;
       const refreshedFile = loaded.files.find((file) => file.path === finding.filePath);

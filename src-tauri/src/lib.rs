@@ -152,27 +152,31 @@ fn save_env_value(
     key: String,
     line_number: usize,
     value: String,
-) -> Result<EnvFile, String> {
+) -> Result<ProjectSnapshot, String> {
+    let root_path = Path::new(&root)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
     let path = resolve_project_file(&root, &path)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let updated = replace_env_value_at(&content, &key, line_number, &value)
         .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))?;
 
     atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
-    let refreshed = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    Ok(parse_env_file(&path, refreshed))
+    snapshot_project(&root_path).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn add_env_key(root: String, path: String, key: String) -> Result<EnvFile, String> {
+fn add_env_key(root: String, path: String, key: String) -> Result<ProjectSnapshot, String> {
+    let root_path = Path::new(&root)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
     let path = resolve_project_file(&root, &path)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let updated = append_env_key(&content, &key, "")
         .ok_or_else(|| format!("Key `{key}` already exists or is not a valid env key"))?;
 
     atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
-    let refreshed = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    Ok(parse_env_file(&path, refreshed))
+    snapshot_project(&root_path).map_err(|error| error.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2032,6 +2036,70 @@ mod tests {
             outside_file.to_str().unwrap()
         )
         .is_err());
+    }
+
+    #[test]
+    fn save_value_command_returns_rescanned_snapshot() {
+        let dir = tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        fs::write(&env_path, "API_TOKEN=todo\nPORT=1420\n").unwrap();
+        fs::write(dir.path().join(".env.example"), "API_TOKEN=\nPORT=1420\n").unwrap();
+
+        let before = snapshot_project(dir.path()).unwrap();
+        assert!(before.findings.iter().any(|finding| {
+            finding.action_kind == "replace-placeholder"
+                && finding.key.as_deref() == Some("API_TOKEN")
+        }));
+
+        let after = save_env_value(
+            dir.path().to_string_lossy().to_string(),
+            env_path.to_string_lossy().to_string(),
+            "API_TOKEN".to_string(),
+            1,
+            "sk-updated".to_string(),
+        )
+        .unwrap();
+        let refreshed_env = after.files.iter().find(|file| file.name == ".env").unwrap();
+        let refreshed_entry = refreshed_env
+            .entries
+            .iter()
+            .find(|entry| entry.key == "API_TOKEN")
+            .unwrap();
+
+        assert_eq!(refreshed_entry.value, "sk-updated");
+        assert!(!after.findings.iter().any(|finding| {
+            finding.action_kind == "replace-placeholder"
+                && finding.key.as_deref() == Some("API_TOKEN")
+        }));
+    }
+
+    #[test]
+    fn add_key_command_returns_rescanned_snapshot() {
+        let dir = tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        fs::write(&env_path, "PORT=1420\n").unwrap();
+        fs::write(dir.path().join(".env.example"), "PORT=1420\nREDIS_URL=\n").unwrap();
+
+        let before = snapshot_project(dir.path()).unwrap();
+        assert!(before.findings.iter().any(|finding| {
+            finding.action_kind == "add-missing-key" && finding.key.as_deref() == Some("REDIS_URL")
+        }));
+
+        let after = add_env_key(
+            dir.path().to_string_lossy().to_string(),
+            env_path.to_string_lossy().to_string(),
+            "REDIS_URL".to_string(),
+        )
+        .unwrap();
+        let refreshed_env = after.files.iter().find(|file| file.name == ".env").unwrap();
+
+        assert!(refreshed_env
+            .entries
+            .iter()
+            .any(|entry| entry.key == "REDIS_URL"));
+        assert!(!after.findings.iter().any(|finding| {
+            finding.action_kind == "add-missing-key" && finding.key.as_deref() == Some("REDIS_URL")
+        }));
     }
 
     #[test]
