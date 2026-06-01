@@ -91,6 +91,7 @@ export interface EnvFinding {
   title: string;
   detail: string;
   evidence: string[];
+  mutationPreview: string | null;
   filePath: string | null;
   key: string | null;
 }

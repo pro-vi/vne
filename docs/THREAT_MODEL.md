@@ -21,6 +21,7 @@
 - Secret-like values and credential-bearing URLs/DSNs are redacted by default before they reach normal display fields.
 - Findings include key names, file names, and framework load-order evidence, not raw values.
 - Source context shows structural metadata such as quote style, export prefix, comments, and diagnostics without adding network or logging paths.
+- Safe-edit mutation previews include only key names, file names, and the narrow edit shape.
 - Layer conflict summaries name the effective file without showing competing values.
 - Save operations update one selected key occurrence at a time and use atomic write with permission preservation where practical.
 - Blank-key repair only appends `KEY=` for a documented missing key; it refuses duplicate or invalid keys.

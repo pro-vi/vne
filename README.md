@@ -18,7 +18,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 - Compares `.env` with `.env.example` for missing, extra, shared, and duplicate keys
 - Reports layered overrides across actual env files, naming the winning file without exposing secret values
 - Uses Next.js and Vite env load-order knowledge as evidence on related findings
-- Shows value-safe findings for missing keys, duplicate keys, placeholders, and layered conflicts, with safe blank-key insertion for documented missing keys
+- Shows value-safe findings for missing keys, duplicate keys, placeholders, and layered conflicts, with previewed blank-key insertion for documented missing keys
 - Infers common shapes such as credential URL/DSN, URL, secret, public frontend variable, bool, int, port, path, list, UUID, JSON, PEM, and provider-specific keys
 - Redacts secret-like values and credential-bearing URLs by default
 - Shows structured source context such as duplicate occurrence, export prefix, quote style, inline comment, and parser diagnostics

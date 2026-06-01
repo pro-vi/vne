@@ -360,6 +360,13 @@ textarea:focus {
   line-height: 1.35;
 }
 
+.mutation-preview {
+  color: var(--ink-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .evidence-list {
   display: grid;
   gap: 2px;

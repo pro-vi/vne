@@ -119,6 +119,7 @@ pub struct EnvFinding {
     pub title: String,
     pub detail: String,
     pub evidence: Vec<String>,
+    pub mutation_preview: Option<String>,
     pub file_path: Option<String>,
     pub key: Option<String>,
 }
@@ -992,6 +993,10 @@ fn build_findings(
                     file_label(&comparison.base_path)
                 ),
                 evidence: Vec::new(),
+                mutation_preview: Some(format!(
+                    "Append `{key}=` to {}.",
+                    file_label(&comparison.base_path)
+                )),
                 file_path: Some(comparison.base_path.clone()),
                 key: Some(key.clone()),
             });
@@ -1008,6 +1013,7 @@ fn build_findings(
                     file_label(&comparison.example_path)
                 ),
                 evidence: Vec::new(),
+                mutation_preview: None,
                 file_path: Some(comparison.base_path.clone()),
                 key: Some(key.clone()),
             });
@@ -1024,6 +1030,7 @@ fn build_findings(
                 title: format!("Resolve duplicate `{key}`"),
                 detail: format!("`{file_name}` defines `{key}` more than once."),
                 evidence: Vec::new(),
+                mutation_preview: None,
                 file_path: None,
                 key: Some(key),
             });
@@ -1041,6 +1048,7 @@ fn build_findings(
             title: format!("Replace placeholder `{key}`"),
             detail: format!("`{file_name}` has a placeholder-like value for `{key}`."),
             evidence: Vec::new(),
+            mutation_preview: None,
             file_path: None,
             key: Some(key),
         });
@@ -1062,6 +1070,7 @@ fn build_findings(
                 override_row.effective_file
             ),
             evidence: framework_evidence_for_files(framework_profiles, &override_row.files),
+            mutation_preview: None,
             file_path: None,
             key: Some(override_row.key.clone()),
         });
@@ -2020,6 +2029,17 @@ mod tests {
             .iter()
             .any(|finding| finding.action_kind == "add-missing-key"
                 && finding.key.as_deref() == Some("REDIS_URL")));
+        let missing_finding = findings
+            .iter()
+            .find(|finding| {
+                finding.action_kind == "add-missing-key"
+                    && finding.key.as_deref() == Some("REDIS_URL")
+            })
+            .unwrap();
+        assert_eq!(
+            missing_finding.mutation_preview.as_deref(),
+            Some("Append `REDIS_URL=` to .env.")
+        );
         assert!(findings
             .iter()
             .any(|finding| finding.action_kind == "resolve-duplicate-key"
@@ -2046,7 +2066,14 @@ mod tests {
 
         let rendered = findings
             .iter()
-            .map(|finding| format!("{} {}", finding.title, finding.detail))
+            .map(|finding| {
+                format!(
+                    "{} {} {}",
+                    finding.title,
+                    finding.detail,
+                    finding.mutation_preview.as_deref().unwrap_or_default()
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!rendered.contains("base-secret"));

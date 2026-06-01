@@ -331,6 +331,9 @@
               <li class:warning={finding.severity === 'warning'}>
                 <strong>{finding.title}</strong>
                 <span>{finding.detail}</span>
+                {#if finding.mutationPreview}
+                  <small class="mutation-preview">{finding.mutationPreview}</small>
+                {/if}
                 <button type="button" class="mini-action" disabled={!canApplySafeEdit(finding)} onclick={() => void applySafeEdit(finding)}>
                   Add blank
                 </button>
