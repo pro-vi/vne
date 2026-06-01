@@ -43,8 +43,8 @@
   $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && !selectedValueHidden && editValue !== selectedEntry.value);
   $: layerConflicts = snapshot?.layerReport.overrides.filter((override) => override.conflict) ?? [];
   $: findings = snapshot?.findings ?? [];
-  $: safeEditFindings = findings.filter(isSafeEditFinding);
-  $: advisoryFindings = findings.filter((finding) => !isSafeEditFinding(finding));
+  $: missingKeyFindings = findings.filter(isAddMissingKeyFinding);
+  $: advisoryFindings = findings.filter((finding) => !isAddMissingKeyFinding(finding));
   $: if (selectedFileHasHiddenSecrets && showRaw) {
     showRaw = false;
   }
@@ -171,8 +171,8 @@
     }
   }
 
-  async function applySafeEdit(finding: EnvFinding): Promise<void> {
-    if (!canApplySafeEdit(finding) || !finding.filePath || !finding.key) {
+  async function addMissingKey(finding: EnvFinding): Promise<void> {
+    if (!canAddMissingKey(finding) || !finding.filePath || !finding.key) {
       return;
     }
 
@@ -211,12 +211,12 @@
     chooseEntry(entry);
   }
 
-  function isSafeEditFinding(finding: EnvFinding): boolean {
+  function isAddMissingKeyFinding(finding: EnvFinding): boolean {
     return finding.actionKind === 'add-missing-key' && Boolean(finding.filePath && finding.key);
   }
 
-  function canApplySafeEdit(finding: EnvFinding): boolean {
-    return isTauriRuntime() && isSafeEditFinding(finding);
+  function canAddMissingKey(finding: EnvFinding): boolean {
+    return isTauriRuntime() && isAddMissingKeyFinding(finding);
   }
 
   function canInspectFinding(finding: EnvFinding): boolean {
@@ -353,18 +353,18 @@
         <p class="empty-copy">No env-like files were found in this directory.</p>
       {/if}
 
-      {#if safeEditFindings.length > 0}
+      {#if missingKeyFindings.length > 0}
         <div class="comparison-block">
-          <h2>Safe edits</h2>
+          <h2>Add missing keys</h2>
           <ul class="action-list">
-            {#each safeEditFindings.slice(0, 3) as finding}
+            {#each missingKeyFindings.slice(0, 3) as finding}
               <li class:warning={finding.severity === 'warning'}>
                 <strong>{finding.title}</strong>
                 <span>{finding.detail}</span>
                 {#if finding.mutationPreview}
                   <small class="mutation-preview">{finding.mutationPreview}</small>
                 {/if}
-                <button type="button" class="mini-action" disabled={!canApplySafeEdit(finding)} onclick={() => void applySafeEdit(finding)}>
+                <button type="button" class="mini-action" disabled={!canAddMissingKey(finding)} onclick={() => void addMissingKey(finding)}>
                   Add blank
                 </button>
               </li>

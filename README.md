@@ -18,7 +18,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 - Compares `.env` with `.env.example` for missing, extra, shared, and duplicate keys
 - Reports layered overrides across actual env files, avoiding generic winner claims unless framework evidence explains precedence
 - Uses Next.js and Vite env load-order knowledge as evidence on related findings
-- Shows value-safe findings for missing keys, duplicate keys, placeholders, and layered conflicts, with previewed blank-key insertion for documented missing keys
+- Separates actionable missing-key insertion from advisory duplicate, placeholder, extra-key, and layered-conflict findings
 - Lets targetable advisory findings jump to the relevant file and key occurrence without mutating the env file
 - Infers common shapes such as credential URL/DSN, URL, secret, browser-exposed secret-looking variable, public frontend variable, bool, int, port, path, list, UUID, JSON, PEM, and provider-specific keys
 - Redacts secret-like values and credential-bearing URLs by default
@@ -80,4 +80,4 @@ fixtures/demo
 
 ## Current Status
 
-The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table and source context, redact likely secrets, credential-bearing URLs, and public-prefixed secret-looking keys, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, attach Next.js and Vite load-order evidence to related findings, show value-safe findings, add documented missing keys as blank entries, support keyboard scanning, and save one selected key occurrence while rescanning project diagnostics in the Tauri runtime. Release packaging is still intentionally deferred.
+The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table and source context, redact likely secrets, credential-bearing URLs, and public-prefixed secret-looking keys, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, attach Next.js and Vite load-order evidence to related findings, separate actionable missing-key insertion from advisory findings, support keyboard scanning, and save one selected key occurrence while rescanning project diagnostics in the Tauri runtime. Release packaging is still intentionally deferred.

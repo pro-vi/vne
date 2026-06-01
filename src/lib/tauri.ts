@@ -34,7 +34,7 @@ export async function saveEnvValue(
 export async function addEnvKey(root: string, path: string, key: string): Promise<ProjectSnapshot> {
   if (!isTauriRuntime()) {
     await delay(180);
-    throw new Error('Safe edits are available in the Tauri desktop app. Browser preview uses read-only sample data.');
+    throw new Error('Adding missing keys is available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
   return invoke<ProjectSnapshot>('add_env_key', { root, path, key });
