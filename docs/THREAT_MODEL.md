@@ -30,7 +30,8 @@
 - Save operations update one selected key occurrence at a time, use atomic write with permission preservation where practical, and return a fresh project snapshot so diagnostics do not stay stale after writes.
 - Duplicate-key saves require an explicit "this occurrence only" choice in the UI before the save button is enabled.
 - Missing-key insertion requires an explicit non-empty value; it refuses duplicate, invalid, or empty keys and returns a fresh project snapshot.
-- Write commands resolve the active project root and reject file paths outside that root.
+- Write commands resolve the active project root and reject file paths outside that root, with regression tests for direct symlink escapes and nested symlink directory escapes.
+- Env files referenced by Docker Compose are canonicalized and ignored when they resolve outside the active project root.
 - Parser/write regression tests include CRLF, UTF-8 BOM, empty values, inline comments, hashes inside values, quoted values, multiline values, invalid keys, duplicates, and quote-requiring replacements.
 - Browser preview uses sample data and cannot save or add missing keys.
 - Tauri CSP is enabled with local-only defaults, IPC connect sources, and no `unsafe-inline` or `unsafe-eval` allowance.

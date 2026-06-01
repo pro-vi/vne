@@ -2244,6 +2244,54 @@ mod tests {
         .is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_write_path_symlink_escape() {
+        let project = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join(".env");
+        let direct_link = project.path().join("linked.env");
+        let nested_link_dir = project.path().join("linked-dir");
+        let nested_link_file = nested_link_dir.join(".env");
+        fs::write(&outside_file, "PORT=1420\n").unwrap();
+
+        std::os::unix::fs::symlink(&outside_file, &direct_link).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &nested_link_dir).unwrap();
+
+        assert!(resolve_project_file(
+            project.path().to_str().unwrap(),
+            direct_link.to_str().unwrap()
+        )
+        .is_err());
+        assert!(resolve_project_file(
+            project.path().to_str().unwrap(),
+            nested_link_file.to_str().unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ignores_compose_env_file_references_outside_project_root() {
+        let parent = tempdir().unwrap();
+        let project = parent.path().join("project");
+        let outside = parent.path().join("outside");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(project.join(".env"), "PORT=1420\n").unwrap();
+        fs::write(outside.join(".env"), "API_TOKEN=outside\n").unwrap();
+        fs::write(
+            project.join("compose.yaml"),
+            "services:\n  app:\n    env_file:\n      - ../outside/.env\n",
+        )
+        .unwrap();
+
+        let snapshot = snapshot_project(&project).unwrap();
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].name, ".env");
+        assert!(!snapshot.files[0].content.contains("outside"));
+    }
+
     #[test]
     fn load_project_redacts_secret_values_until_per_entry_reveal() {
         let dir = tempdir().unwrap();
