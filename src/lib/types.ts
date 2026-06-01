@@ -25,6 +25,7 @@ export interface EnvEntry {
   lineNumber: number;
   exported: boolean;
   quote: string | null;
+  comment: string | null;
   shape: KeyShape;
   diagnostics: string[];
 }

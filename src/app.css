@@ -506,10 +506,38 @@ button.key-row.warn {
   width: 100%;
 }
 
+.source-list,
 .reason-list {
   display: grid;
   gap: 8px;
   padding-top: 6px;
+}
+
+.source-list dl {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.source-list div {
+  display: grid;
+  grid-template-columns: minmax(82px, 0.42fr) minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+}
+
+.source-list dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.source-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink-soft);
+  font-size: 12px;
 }
 
 .reason-list ul {

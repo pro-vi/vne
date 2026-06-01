@@ -37,6 +37,7 @@ pub struct EnvEntry {
     pub line_number: usize,
     pub exported: bool,
     pub quote: Option<String>,
+    pub comment: Option<String>,
     pub shape: KeyShape,
     pub diagnostics: Vec<String>,
 }
@@ -129,6 +130,7 @@ struct ParsedLine {
     line_number: usize,
     exported: bool,
     quote: Option<char>,
+    comment: Option<String>,
     value_start: usize,
     value_end: usize,
     next_start: usize,
@@ -291,6 +293,7 @@ fn parse_env_file_with_reasons(
             line_number: parsed.line_number,
             exported: parsed.exported,
             quote: parsed.quote.map(|quote| quote.to_string()),
+            comment: parsed.comment,
             shape,
             diagnostics: parsed.diagnostic.into_iter().collect(),
         });
@@ -603,6 +606,7 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
 
     let mut diagnostic = None;
     let mut quote = None;
+    let mut comment = None;
     let value_start;
     let value_end;
     let next_start;
@@ -633,6 +637,10 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
             }
             value_end = cursor;
             next_start = if found {
+                let comment_end = current_line_body_end(content, cursor);
+                if cursor < comment_end {
+                    comment = extract_inline_comment(&content[cursor + 1..comment_end]);
+                }
                 next_line_start(content, cursor)
             } else {
                 content.len()
@@ -660,6 +668,9 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
             while end > local_value_start && bytes[end - 1].is_ascii_whitespace() {
                 end -= 1;
             }
+            if comment_start < bytes.len() {
+                comment = Some(line_body[comment_start..].trim().to_string());
+            }
             value_end = line_start + end;
             next_start = next_line_start(content, line_start);
             value = content[value_start..value_end].to_string();
@@ -672,6 +683,7 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
         line_number,
         exported,
         quote,
+        comment,
         value_start,
         value_end,
         next_start,
@@ -1581,6 +1593,13 @@ fn skip_spaces(bytes: &[u8], index: &mut usize) {
     }
 }
 
+fn extract_inline_comment(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut index = 0;
+    skip_spaces(bytes, &mut index);
+    (bytes.get(index) == Some(&b'#')).then(|| segment[index..].trim().to_string())
+}
+
 fn current_line_body_end(content: &str, line_start: usize) -> usize {
     let line_end = next_line_start(content, line_start);
     content[line_start..line_end]
@@ -1668,7 +1687,7 @@ mod tests {
 
     #[test]
     fn parses_entries_without_destroying_file_structure() {
-        let content = "# db\nexport DATABASE_URL=\"postgres://localhost/app\"\n\nNEXT_PUBLIC_SITE=https://example.com\n";
+        let content = "# db\nexport DATABASE_URL=\"postgres://localhost/app\" # local\n\nNEXT_PUBLIC_SITE=https://example.com\n";
         let file = parse_env_file(Path::new(".env"), content.to_string());
 
         assert_eq!(file.content, content);
@@ -1677,6 +1696,7 @@ mod tests {
         assert_eq!(file.entries[0].key, "DATABASE_URL");
         assert_eq!(file.entries[0].value, "postgres://localhost/app");
         assert_eq!(file.entries[0].quote.as_deref(), Some("\""));
+        assert_eq!(file.entries[0].comment.as_deref(), Some("# local"));
         assert!(file.entries[0].exported);
         assert_eq!(file.entries[1].shape.kind, "public");
     }
@@ -1693,6 +1713,14 @@ mod tests {
             "-----BEGIN KEY-----\nabc123\n-----END KEY-----"
         );
         assert_eq!(file.entries[1].key, "NEXT_PUBLIC_SITE");
+    }
+
+    #[test]
+    fn parses_unquoted_inline_comments_as_source_context() {
+        let file = parse_env_file(Path::new(".env"), "PORT=1420 # dev server\n".to_string());
+
+        assert_eq!(file.entries[0].value, "1420");
+        assert_eq!(file.entries[0].comment.as_deref(), Some("# dev server"));
     }
 
     #[test]

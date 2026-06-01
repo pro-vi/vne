@@ -16,7 +16,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         diagnostics: ['Duplicate key `FEATURE_ENABLED`'],
         duplicateKeys: ['FEATURE_ENABLED'],
         content:
-          '# local development\nDATABASE_URL="postgres://localhost/vne"\nREDIS_URL=redis://localhost:6379\nOPENAI_API_KEY=sk-local-redacted\nPRIVATE_KEY="-----BEGIN KEY-----\nabc123\n-----END KEY-----"\nNEXT_PUBLIC_SITE_URL=http://localhost:1420\nPORT=1420\nFEATURE_ENABLED=true\nFEATURE_ENABLED=false\n',
+          '# local development\nDATABASE_URL="postgres://localhost/vne"\nREDIS_URL=redis://localhost:6379\nOPENAI_API_KEY=sk-local-redacted\nPRIVATE_KEY="-----BEGIN KEY-----\nabc123\n-----END KEY-----"\nNEXT_PUBLIC_SITE_URL=http://localhost:1420\nPORT=1420 # dev server\nFEATURE_ENABLED=true\nFEATURE_ENABLED=false\n',
         entries: [
           entry('DATABASE_URL', 'postgres://localhost/vne', 'Credential URL / DSN', 'credential-url', true, 2, [
             'credential-bearing URL key name',
@@ -33,7 +33,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
           entry('NEXT_PUBLIC_SITE_URL', 'http://localhost:1420', 'Public frontend variable', 'public', false, 8, [
             'frontend-exposed prefix'
           ]),
-          entry('PORT', '1420', 'Port', 'port', false, 9, ['port-like key or numeric port value']),
+          entry('PORT', '1420', 'Port', 'port', false, 9, ['port-like key or numeric port value'], [], '# dev server'),
           entry('FEATURE_ENABLED', 'true', 'Boolean', 'bool', false, 10, ['boolean-like value'], ['Duplicate key']),
           entry('FEATURE_ENABLED', 'false', 'Boolean', 'bool', false, 11, ['boolean-like value'], ['Duplicate key'])
         ]
@@ -206,7 +206,8 @@ function entry(
   redacted: boolean,
   lineNumber: number,
   reasons: string[],
-  diagnostics: string[] = []
+  diagnostics: string[] = [],
+  comment: string | null = null
 ) {
   return {
     id: `${key}@${lineNumber}`,
@@ -216,6 +217,7 @@ function entry(
     lineNumber,
     exported: false,
     quote: null,
+    comment,
     diagnostics,
     shape: {
       kind,

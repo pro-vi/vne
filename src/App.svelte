@@ -203,6 +203,32 @@
     return isTauriRuntime() && isSafeEditFinding(finding);
   }
 
+  function occurrenceLabel(file: EnvFile, entry: EnvEntry): string {
+    const occurrences = file.entries.filter((candidate) => candidate.key === entry.key);
+    const index = occurrences.findIndex((candidate) => candidate.id === entry.id);
+    return `${index === -1 ? 1 : index + 1} of ${occurrences.length || 1}`;
+  }
+
+  function assignmentLabel(entry: EnvEntry): string {
+    return entry.exported ? 'export assignment' : 'plain assignment';
+  }
+
+  function quoteLabel(entry: EnvEntry): string {
+    if (entry.quote === '"') {
+      return 'double quoted';
+    }
+
+    if (entry.quote === "'") {
+      return 'single quoted';
+    }
+
+    return 'unquoted';
+  }
+
+  function diagnosticsLabel(entry: EnvEntry): string {
+    return entry.diagnostics.length ? entry.diagnostics.join(', ') : 'none';
+  }
+
   function displayValue(entry: EnvEntry): string {
     if (!isEntryValueHidden(entry, showSecrets)) {
       return entry.value || '(empty)';
@@ -459,6 +485,32 @@
           <Save size={16} aria-hidden="true" />
           <span>Save value</span>
         </button>
+
+        <div class="source-list">
+          <h3>Source</h3>
+          <dl>
+            <div>
+              <dt>Occurrence</dt>
+              <dd>{occurrenceLabel(selectedFile, selectedEntry)}</dd>
+            </div>
+            <div>
+              <dt>Assignment</dt>
+              <dd>{assignmentLabel(selectedEntry)}</dd>
+            </div>
+            <div>
+              <dt>Quote</dt>
+              <dd>{quoteLabel(selectedEntry)}</dd>
+            </div>
+            <div>
+              <dt>Comment</dt>
+              <dd>{selectedEntry.comment ?? 'none'}</dd>
+            </div>
+            <div>
+              <dt>Diagnostics</dt>
+              <dd>{diagnosticsLabel(selectedEntry)}</dd>
+            </div>
+          </dl>
+        </div>
 
         <div class="reason-list">
           <h3>Why this shape?</h3>
