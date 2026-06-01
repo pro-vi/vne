@@ -151,6 +151,13 @@ struct EnvEntryTarget {
 
 #[tauri::command]
 fn load_project(path: String) -> Result<ProjectSnapshot, String> {
+    snapshot_project(Path::new(&path))
+        .map(redact_snapshot)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn reveal_project(path: String) -> Result<ProjectSnapshot, String> {
     snapshot_project(Path::new(&path)).map_err(|error| error.to_string())
 }
 
@@ -171,7 +178,9 @@ fn save_env_value(
         .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))?;
 
     atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
-    snapshot_project(&root_path).map_err(|error| error.to_string())
+    snapshot_project(&root_path)
+        .map(redact_snapshot)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -185,7 +194,9 @@ fn add_env_key(root: String, path: String, key: String) -> Result<ProjectSnapsho
         .ok_or_else(|| format!("Key `{key}` already exists or is not a valid env key"))?;
 
     atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
-    snapshot_project(&root_path).map_err(|error| error.to_string())
+    snapshot_project(&root_path)
+        .map(redact_snapshot)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -194,6 +205,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             load_project,
+            reveal_project,
             save_env_value,
             add_env_key
         ])
@@ -264,6 +276,46 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
         framework_profiles,
         findings,
     })
+}
+
+fn redact_snapshot(mut snapshot: ProjectSnapshot) -> ProjectSnapshot {
+    for file in &mut snapshot.files {
+        let mut has_redacted_entry = false;
+        for entry in &mut file.entries {
+            if entry.shape.redacted_by_default {
+                entry.value.clear();
+                has_redacted_entry = true;
+            }
+        }
+
+        if has_redacted_entry {
+            file.content = redact_env_content(&file.content);
+        }
+    }
+
+    snapshot
+}
+
+fn redact_env_content(content: &str) -> String {
+    let entries = parse_env_entries(content);
+    if !entries
+        .iter()
+        .any(|entry| infer_key_shape(&entry.key, &entry.value).redacted_by_default)
+    {
+        return content.to_string();
+    }
+
+    let mut output = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for entry in entries {
+        if infer_key_shape(&entry.key, &entry.value).redacted_by_default {
+            output.push_str(&content[cursor..entry.value_start]);
+            output.push_str("********");
+            cursor = entry.value_end;
+        }
+    }
+    output.push_str(&content[cursor..]);
+    output
 }
 
 pub fn parse_env_file(path: &Path, content: String) -> EnvFile {
@@ -2169,6 +2221,48 @@ mod tests {
     }
 
     #[test]
+    fn load_project_redacts_secret_values_until_reveal() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(".env"),
+            "API_TOKEN=sk-hidden\nPORT=1420\nDATABASE_URL=postgres://user:pass@localhost/app\n",
+        )
+        .unwrap();
+
+        let hidden = load_project(dir.path().to_string_lossy().to_string()).unwrap();
+        let hidden_file = hidden.files.iter().find(|file| file.name == ".env").unwrap();
+        let token = hidden_file
+            .entries
+            .iter()
+            .find(|entry| entry.key == "API_TOKEN")
+            .unwrap();
+        let port = hidden_file
+            .entries
+            .iter()
+            .find(|entry| entry.key == "PORT")
+            .unwrap();
+
+        assert_eq!(token.value, "");
+        assert_eq!(token.display_value, "********");
+        assert_eq!(port.value, "1420");
+        assert!(!hidden_file.content.contains("sk-hidden"));
+        assert!(!hidden_file.content.contains("user:pass"));
+        assert!(hidden_file.content.contains("PORT=1420"));
+
+        let revealed = reveal_project(dir.path().to_string_lossy().to_string()).unwrap();
+        let revealed_file = revealed.files.iter().find(|file| file.name == ".env").unwrap();
+        let revealed_token = revealed_file
+            .entries
+            .iter()
+            .find(|entry| entry.key == "API_TOKEN")
+            .unwrap();
+
+        assert_eq!(revealed_token.value, "sk-hidden");
+        assert!(revealed_file.content.contains("API_TOKEN=sk-hidden"));
+        assert!(revealed_file.content.contains("user:pass"));
+    }
+
+    #[test]
     fn save_value_command_returns_rescanned_snapshot() {
         let dir = tempdir().unwrap();
         let env_path = dir.path().join(".env");
@@ -2196,11 +2290,17 @@ mod tests {
             .find(|entry| entry.key == "API_TOKEN")
             .unwrap();
 
-        assert_eq!(refreshed_entry.value, "sk-updated");
+        assert_eq!(refreshed_entry.value, "");
+        assert_eq!(refreshed_entry.display_value, "********");
+        assert!(!refreshed_env.content.contains("sk-updated"));
         assert!(!after.findings.iter().any(|finding| {
             finding.action_kind == "replace-placeholder"
                 && finding.key.as_deref() == Some("API_TOKEN")
         }));
+
+        let revealed = reveal_project(dir.path().to_string_lossy().to_string()).unwrap();
+        let revealed_env = revealed.files.iter().find(|file| file.name == ".env").unwrap();
+        assert!(revealed_env.content.contains("API_TOKEN=sk-updated"));
     }
 
     #[test]

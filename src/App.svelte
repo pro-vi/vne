@@ -11,7 +11,7 @@
     Search,
     ShieldCheck
   } from '@lucide/svelte';
-  import { addEnvKey, isTauriRuntime, loadProject, pickProjectDirectory, saveEnvValue } from './lib/tauri';
+  import { addEnvKey, isTauriRuntime, loadProject, pickProjectDirectory, revealProject, saveEnvValue } from './lib/tauri';
   import type { EnvEntry, EnvFile, EnvFinding, ProjectSnapshot } from './lib/types';
   import { isEntryValueHidden, keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
@@ -53,10 +53,11 @@
     notice = { kind: 'loading', message: 'Scanning env files...' };
     try {
       const loaded = await loadProject(projectPath.trim() || '.');
-      snapshot = loaded;
-      selectedPath = loaded.files[0]?.path ?? '';
-      selectedEntryId = loaded.files[0]?.entries[0]?.id ?? '';
-      editValue = loaded.files[0]?.entries[0]?.value ?? '';
+      showSecrets = false;
+      showRaw = false;
+      const firstFile = loaded.files[0];
+      const firstEntry = firstFile?.entries[0];
+      applySnapshotSelection(loaded, firstFile?.path ?? '', firstEntry?.id ?? '', firstEntry?.key ?? '');
       notice = {
         kind: 'success',
         message: loaded.files.length ? `Loaded ${loaded.files.length} env file${loaded.files.length === 1 ? '' : 's'}.` : 'No env files found.'
@@ -154,17 +155,9 @@
       const savedPath = selectedFile.path;
       const savedEntryId = selectedEntry.id;
       const savedKey = selectedEntry.key;
-      const loaded = await saveEnvValue(root, savedPath, savedKey, selectedEntry.lineNumber, editValue);
-      snapshot = loaded;
-      const refreshedFile = loaded.files.find((file) => file.path === savedPath) ?? loaded.files[0] ?? null;
-      selectedPath = refreshedFile?.path ?? savedPath;
-      const refreshedEntry =
-        refreshedFile?.entries.find((entry) => entry.id === savedEntryId) ??
-        refreshedFile?.entries.find((entry) => entry.key === savedKey) ??
-        refreshedFile?.entries[0] ??
-        null;
-      selectedEntryId = refreshedEntry?.id ?? '';
-      editValue = refreshedEntry?.value ?? '';
+      const saved = await saveEnvValue(root, savedPath, savedKey, selectedEntry.lineNumber, editValue);
+      const loaded = showSecrets ? await revealProject(root) : saved;
+      applySnapshotSelection(loaded, savedPath, savedEntryId, savedKey);
       notice = { kind: 'success', message: `${savedKey} saved and project diagnostics rescanned.` };
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
@@ -180,13 +173,38 @@
     try {
       const root = snapshot?.root ?? (projectPath.trim() || '.');
       const loaded = await addEnvKey(root, finding.filePath, finding.key);
-      snapshot = loaded;
-      selectedPath = finding.filePath;
-      const refreshedFile = loaded.files.find((file) => file.path === finding.filePath);
-      const refreshedEntry = refreshedFile?.entries.find((entry) => entry.key === finding.key);
-      selectedEntryId = refreshedEntry?.id ?? '';
-      editValue = refreshedEntry?.value ?? '';
+      const refreshed = showSecrets ? await revealProject(root) : loaded;
+      applySnapshotSelection(refreshed, finding.filePath, '', finding.key);
       notice = { kind: 'success', message: `${finding.key} was added as a blank value.` };
+    } catch (error) {
+      notice = { kind: 'error', message: errorMessage(error) };
+    }
+  }
+
+  async function toggleSecrets(): Promise<void> {
+    if (!snapshot) {
+      showSecrets = !showSecrets;
+      return;
+    }
+
+    const reveal = !showSecrets;
+    const root = currentProjectRoot();
+    const path = selectedPath;
+    const entryId = selectedEntryId;
+    const key = selectedEntry?.key ?? '';
+    notice = { kind: 'loading', message: reveal ? 'Revealing secret values...' : 'Hiding secret values...' };
+
+    try {
+      const loaded = reveal ? await revealProject(root) : await loadProject(root);
+      showSecrets = reveal;
+      if (!reveal) {
+        showRaw = false;
+      }
+      applySnapshotSelection(loaded, path, entryId, key);
+      notice = {
+        kind: 'success',
+        message: reveal ? 'Secret values revealed for this session.' : 'Secret values hidden and snapshot reloaded.'
+      };
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
     }
@@ -221,6 +239,23 @@
 
   function canInspectFinding(finding: EnvFinding): boolean {
     return Boolean(finding.filePath && (finding.entryId || finding.key));
+  }
+
+  function currentProjectRoot(): string {
+    return snapshot?.root ?? (projectPath.trim() || '.');
+  }
+
+  function applySnapshotSelection(loaded: ProjectSnapshot, preferredPath: string, preferredEntryId: string, preferredKey: string): void {
+    snapshot = loaded;
+    const refreshedFile = loaded.files.find((file) => file.path === preferredPath) ?? loaded.files[0] ?? null;
+    selectedPath = refreshedFile?.path ?? preferredPath;
+    const refreshedEntry =
+      refreshedFile?.entries.find((entry) => entry.id === preferredEntryId) ??
+      (preferredKey ? refreshedFile?.entries.find((entry) => entry.key === preferredKey) : undefined) ??
+      refreshedFile?.entries[0] ??
+      null;
+    selectedEntryId = refreshedEntry?.id ?? '';
+    editValue = refreshedEntry?.value ?? '';
   }
 
   function occurrenceLabel(file: EnvFile, entry: EnvEntry): string {
@@ -455,7 +490,7 @@
           <Search size={16} aria-hidden="true" />
           <input bind:this={filterInput} bind:value={filter} placeholder="Filter keys or shapes" />
         </div>
-        <button type="button" class="ghost" onclick={() => (showSecrets = !showSecrets)}>
+        <button type="button" class="ghost" disabled={notice.kind === 'loading'} onclick={() => void toggleSecrets()}>
           {#if showSecrets}
             <EyeOff size={16} aria-hidden="true" />
             <span>Hide secrets</span>
