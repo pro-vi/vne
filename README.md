@@ -30,7 +30,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 
 ## Privacy
 
-Env contents stay local. The current app has no network path for env data and no telemetry. Redaction is a presentation safeguard inside the trusted local app: secret-like values are hidden in normal UI until Reveal is active, but parsed values are still handled by the local Tauri/Svelte process.
+Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Redaction is a presentation safeguard inside the trusted local app: secret-like values are hidden in normal UI until Reveal is active, but parsed values are still handled by the local Tauri/Svelte process.
 
 See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the current local-only threat model and release safety checklist.
 

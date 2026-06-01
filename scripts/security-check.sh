@@ -77,8 +77,21 @@ case "$dev_url" in
     ;;
 esac
 
-if rg -q '"csp"\s*:\s*null' src-tauri/tauri.conf.json; then
-  printf '%s\n' "security-check: note csp is null; threat model tracks this release hardening item" >&2
+csp_line="$(rg -n '"csp"\s*:' src-tauri/tauri.conf.json || true)"
+if [ -z "$csp_line" ]; then
+  printf '%s\n' "security-check: failed missing Tauri CSP" >&2
+  fail=1
+elif printf '%s\n' "$csp_line" | rg -q '"csp"\s*:\s*null'; then
+  printf '%s\n' "security-check: failed null Tauri CSP" >&2
+  fail=1
+elif ! printf '%s\n' "$csp_line" | rg -q 'connect-src[^"]*ipc:[^"]*http://ipc\.localhost'; then
+  printf '%s\n' "security-check: failed Tauri CSP missing IPC connect source" >&2
+  printf '%s\n' "$csp_line" >&2
+  fail=1
+elif printf '%s\n' "$csp_line" | rg -q "'unsafe-(inline|eval)'"; then
+  printf '%s\n' "security-check: failed Tauri CSP allows unsafe inline/eval" >&2
+  printf '%s\n' "$csp_line" >&2
+  fail=1
 fi
 
 if [ "$fail" -ne 0 ]; then
