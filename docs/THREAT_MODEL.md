@@ -23,7 +23,7 @@
 - Findings include key names, file names, and framework load-order evidence, not raw values.
 - Source context shows structural metadata such as quote style, export prefix, comments, and diagnostics without adding network or logging paths.
 - Safe-edit mutation previews include only key names, file names, and the narrow edit shape.
-- Advisory finding inspection changes only UI selection state; it does not mutate files.
+- Advisory finding inspection changes only UI selection state; targetable findings carry entry id and line number where an exact occurrence exists, and inspection does not mutate files.
 - Layer conflict summaries name the effective file without showing competing values.
 - Save operations update one selected key occurrence at a time, use atomic write with permission preservation where practical, and return a fresh project snapshot so diagnostics do not stay stale after writes.
 - Blank-key repair only appends `KEY=` for a documented missing key; it refuses duplicate or invalid keys and returns a fresh project snapshot.

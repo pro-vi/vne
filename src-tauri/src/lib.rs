@@ -124,6 +124,8 @@ pub struct EnvFinding {
     pub mutation_preview: Option<String>,
     pub file_path: Option<String>,
     pub key: Option<String>,
+    pub line_number: Option<usize>,
+    pub entry_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +140,13 @@ struct ParsedLine {
     value_end: usize,
     next_start: usize,
     diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnvEntryTarget {
+    file_path: String,
+    line_number: usize,
+    entry_id: String,
 }
 
 #[tauri::command]
@@ -1046,10 +1055,13 @@ fn build_findings(
                 )),
                 file_path: Some(comparison.base_path.clone()),
                 key: Some(key.clone()),
+                line_number: None,
+                entry_id: None,
             });
         }
 
         for key in &comparison.extra_keys {
+            let target = find_entry_target_by_path(files, &comparison.base_path, key);
             findings.push(EnvFinding {
                 severity: "info".to_string(),
                 action_kind: "document-or-remove-key".to_string(),
@@ -1063,6 +1075,8 @@ fn build_findings(
                 mutation_preview: None,
                 file_path: Some(comparison.base_path.clone()),
                 key: Some(key.clone()),
+                line_number: target.as_ref().map(|target| target.line_number),
+                entry_id: target.as_ref().map(|target| target.entry_id.clone()),
             });
         }
 
@@ -1071,6 +1085,7 @@ fn build_findings(
                 .split_once(':')
                 .map(|(file_name, key)| (file_name.to_string(), key.to_string()))
                 .unwrap_or_else(|| ("env file".to_string(), duplicate.clone()));
+            let target = find_duplicate_entry_target_by_name(files, &file_name, &key);
             findings.push(EnvFinding {
                 severity: "warning".to_string(),
                 action_kind: "resolve-duplicate-key".to_string(),
@@ -1078,8 +1093,13 @@ fn build_findings(
                 detail: format!("`{file_name}` defines `{key}` more than once."),
                 evidence: Vec::new(),
                 mutation_preview: None,
-                file_path: find_file_path_by_name(files, &file_name),
+                file_path: target
+                    .as_ref()
+                    .map(|target| target.file_path.clone())
+                    .or_else(|| find_file_path_by_name(files, &file_name)),
                 key: Some(key),
+                line_number: target.as_ref().map(|target| target.line_number),
+                entry_id: target.as_ref().map(|target| target.entry_id.clone()),
             });
         }
     }
@@ -1089,6 +1109,7 @@ fn build_findings(
             .split_once(':')
             .map(|(file_name, key)| (file_name.to_string(), key.to_string()))
             .unwrap_or_else(|| ("env file".to_string(), placeholder.clone()));
+        let target = find_placeholder_entry_target_by_name(files, &file_name, &key);
         findings.push(EnvFinding {
             severity: "warning".to_string(),
             action_kind: "replace-placeholder".to_string(),
@@ -1096,8 +1117,13 @@ fn build_findings(
             detail: format!("`{file_name}` has a placeholder-like value for `{key}`."),
             evidence: Vec::new(),
             mutation_preview: None,
-            file_path: find_file_path_by_name(files, &file_name),
+            file_path: target
+                .as_ref()
+                .map(|target| target.file_path.clone())
+                .or_else(|| find_file_path_by_name(files, &file_name)),
             key: Some(key),
+            line_number: target.as_ref().map(|target| target.line_number),
+            entry_id: target.as_ref().map(|target| target.entry_id.clone()),
         });
     }
 
@@ -1120,6 +1146,8 @@ fn build_findings(
             mutation_preview: None,
             file_path: None,
             key: Some(override_row.key.clone()),
+            line_number: None,
+            entry_id: None,
         });
     }
 
@@ -1161,6 +1189,63 @@ fn find_file_path_by_name(files: &[EnvFile], file_name: &str) -> Option<String> 
         .iter()
         .find(|file| file.name == file_name)
         .map(|file| file.path.clone())
+}
+
+fn find_entry_target_by_path(
+    files: &[EnvFile],
+    file_path: &str,
+    key: &str,
+) -> Option<EnvEntryTarget> {
+    files
+        .iter()
+        .find(|file| file.path == file_path)
+        .and_then(|file| {
+            file.entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry_target(file, entry))
+        })
+}
+
+fn find_duplicate_entry_target_by_name(
+    files: &[EnvFile],
+    file_name: &str,
+    key: &str,
+) -> Option<EnvEntryTarget> {
+    let file = files.iter().find(|file| file.name == file_name)?;
+    let matches = file
+        .entries
+        .iter()
+        .filter(|entry| entry.key == key)
+        .collect::<Vec<_>>();
+    matches
+        .get(1)
+        .or_else(|| matches.first())
+        .map(|entry| entry_target(file, entry))
+}
+
+fn find_placeholder_entry_target_by_name(
+    files: &[EnvFile],
+    file_name: &str,
+    key: &str,
+) -> Option<EnvEntryTarget> {
+    files
+        .iter()
+        .find(|file| file.name == file_name)
+        .and_then(|file| {
+            file.entries
+                .iter()
+                .find(|entry| entry.key == key && is_placeholder_value(&entry.value))
+                .map(|entry| entry_target(file, entry))
+        })
+}
+
+fn entry_target(file: &EnvFile, entry: &EnvEntry) -> EnvEntryTarget {
+    EnvEntryTarget {
+        file_path: file.path.clone(),
+        line_number: entry.line_number,
+        entry_id: entry.id.clone(),
+    }
 }
 
 fn file_label(path: &str) -> String {
@@ -2213,6 +2298,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(duplicate_finding.file_path.as_deref(), Some(".env"));
+        assert_eq!(duplicate_finding.line_number, Some(4));
+        assert_eq!(duplicate_finding.entry_id.as_deref(), Some("EXTRA@4"));
         assert!(findings
             .iter()
             .any(|finding| finding.action_kind == "replace-placeholder"
@@ -2225,6 +2312,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(placeholder_finding.file_path.as_deref(), Some(".env"));
+        assert_eq!(placeholder_finding.line_number, Some(5));
+        assert_eq!(placeholder_finding.entry_id.as_deref(), Some("API_TOKEN@5"));
         assert!(findings
             .iter()
             .any(|finding| finding.action_kind == "review-layer-conflict"

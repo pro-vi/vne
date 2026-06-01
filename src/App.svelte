@@ -198,7 +198,10 @@
     }
 
     const file = snapshot.files.find((candidate) => candidate.path === finding.filePath);
-    const entry = file?.entries.find((candidate) => candidate.key === finding.key);
+    const entry =
+      file?.entries.find((candidate) => candidate.id === finding.entryId) ??
+      file?.entries.find((candidate) => candidate.key === finding.key && candidate.lineNumber === finding.lineNumber) ??
+      file?.entries.find((candidate) => candidate.key === finding.key);
     if (!file || !entry) {
       notice = { kind: 'error', message: `Could not find ${finding.key} in the current snapshot.` };
       return;
@@ -217,7 +220,7 @@
   }
 
   function canInspectFinding(finding: EnvFinding): boolean {
-    return Boolean(finding.filePath && finding.key);
+    return Boolean(finding.filePath && (finding.entryId || finding.key));
   }
 
   function occurrenceLabel(file: EnvFile, entry: EnvEntry): string {

@@ -96,6 +96,8 @@ export interface EnvFinding {
   mutationPreview: string | null;
   filePath: string | null;
   key: string | null;
+  lineNumber: number | null;
+  entryId: string | null;
 }
 
 export type KeyStatus = 'ok' | 'missing' | 'extra' | 'duplicate';

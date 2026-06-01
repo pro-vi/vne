@@ -171,7 +171,9 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         evidence: [],
         mutationPreview: 'Append `STRIPE_SECRET_KEY=` to .env.',
         filePath: basePath,
-        key: 'STRIPE_SECRET_KEY'
+        key: 'STRIPE_SECRET_KEY',
+        lineNumber: null,
+        entryId: null
       },
       {
         severity: 'warning',
@@ -181,7 +183,9 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         evidence: [],
         mutationPreview: null,
         filePath: basePath,
-        key: 'FEATURE_ENABLED'
+        key: 'FEATURE_ENABLED',
+        lineNumber: 12,
+        entryId: 'FEATURE_ENABLED@12'
       },
       {
         severity: 'info',
@@ -191,7 +195,9 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         evidence: ['Next.js development load order: .env.local -> .env'],
         mutationPreview: null,
         filePath: null,
-        key: 'DATABASE_URL'
+        key: 'DATABASE_URL',
+        lineNumber: null,
+        entryId: null
       }
     ],
     comparison: {
