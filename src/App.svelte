@@ -12,7 +12,7 @@
     ShieldCheck
   } from '@lucide/svelte';
   import { addEnvKey, isTauriRuntime, loadProject, pickProjectDirectory, saveEnvValue } from './lib/tauri';
-  import type { EnvEntry, EnvFile, EnvRepairAction, FrameworkEnvProfile, ProjectSnapshot } from './lib/types';
+  import type { EnvEntry, EnvFile, EnvFinding, FrameworkEnvProfile, ProjectSnapshot } from './lib/types';
   import { isEntryValueHidden, keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
   type Notice = {
@@ -43,7 +43,9 @@
   $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && !selectedValueHidden && editValue !== selectedEntry.value);
   $: layerConflicts = snapshot?.layerReport.overrides.filter((override) => override.conflict) ?? [];
   $: frameworkMissingCount = snapshot?.frameworkProfiles.reduce((total, profile) => total + profile.missingFiles.length, 0) ?? 0;
-  $: repairActions = snapshot?.repairActions ?? [];
+  $: findings = snapshot?.findings ?? [];
+  $: safeEditFindings = findings.filter(isSafeEditFinding);
+  $: advisoryFindings = findings.filter((finding) => !isSafeEditFinding(finding));
   $: if (selectedFileHasHiddenSecrets && showRaw) {
     showRaw = false;
   }
@@ -172,30 +174,34 @@
     }
   }
 
-  async function applyRepairAction(action: EnvRepairAction): Promise<void> {
-    if (!canApplyRepairAction(action) || !action.filePath || !action.key) {
+  async function applySafeEdit(finding: EnvFinding): Promise<void> {
+    if (!canApplySafeEdit(finding) || !finding.filePath || !finding.key) {
       return;
     }
 
-    notice = { kind: 'loading', message: `Adding ${action.key}...` };
+    notice = { kind: 'loading', message: `Adding ${finding.key}...` };
     try {
       const root = snapshot?.root ?? (projectPath.trim() || '.');
-      await addEnvKey(root, action.filePath, action.key);
+      await addEnvKey(root, finding.filePath, finding.key);
       const loaded = await loadProject(root);
       snapshot = loaded;
-      selectedPath = action.filePath;
-      const refreshedFile = loaded.files.find((file) => file.path === action.filePath);
-      const refreshedEntry = refreshedFile?.entries.find((entry) => entry.key === action.key);
+      selectedPath = finding.filePath;
+      const refreshedFile = loaded.files.find((file) => file.path === finding.filePath);
+      const refreshedEntry = refreshedFile?.entries.find((entry) => entry.key === finding.key);
       selectedEntryId = refreshedEntry?.id ?? '';
       editValue = refreshedEntry?.value ?? '';
-      notice = { kind: 'success', message: `${action.key} was added as a blank value.` };
+      notice = { kind: 'success', message: `${finding.key} was added as a blank value.` };
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
     }
   }
 
-  function canApplyRepairAction(action: EnvRepairAction): boolean {
-    return isTauriRuntime() && action.actionKind === 'add-missing-key' && Boolean(action.filePath && action.key);
+  function isSafeEditFinding(finding: EnvFinding): boolean {
+    return finding.actionKind === 'add-missing-key' && Boolean(finding.filePath && finding.key);
+  }
+
+  function canApplySafeEdit(finding: EnvFinding): boolean {
+    return isTauriRuntime() && isSafeEditFinding(finding);
   }
 
   function displayValue(entry: EnvEntry): string {
@@ -296,19 +302,31 @@
         <p class="empty-copy">No env-like files were found in this directory.</p>
       {/if}
 
-      {#if repairActions.length > 0}
+      {#if safeEditFindings.length > 0}
         <div class="comparison-block">
-          <h2>Repair queue</h2>
+          <h2>Safe edits</h2>
           <ul class="action-list">
-            {#each repairActions.slice(0, 5) as action}
-              <li class:warning={action.severity === 'warning'}>
-                <strong>{action.title}</strong>
-                <span>{action.detail}</span>
-                {#if action.actionKind === 'add-missing-key'}
-                  <button type="button" class="mini-action" disabled={!canApplyRepairAction(action)} onclick={() => void applyRepairAction(action)}>
-                    Add blank
-                  </button>
-                {/if}
+            {#each safeEditFindings.slice(0, 3) as finding}
+              <li class:warning={finding.severity === 'warning'}>
+                <strong>{finding.title}</strong>
+                <span>{finding.detail}</span>
+                <button type="button" class="mini-action" disabled={!canApplySafeEdit(finding)} onclick={() => void applySafeEdit(finding)}>
+                  Add blank
+                </button>
+              </li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+
+      {#if advisoryFindings.length > 0}
+        <div class="comparison-block">
+          <h2>Findings</h2>
+          <ul class="action-list">
+            {#each advisoryFindings.slice(0, 5) as finding}
+              <li class:warning={finding.severity === 'warning'}>
+                <strong>{finding.title}</strong>
+                <span>{finding.detail}</span>
               </li>
             {/each}
           </ul>

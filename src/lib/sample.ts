@@ -158,7 +158,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         ]
       }
     ],
-    repairActions: [
+    findings: [
       {
         severity: 'warning',
         actionKind: 'add-missing-key',

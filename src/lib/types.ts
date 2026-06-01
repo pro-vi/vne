@@ -4,7 +4,7 @@ export interface ProjectSnapshot {
   comparison: EnvComparison | null;
   layerReport: EnvLayerReport;
   frameworkProfiles: FrameworkEnvProfile[];
-  repairActions: EnvRepairAction[];
+  findings: EnvFinding[];
 }
 
 export interface EnvFile {
@@ -84,7 +84,7 @@ export interface FrameworkEnvFile {
   rank: number;
 }
 
-export interface EnvRepairAction {
+export interface EnvFinding {
   severity: 'info' | 'warning' | string;
   actionKind: string;
   title: string;

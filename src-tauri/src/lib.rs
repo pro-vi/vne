@@ -12,7 +12,7 @@ pub struct ProjectSnapshot {
     pub comparison: Option<EnvComparison>,
     pub layer_report: EnvLayerReport,
     pub framework_profiles: Vec<FrameworkEnvProfile>,
-    pub repair_actions: Vec<EnvRepairAction>,
+    pub findings: Vec<EnvFinding>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub struct FrameworkEnvFile {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct EnvRepairAction {
+pub struct EnvFinding {
     pub severity: String,
     pub action_kind: String,
     pub title: String,
@@ -230,7 +230,7 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     let comparison = compare_actual_to_example(&files);
     let layer_report = build_layer_report(&files);
     let framework_profiles = build_framework_profiles(&root, &files);
-    let repair_actions = build_repair_actions(comparison.as_ref(), &layer_report);
+    let findings = build_findings(comparison.as_ref(), &layer_report);
 
     Ok(ProjectSnapshot {
         root: root.to_string_lossy().to_string(),
@@ -238,7 +238,7 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
         comparison,
         layer_report,
         framework_profiles,
-        repair_actions,
+        findings,
     })
 }
 
@@ -960,15 +960,15 @@ fn is_mode_name(mode: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
-fn build_repair_actions(
+fn build_findings(
     comparison: Option<&EnvComparison>,
     layer_report: &EnvLayerReport,
-) -> Vec<EnvRepairAction> {
-    let mut actions = Vec::new();
+) -> Vec<EnvFinding> {
+    let mut findings = Vec::new();
 
     if let Some(comparison) = comparison {
         for key in &comparison.missing_keys {
-            actions.push(EnvRepairAction {
+            findings.push(EnvFinding {
                 severity: "warning".to_string(),
                 action_kind: "add-missing-key".to_string(),
                 title: format!("Add `{key}` to {}", file_label(&comparison.base_path)),
@@ -983,7 +983,7 @@ fn build_repair_actions(
         }
 
         for key in &comparison.extra_keys {
-            actions.push(EnvRepairAction {
+            findings.push(EnvFinding {
                 severity: "info".to_string(),
                 action_kind: "document-or-remove-key".to_string(),
                 title: format!("Document or remove `{key}`"),
@@ -1002,7 +1002,7 @@ fn build_repair_actions(
                 .split_once(':')
                 .map(|(file_name, key)| (file_name.to_string(), key.to_string()))
                 .unwrap_or_else(|| ("env file".to_string(), duplicate.clone()));
-            actions.push(EnvRepairAction {
+            findings.push(EnvFinding {
                 severity: "warning".to_string(),
                 action_kind: "resolve-duplicate-key".to_string(),
                 title: format!("Resolve duplicate `{key}`"),
@@ -1018,7 +1018,7 @@ fn build_repair_actions(
             .split_once(':')
             .map(|(file_name, key)| (file_name.to_string(), key.to_string()))
             .unwrap_or_else(|| ("env file".to_string(), placeholder.clone()));
-        actions.push(EnvRepairAction {
+        findings.push(EnvFinding {
             severity: "warning".to_string(),
             action_kind: "replace-placeholder".to_string(),
             title: format!("Replace placeholder `{key}`"),
@@ -1033,7 +1033,7 @@ fn build_repair_actions(
         .iter()
         .filter(|override_row| override_row.conflict)
     {
-        actions.push(EnvRepairAction {
+        findings.push(EnvFinding {
             severity: "info".to_string(),
             action_kind: "review-layer-conflict".to_string(),
             title: format!("Review layered `{}`", override_row.key),
@@ -1048,7 +1048,7 @@ fn build_repair_actions(
         });
     }
 
-    actions
+    findings
 }
 
 fn file_label(path: &str) -> String {
@@ -1911,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_repair_actions_without_exposing_values() {
+    fn builds_findings_without_exposing_values() {
         let base = parse_env_file(
             Path::new(".env"),
             "DATABASE_URL=postgres://base\nJWT_SECRET=base-secret\nEXTRA=yes\nEXTRA=no\nAPI_TOKEN=replace-me\n".to_string(),
@@ -1928,28 +1928,28 @@ mod tests {
         let comparison = compare_actual_to_example(&files);
         let layer_report = build_layer_report(&files);
 
-        let actions = build_repair_actions(comparison.as_ref(), &layer_report);
+        let findings = build_findings(comparison.as_ref(), &layer_report);
 
-        assert!(actions
+        assert!(findings
             .iter()
-            .any(|action| action.action_kind == "add-missing-key"
-                && action.key.as_deref() == Some("REDIS_URL")));
-        assert!(actions
+            .any(|finding| finding.action_kind == "add-missing-key"
+                && finding.key.as_deref() == Some("REDIS_URL")));
+        assert!(findings
             .iter()
-            .any(|action| action.action_kind == "resolve-duplicate-key"
-                && action.key.as_deref() == Some("EXTRA")));
-        assert!(actions
+            .any(|finding| finding.action_kind == "resolve-duplicate-key"
+                && finding.key.as_deref() == Some("EXTRA")));
+        assert!(findings
             .iter()
-            .any(|action| action.action_kind == "replace-placeholder"
-                && action.key.as_deref() == Some("API_TOKEN")));
-        assert!(actions
+            .any(|finding| finding.action_kind == "replace-placeholder"
+                && finding.key.as_deref() == Some("API_TOKEN")));
+        assert!(findings
             .iter()
-            .any(|action| action.action_kind == "review-layer-conflict"
-                && action.key.as_deref() == Some("JWT_SECRET")));
+            .any(|finding| finding.action_kind == "review-layer-conflict"
+                && finding.key.as_deref() == Some("JWT_SECRET")));
 
-        let rendered = actions
+        let rendered = findings
             .iter()
-            .map(|action| format!("{} {}", action.title, action.detail))
+            .map(|finding| format!("{} {}", finding.title, finding.detail))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!rendered.contains("base-secret"));
