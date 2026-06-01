@@ -28,6 +28,8 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 
 Env contents stay local. The current app has no network path for env data and no telemetry. Secret-like values are redacted in the UI and should not be logged.
 
+See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the current local-only threat model and release safety checklist.
+
 ## Development
 
 Install dependencies:
