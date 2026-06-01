@@ -195,12 +195,32 @@
     }
   }
 
+  function inspectFinding(finding: EnvFinding): void {
+    if (!finding.filePath || !finding.key || !snapshot) {
+      return;
+    }
+
+    const file = snapshot.files.find((candidate) => candidate.path === finding.filePath);
+    const entry = file?.entries.find((candidate) => candidate.key === finding.key);
+    if (!file || !entry) {
+      notice = { kind: 'error', message: `Could not find ${finding.key} in the current snapshot.` };
+      return;
+    }
+
+    selectedPath = file.path;
+    chooseEntry(entry);
+  }
+
   function isSafeEditFinding(finding: EnvFinding): boolean {
     return finding.actionKind === 'add-missing-key' && Boolean(finding.filePath && finding.key);
   }
 
   function canApplySafeEdit(finding: EnvFinding): boolean {
     return isTauriRuntime() && isSafeEditFinding(finding);
+  }
+
+  function canInspectFinding(finding: EnvFinding): boolean {
+    return Boolean(finding.filePath && finding.key);
   }
 
   function occurrenceLabel(file: EnvFile, entry: EnvEntry): string {
@@ -357,6 +377,9 @@
                       <li>{evidence}</li>
                     {/each}
                   </ul>
+                {/if}
+                {#if canInspectFinding(finding)}
+                  <button type="button" class="mini-action" onclick={() => inspectFinding(finding)}>Inspect</button>
                 {/if}
               </li>
             {/each}

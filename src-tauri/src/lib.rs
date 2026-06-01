@@ -234,7 +234,12 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     let comparison = compare_actual_to_example(&files);
     let layer_report = build_layer_report(&files);
     let framework_profiles = build_framework_profiles(&root, &files);
-    let findings = build_findings(comparison.as_ref(), &layer_report, &framework_profiles);
+    let findings = build_findings(
+        comparison.as_ref(),
+        &layer_report,
+        &framework_profiles,
+        &files,
+    );
 
     Ok(ProjectSnapshot {
         root: root.to_string_lossy().to_string(),
@@ -978,6 +983,7 @@ fn build_findings(
     comparison: Option<&EnvComparison>,
     layer_report: &EnvLayerReport,
     framework_profiles: &[FrameworkEnvProfile],
+    files: &[EnvFile],
 ) -> Vec<EnvFinding> {
     let mut findings = Vec::new();
 
@@ -1031,7 +1037,7 @@ fn build_findings(
                 detail: format!("`{file_name}` defines `{key}` more than once."),
                 evidence: Vec::new(),
                 mutation_preview: None,
-                file_path: None,
+                file_path: find_file_path_by_name(files, &file_name),
                 key: Some(key),
             });
         }
@@ -1049,7 +1055,7 @@ fn build_findings(
             detail: format!("`{file_name}` has a placeholder-like value for `{key}`."),
             evidence: Vec::new(),
             mutation_preview: None,
-            file_path: None,
+            file_path: find_file_path_by_name(files, &file_name),
             key: Some(key),
         });
     }
@@ -1107,6 +1113,13 @@ fn framework_evidence_for_files(
         })
         .take(3)
         .collect()
+}
+
+fn find_file_path_by_name(files: &[EnvFile], file_name: &str) -> Option<String> {
+    files
+        .iter()
+        .find(|file| file.name == file_name)
+        .map(|file| file.path.clone())
 }
 
 fn file_label(path: &str) -> String {
@@ -2023,7 +2036,12 @@ mod tests {
             notes: Vec::new(),
         }];
 
-        let findings = build_findings(comparison.as_ref(), &layer_report, &framework_profiles);
+        let findings = build_findings(
+            comparison.as_ref(),
+            &layer_report,
+            &framework_profiles,
+            &files,
+        );
 
         assert!(findings
             .iter()
@@ -2044,10 +2062,26 @@ mod tests {
             .iter()
             .any(|finding| finding.action_kind == "resolve-duplicate-key"
                 && finding.key.as_deref() == Some("EXTRA")));
+        let duplicate_finding = findings
+            .iter()
+            .find(|finding| {
+                finding.action_kind == "resolve-duplicate-key"
+                    && finding.key.as_deref() == Some("EXTRA")
+            })
+            .unwrap();
+        assert_eq!(duplicate_finding.file_path.as_deref(), Some(".env"));
         assert!(findings
             .iter()
             .any(|finding| finding.action_kind == "replace-placeholder"
                 && finding.key.as_deref() == Some("API_TOKEN")));
+        let placeholder_finding = findings
+            .iter()
+            .find(|finding| {
+                finding.action_kind == "replace-placeholder"
+                    && finding.key.as_deref() == Some("API_TOKEN")
+            })
+            .unwrap();
+        assert_eq!(placeholder_finding.file_path.as_deref(), Some(".env"));
         assert!(findings
             .iter()
             .any(|finding| finding.action_kind == "review-layer-conflict"

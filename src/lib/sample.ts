@@ -176,7 +176,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         detail: '`.env` defines `FEATURE_ENABLED` more than once.',
         evidence: [],
         mutationPreview: null,
-        filePath: null,
+        filePath: basePath,
         key: 'FEATURE_ENABLED'
       },
       {
