@@ -2,6 +2,7 @@ export interface ProjectSnapshot {
   root: string;
   files: EnvFile[];
   comparison: EnvComparison | null;
+  layerReport: EnvLayerReport;
 }
 
 export interface EnvFile {
@@ -40,6 +41,28 @@ export interface EnvComparison {
   extraKeys: string[];
   sharedKeys: string[];
   duplicateKeys: string[];
+}
+
+export interface EnvLayerReport {
+  orderedFiles: EnvLayerFile[];
+  overrides: EnvLayerOverride[];
+  placeholderKeys: string[];
+}
+
+export interface EnvLayerFile {
+  path: string;
+  name: string;
+  layerKind: string;
+  precedence: number;
+}
+
+export interface EnvLayerOverride {
+  key: string;
+  files: string[];
+  effectiveFile: string;
+  conflict: boolean;
+  redacted: boolean;
+  summary: string;
 }
 
 export type KeyStatus = 'ok' | 'missing' | 'extra' | 'duplicate';

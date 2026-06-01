@@ -8,9 +8,11 @@ export function totalIssueCount(snapshot: ProjectSnapshot | null): number {
   const comparisonIssues = snapshot.comparison
     ? snapshot.comparison.missingKeys.length + snapshot.comparison.extraKeys.length + snapshot.comparison.duplicateKeys.length
     : 0;
+  const layerIssues =
+    snapshot.layerReport.overrides.filter((override) => override.conflict).length + snapshot.layerReport.placeholderKeys.length;
   const fileDiagnostics = snapshot.files.reduce((total, file) => total + file.diagnostics.length, 0);
 
-  return comparisonIssues + fileDiagnostics;
+  return comparisonIssues + layerIssues + fileDiagnostics;
 }
 
 export function keyStatus(file: EnvFile, entry: EnvEntry, comparison: EnvComparison | null): KeyStatus {

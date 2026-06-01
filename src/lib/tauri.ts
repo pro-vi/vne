@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 import { sampleProject } from './sample';
 import type { EnvFile, ProjectSnapshot } from './types';
 
@@ -22,6 +23,21 @@ export async function saveEnvValue(path: string, key: string, value: string): Pr
   }
 
   return invoke<EnvFile>('save_env_value', { path, key, value });
+}
+
+export async function pickProjectDirectory(defaultPath: string): Promise<string | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+
+  const selected = await open({
+    title: 'Open project folder',
+    directory: true,
+    multiple: false,
+    defaultPath: defaultPath || undefined
+  });
+
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected;
 }
 
 function delay(milliseconds: number): Promise<void> {

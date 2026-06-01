@@ -10,6 +10,7 @@ pub struct ProjectSnapshot {
     pub root: String,
     pub files: Vec<EnvFile>,
     pub comparison: Option<EnvComparison>,
+    pub layer_report: EnvLayerReport,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -58,6 +59,34 @@ pub struct EnvComparison {
     pub duplicate_keys: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvLayerReport {
+    pub ordered_files: Vec<EnvLayerFile>,
+    pub overrides: Vec<EnvLayerOverride>,
+    pub placeholder_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvLayerFile {
+    pub path: String,
+    pub name: String,
+    pub layer_kind: String,
+    pub precedence: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvLayerOverride {
+    pub key: String,
+    pub files: Vec<String>,
+    pub effective_file: String,
+    pub conflict: bool,
+    pub redacted: bool,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedLine {
     key: String,
@@ -91,6 +120,7 @@ fn save_env_value(path: String, key: String, value: String) -> Result<EnvFile, S
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![load_project, save_env_value])
         .run(tauri::generate_context!())
         .expect("error while running vne");
@@ -142,11 +172,13 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
         .collect::<Vec<_>>();
 
     let comparison = compare_actual_to_example(&files);
+    let layer_report = build_layer_report(&files);
 
     Ok(ProjectSnapshot {
         root: root.to_string_lossy().to_string(),
         files,
         comparison,
+        layer_report,
     })
 }
 
@@ -541,6 +573,138 @@ fn compare_actual_to_example(files: &[EnvFile]) -> Option<EnvComparison> {
         shared_keys,
         duplicate_keys,
     })
+}
+
+fn build_layer_report(files: &[EnvFile]) -> EnvLayerReport {
+    let mut ordered_files = files
+        .iter()
+        .filter(|file| is_layer_file(file))
+        .map(|file| EnvLayerFile {
+            path: file.path.clone(),
+            name: file.name.clone(),
+            layer_kind: layer_kind(&file.name).to_string(),
+            precedence: layer_precedence(&file.name),
+        })
+        .collect::<Vec<_>>();
+
+    ordered_files.sort_by_key(|file| (file.precedence, file.name.clone()));
+
+    let mut by_key = BTreeMap::<String, Vec<(&EnvFile, &EnvEntry)>>::new();
+    let mut placeholder_keys = BTreeSet::new();
+
+    for file in files.iter().filter(|file| is_layer_file(file)) {
+        for entry in &file.entries {
+            by_key
+                .entry(entry.key.clone())
+                .or_default()
+                .push((file, entry));
+            if is_placeholder_value(&entry.value) {
+                placeholder_keys.insert(format!("{}:{}", file.name, entry.key));
+            }
+        }
+    }
+
+    let mut overrides = Vec::new();
+    for (key, mut entries) in by_key {
+        if entries.len() < 2 {
+            continue;
+        }
+
+        entries.sort_by_key(|(file, _)| (layer_precedence(&file.name), file.name.clone()));
+        let unique_values = entries
+            .iter()
+            .map(|(_, entry)| normalized_layer_value(&entry.value))
+            .collect::<BTreeSet<_>>();
+        let conflict = unique_values.len() > 1;
+        let effective_file = entries
+            .last()
+            .map(|(file, _)| file.name.clone())
+            .unwrap_or_default();
+        let redacted = entries
+            .iter()
+            .any(|(_, entry)| entry.shape.redacted_by_default);
+        let files = entries
+            .iter()
+            .map(|(file, _)| file.name.clone())
+            .collect::<Vec<_>>();
+        let summary = if conflict {
+            format!(
+                "{} layers set different values; `{effective_file}` currently wins.",
+                files.len()
+            )
+        } else {
+            format!(
+                "{} layers repeat the same value; `{effective_file}` currently wins.",
+                files.len()
+            )
+        };
+
+        overrides.push(EnvLayerOverride {
+            key,
+            files,
+            effective_file,
+            conflict,
+            redacted,
+            summary,
+        });
+    }
+
+    EnvLayerReport {
+        ordered_files,
+        overrides,
+        placeholder_keys: placeholder_keys.into_iter().collect(),
+    }
+}
+
+fn is_layer_file(file: &EnvFile) -> bool {
+    !matches!(
+        file.name.as_str(),
+        ".env.example" | ".env.sample" | ".env.template" | ".env.defaults"
+    )
+}
+
+fn layer_kind(name: &str) -> &'static str {
+    match name {
+        ".env" => "base",
+        ".env.local" => "local",
+        ".env.development" => "development",
+        ".env.production" => "production",
+        ".env.test" => "test",
+        ".env.development.local" => "development local",
+        ".env.production.local" => "production local",
+        ".env.test.local" => "test local",
+        ".envrc" => "shell",
+        ".flaskenv" => "Flask",
+        _ if name.ends_with(".env") => "referenced",
+        _ => "custom",
+    }
+}
+
+fn layer_precedence(name: &str) -> usize {
+    match name {
+        ".env" => 10,
+        ".env.development" | ".env.production" | ".env.test" => 20,
+        ".env.local" => 30,
+        ".env.development.local" | ".env.production.local" | ".env.test.local" => 40,
+        ".envrc" | ".flaskenv" => 50,
+        _ => 60,
+    }
+}
+
+fn normalized_layer_value(value: &str) -> String {
+    value.trim().trim_matches(['"', '\'']).to_string()
+}
+
+fn is_placeholder_value(value: &str) -> bool {
+    let normalized = normalized_layer_value(value).to_ascii_lowercase();
+    normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "changeme" | "change-me" | "todo" | "tbd" | "replace-me" | "placeholder" | "your-value"
+        )
+        || normalized.starts_with("your_")
+        || normalized.starts_with("your-")
+        || (normalized.starts_with('<') && normalized.ends_with('>'))
 }
 
 fn key_set(file: &EnvFile) -> BTreeSet<String> {
@@ -1102,5 +1266,42 @@ mod tests {
             .discovery_reasons
             .iter()
             .any(|reason| reason.contains("package.json")));
+    }
+
+    #[test]
+    fn reports_layer_overrides_without_exposing_values() {
+        let base = parse_env_file(
+            Path::new(".env"),
+            "DATABASE_URL=postgres://base\nJWT_SECRET=base-secret\n".to_string(),
+        );
+        let local = parse_env_file(
+            Path::new(".env.local"),
+            "DATABASE_URL=postgres://local\nJWT_SECRET=local-secret\n".to_string(),
+        );
+        let example = parse_env_file(
+            Path::new(".env.example"),
+            "DATABASE_URL=\nJWT_SECRET=<secret>\n".to_string(),
+        );
+
+        let report = build_layer_report(&[base, local, example]);
+
+        assert_eq!(report.ordered_files.len(), 2);
+        assert!(report.placeholder_keys.is_empty());
+        let database = report
+            .overrides
+            .iter()
+            .find(|override_row| override_row.key == "DATABASE_URL")
+            .unwrap();
+        assert_eq!(database.effective_file, ".env.local");
+        assert!(database.conflict);
+        assert!(!database.summary.contains("postgres://"));
+
+        let secret = report
+            .overrides
+            .iter()
+            .find(|override_row| override_row.key == "JWT_SECRET")
+            .unwrap();
+        assert!(secret.redacted);
+        assert!(!secret.summary.contains("local-secret"));
     }
 }

@@ -5,12 +5,13 @@
     Eye,
     EyeOff,
     FolderOpen,
+    FolderSearch,
     RefreshCw,
     Save,
     Search,
     ShieldCheck
   } from '@lucide/svelte';
-  import { isTauriRuntime, loadProject, saveEnvValue } from './lib/tauri';
+  import { isTauriRuntime, loadProject, pickProjectDirectory, saveEnvValue } from './lib/tauri';
   import type { EnvEntry, EnvFile, ProjectSnapshot } from './lib/types';
   import { keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
@@ -37,6 +38,7 @@
   $: visibleEntries = selectedFile ? filterEntries(selectedFile, filter) : [];
   $: issueCount = totalIssueCount(snapshot);
   $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && editValue !== selectedEntry.value);
+  $: layerConflicts = snapshot?.layerReport.overrides.filter((override) => override.conflict) ?? [];
 
   async function openProject(): Promise<void> {
     notice = { kind: 'loading', message: 'Scanning env files...' };
@@ -58,6 +60,25 @@
   function handleSubmit(event: SubmitEvent): void {
     event.preventDefault();
     void openProject();
+  }
+
+  async function browseProject(): Promise<void> {
+    if (!isTauriRuntime()) {
+      notice = { kind: 'error', message: 'Native folder picking is available in the Tauri desktop app.' };
+      return;
+    }
+
+    try {
+      const selected = await pickProjectDirectory(projectPath);
+      if (!selected) {
+        notice = { kind: 'idle', message: 'Folder selection cancelled.' };
+        return;
+      }
+      projectPath = selected;
+      await openProject();
+    } catch (error) {
+      notice = { kind: 'error', message: errorMessage(error) };
+    }
   }
 
   function chooseFile(file: EnvFile): void {
@@ -147,6 +168,10 @@
         <FolderOpen size={16} aria-hidden="true" />
         <span>Open</span>
       </button>
+      <button type="button" class="ghost" disabled={notice.kind === 'loading'} onclick={() => void browseProject()}>
+        <FolderSearch size={16} aria-hidden="true" />
+        <span>Browse</span>
+      </button>
       <button type="button" class="icon-button" title="Reload project" aria-label="Reload project" onclick={() => void openProject()}>
         <RefreshCw size={16} aria-hidden="true" />
       </button>
@@ -201,6 +226,36 @@
               <dd>{snapshot.comparison.sharedKeys.length}</dd>
             </div>
           </dl>
+        </div>
+      {/if}
+
+      {#if snapshot && snapshot.layerReport.orderedFiles.length > 0}
+        <div class="comparison-block">
+          <h2>Layer diagnostics</h2>
+          <dl>
+            <div>
+              <dt>Layers</dt>
+              <dd>{snapshot.layerReport.orderedFiles.length}</dd>
+            </div>
+            <div>
+              <dt>Overrides</dt>
+              <dd>{snapshot.layerReport.overrides.length}</dd>
+            </div>
+            <div>
+              <dt>Conflicts</dt>
+              <dd>{layerConflicts.length}</dd>
+            </div>
+          </dl>
+          {#if snapshot.layerReport.overrides.length > 0}
+            <ul class="override-list">
+              {#each snapshot.layerReport.overrides.slice(0, 4) as override}
+                <li>
+                  <strong>{override.key}</strong>
+                  <span>{override.summary}{override.redacted ? ' Value hidden.' : ''}</span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </div>
       {/if}
     </aside>

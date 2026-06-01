@@ -2,6 +2,7 @@ import type { ProjectSnapshot } from './types';
 
 const basePath = '/demo/project/.env';
 const examplePath = '/demo/project/.env.example';
+const localPath = '/demo/project/.env.local';
 const workerPath = '/demo/project/config/worker.env';
 
 export function sampleProject(root = '/demo/project'): ProjectSnapshot {
@@ -47,6 +48,21 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         ]
       },
       {
+        path: localPath,
+        name: '.env.local',
+        discoveryReasons: ['direct env filename `.env.local`'],
+        diagnostics: [],
+        duplicateKeys: [],
+        content: 'DATABASE_URL="postgres://localhost/vne_local"\nOPENAI_API_KEY=sk-local-override\n',
+        entries: [
+          entry('DATABASE_URL', 'postgres://localhost/vne_local', 'URL / DSN', 'url', false, 1, ['URL-like name or value']),
+          entry('OPENAI_API_KEY', 'sk-local-override', 'Secret', 'secret', true, 2, [
+            'OpenAI convention',
+            'secret-like key name'
+          ])
+        ]
+      },
+      {
         path: workerPath,
         name: 'worker.env',
         discoveryReasons: ['package.json script `worker`'],
@@ -59,6 +75,47 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         ]
       }
     ],
+    layerReport: {
+      orderedFiles: [
+        {
+          path: basePath,
+          name: '.env',
+          layerKind: 'base',
+          precedence: 10
+        },
+        {
+          path: '/demo/project/.env.local',
+          name: '.env.local',
+          layerKind: 'local',
+          precedence: 30
+        },
+        {
+          path: workerPath,
+          name: 'worker.env',
+          layerKind: 'referenced',
+          precedence: 60
+        }
+      ],
+      overrides: [
+        {
+          key: 'DATABASE_URL',
+          files: ['.env', '.env.local'],
+          effectiveFile: '.env.local',
+          conflict: true,
+          redacted: false,
+          summary: '2 layers set different values; `.env.local` currently wins.'
+        },
+        {
+          key: 'OPENAI_API_KEY',
+          files: ['.env', '.env.local'],
+          effectiveFile: '.env.local',
+          conflict: true,
+          redacted: true,
+          summary: '2 layers set different values; `.env.local` currently wins.'
+        }
+      ],
+      placeholderKeys: []
+    },
     comparison: {
       basePath,
       examplePath,
