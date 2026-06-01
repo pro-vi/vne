@@ -31,7 +31,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 
 ## Privacy
 
-Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Default Tauri snapshots scrub secret-like entry values and raw file previews before they reach the webview; Reveal fetches only the selected key occurrence into the local webview and clears it on hide, selection change, reload, or save.
+Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Default Tauri snapshots scrub secret-like entry values and withhold raw preview payloads for files with redacted values or secret-like comments/malformed lines; Reveal fetches only the selected key occurrence into the local webview and clears it on hide, selection change, reload, or save.
 
 See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the current local-only threat model and release safety checklist.
 

@@ -149,6 +149,9 @@ struct EnvEntryTarget {
     entry_id: String,
 }
 
+const RAW_PREVIEW_WITHHELD: &str =
+    "[raw preview withheld because this file contains redacted or secret-like text]";
+
 #[tauri::command]
 fn load_project(path: String) -> Result<ProjectSnapshot, String> {
     snapshot_project(Path::new(&path))
@@ -306,34 +309,56 @@ fn redact_snapshot(mut snapshot: ProjectSnapshot) -> ProjectSnapshot {
             }
         }
 
-        if has_redacted_entry {
-            file.content = redact_env_content(&file.content);
+        if has_redacted_entry || content_has_unparsed_secretish_text(&file.content) {
+            file.content = RAW_PREVIEW_WITHHELD.to_string();
         }
     }
 
     snapshot
 }
 
-fn redact_env_content(content: &str) -> String {
+fn content_has_unparsed_secretish_text(content: &str) -> bool {
     let entries = parse_env_entries(content);
-    if !entries
-        .iter()
-        .any(|entry| infer_key_shape(&entry.key, &entry.value).redacted_by_default)
-    {
-        return content.to_string();
+    if entries.iter().any(|entry| {
+        entry
+            .comment
+            .as_deref()
+            .is_some_and(contains_secretish_text)
+    }) {
+        return true;
     }
 
-    let mut output = String::with_capacity(content.len());
-    let mut cursor = 0;
-    for entry in entries {
-        if infer_key_shape(&entry.key, &entry.value).redacted_by_default {
-            output.push_str(&content[cursor..entry.value_start]);
-            output.push_str("********");
-            cursor = entry.value_end;
-        }
-    }
-    output.push_str(&content[cursor..]);
-    output
+    let parsed_lines = entries
+        .iter()
+        .map(|entry| entry.line_number)
+        .collect::<BTreeSet<_>>();
+    content.lines().enumerate().any(|(index, line)| {
+        let line_number = index + 1;
+        let trimmed = line.trim_start();
+        (!parsed_lines.contains(&line_number) || trimmed.starts_with('#'))
+            && contains_secretish_text(line)
+    })
+}
+
+fn contains_secretish_text(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    contains_any(
+        &upper,
+        &[
+            "SECRET",
+            "TOKEN",
+            "PASSWORD",
+            "API_KEY",
+            "PRIVATE_KEY",
+            "ACCESS_KEY",
+            "CLIENT_SECRET",
+            "WEBHOOK_SECRET",
+            "CREDENTIAL",
+            "-----BEGIN",
+        ],
+    ) || text.contains("sk-")
+        || text.contains("ghp_")
+        || text.contains("xoxb-")
 }
 
 pub fn parse_env_file(path: &Path, content: String) -> EnvFile {
@@ -2365,7 +2390,7 @@ mod tests {
         assert_eq!(port.value, "1420");
         assert!(!hidden_file.content.contains("sk-hidden"));
         assert!(!hidden_file.content.contains("user:pass"));
-        assert!(hidden_file.content.contains("PORT=1420"));
+        assert_eq!(hidden_file.content, RAW_PREVIEW_WITHHELD);
 
         let revealed_token = reveal_env_value(
             dir.path().to_string_lossy().to_string(),
@@ -2393,6 +2418,33 @@ mod tests {
             .unwrap();
         assert!(!still_hidden_file.content.contains("sk-hidden"));
         assert!(!still_hidden_file.content.contains("user:pass"));
+    }
+
+    #[test]
+    fn load_project_withholds_secretish_comments_and_malformed_raw_preview() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(".env"),
+            "# API_TOKEN=comment-secret\nPORT=1420\nBROKEN TOKEN line\n",
+        )
+        .unwrap();
+
+        let hidden = load_project(dir.path().to_string_lossy().to_string()).unwrap();
+        let hidden_file = hidden
+            .files
+            .iter()
+            .find(|file| file.name == ".env")
+            .unwrap();
+        let port = hidden_file
+            .entries
+            .iter()
+            .find(|entry| entry.key == "PORT")
+            .unwrap();
+
+        assert_eq!(port.value, "1420");
+        assert_eq!(hidden_file.content, RAW_PREVIEW_WITHHELD);
+        assert!(!hidden_file.content.contains("comment-secret"));
+        assert!(!hidden_file.content.contains("BROKEN TOKEN"));
     }
 
     #[test]

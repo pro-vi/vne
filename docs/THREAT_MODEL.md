@@ -19,7 +19,7 @@
 ## Current Controls
 
 - Secret-like values, credential-bearing URLs/DSNs, and public-prefixed secret-looking names are redacted by default before normal Tauri snapshots reach the webview.
-- Default Tauri snapshots clear `entry.value` for redacted keys and scrub raw file preview content for files containing redacted entries.
+- Default Tauri snapshots clear `entry.value` for redacted keys and withhold raw preview payloads for files containing redacted entries or secret-like text in comments/malformed lines.
 - The explicit Reveal command fetches one selected key occurrence by file, key, and line number; Hide, selection changes, reloads, and saves clear that revealed value from Svelte state.
 - Key-shape metadata separates sensitive-looking values from browser-exposed public prefixes, so names such as `NEXT_PUBLIC_API_KEY` are not treated as safe public values.
 - Findings include key names, file names, and framework load-order evidence, not raw values.
@@ -49,7 +49,7 @@
 
 - Reveal intentionally serializes one selected raw value into the trusted local webview and shows it to the local user.
 - Parsed raw values are present inside the trusted Rust process during scans, writes, and per-entry reveal. A selected raw value enters the Svelte process only after the explicit Reveal command; this is still a local trust boundary, not OS-level secret isolation.
-- Raw preview remains disabled while the selected file has hidden redacted entries. Default raw preview content is scrubbed for parsed secret-like values, but comments and malformed lines can still contain sensitive text if a local project stores secrets there.
+- Raw preview remains disabled while the selected file has hidden redacted entries. Secret-like comments and malformed lines are withheld from default raw preview payloads by heuristic; unknown sensitive text without recognizable markers can still appear in files that otherwise have no redacted entries.
 - A malicious local project can use misleading key names or comments; `vne` treats env files as data and does not execute them.
 - Active project root checks reduce accidental path escape, but they are not a substitute for operating-system file permissions or user caution when opening untrusted projects.
 - Screenshot or browser-inspection proof is still unavailable in this session because only navigation, not screenshot or DOM inspection, was exposed.
