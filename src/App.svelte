@@ -26,6 +26,7 @@
   let selectedKey = '';
   let editValue = '';
   let filter = '';
+  let filterInput: HTMLInputElement | null = null;
   let showRaw = false;
   let showSecrets = false;
   let notice: Notice = {
@@ -93,6 +94,47 @@
   function chooseEntry(entry: EnvEntry): void {
     selectedKey = entry.key;
     editValue = entry.value;
+  }
+
+  function moveSelection(delta: number): void {
+    if (!selectedFile || visibleEntries.length === 0) {
+      return;
+    }
+
+    const foundIndex = visibleEntries.findIndex((entry) => entry.key === selectedKey);
+    const currentIndex = foundIndex === -1 ? (delta > 0 ? -1 : 0) : foundIndex;
+    const nextIndex = Math.min(Math.max(currentIndex + delta, 0), visibleEntries.length - 1);
+    chooseEntry(visibleEntries[nextIndex]);
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLButtonElement>(`.key-row[data-row-index="${nextIndex}"]`)?.focus();
+    });
+  }
+
+  function handleKeyTableKeydown(event: KeyboardEvent): void {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      moveSelection(1);
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveSelection(-1);
+    }
+  }
+
+  function handleGlobalKeydown(event: KeyboardEvent): void {
+    const target = event.target;
+    const isEditing =
+      target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+
+    if (event.key === '/' && !isEditing) {
+      event.preventDefault();
+      filterInput?.focus();
+    }
+
+    if (event.key === 'Escape' && filter) {
+      filter = '';
+    }
   }
 
   async function saveValue(): Promise<void> {
@@ -181,6 +223,8 @@
 <svelte:head>
   <title>vne</title>
 </svelte:head>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 <main class="app-shell">
   <header class="topbar">
@@ -338,7 +382,7 @@
       <div class="table-toolbar">
         <div class="search-field">
           <Search size={16} aria-hidden="true" />
-          <input bind:value={filter} placeholder="Filter keys or shapes" />
+          <input bind:this={filterInput} bind:value={filter} placeholder="Filter keys or shapes" />
         </div>
         <button type="button" class="ghost" onclick={() => (showSecrets = !showSecrets)}>
           {#if showSecrets}
@@ -360,15 +404,17 @@
         </div>
 
         {#if selectedFile && visibleEntries.length > 0}
-          {#each visibleEntries as entry}
+          {#each visibleEntries as entry, rowIndex}
             {@const status = keyStatus(selectedFile, entry, snapshot?.comparison ?? null)}
             <button
               class="key-row"
               class:selected={entry.key === selectedKey}
               class:warn={status !== 'ok'}
+              data-row-index={rowIndex}
               type="button"
               role="row"
               onclick={() => chooseEntry(entry)}
+              onkeydown={handleKeyTableKeydown}
             >
               <span class="key-name" role="cell">{entry.key}</span>
               <span class="shape-pill" role="cell">{entry.shape.label}</span>
