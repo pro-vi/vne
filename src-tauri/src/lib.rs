@@ -2010,6 +2010,47 @@ mod tests {
     }
 
     #[test]
+    fn loads_public_adversarial_dotenv_corpus() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let corpus = repo_root.join("fixtures/adversarial-dotenv");
+        let mut loaded = 0;
+
+        for entry in fs::read_dir(&corpus).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("env") {
+                continue;
+            }
+
+            let content = fs::read_to_string(&path).unwrap();
+            let file = parse_env_file(&path, content.clone());
+            assert_eq!(file.content, content, "fixture content must stay intact");
+            assert!(
+                !file.entries.is_empty(),
+                "{} should parse at least one assignment",
+                path.display()
+            );
+            loaded += 1;
+
+            if path.file_name().and_then(|name| name.to_str()) == Some("duplicates-invalid.env") {
+                assert_eq!(file.duplicate_keys, vec!["DUP"]);
+                assert!(file.entries.iter().all(|entry| entry.key != "INVALID"));
+                assert!(file.entries.iter().all(|entry| entry.key != "1INVALID"));
+
+                let updated =
+                    replace_env_value_at(&content, "NEEDS_QUOTES", 7, "needs quotes # from corpus")
+                        .unwrap();
+                assert!(updated.contains("NEEDS_QUOTES=\"needs quotes # from corpus\"\n"));
+                assert!(updated.contains("DUP=one\nDUP=two\n"));
+            }
+        }
+
+        assert_eq!(loaded, 3);
+    }
+
+    #[test]
     fn replaces_one_value_while_preserving_comments_order_and_quote_style() {
         let content = "# keep\nDATABASE_URL=\"postgres://old/app\" # local\nPORT=3000\n";
         let updated = replace_env_value(content, "DATABASE_URL", "postgres://new/app").unwrap();

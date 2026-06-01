@@ -27,7 +27,7 @@ Most editors show a `.env` file as raw text. `vne` adds env-specific context:
 - Supports fast key scanning with filter focus and arrow-key row movement
 - Requires an explicit occurrence choice before saving duplicate keys
 - Edits one selected key occurrence while preserving comments, order, quote style, multiline values, and adjacent formatting
-- Parser/write tests cover CRLF, UTF-8 BOM, empty values, inline comments, hashes inside values, quoted values, multiline values, invalid keys, duplicates, and quote-requiring replacements
+- Parser/write tests cover CRLF, UTF-8 BOM, empty values, inline comments, hashes inside values, quoted values, multiline values, invalid keys, duplicates, quote-requiring replacements, and the public `fixtures/adversarial-dotenv` corpus
 
 ## Privacy
 
