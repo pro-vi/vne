@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "devDependencies": {
+    "vite": "8.0.0",
+    "typescript": "6.0.3"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "staging": "vite build --mode staging"
+  }
+}

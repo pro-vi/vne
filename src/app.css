@@ -310,7 +310,8 @@ textarea:focus {
   font-weight: 800;
 }
 
-.override-list {
+.override-list,
+.profile-list {
   display: grid;
   gap: 8px;
   margin: 12px 0 0;
@@ -318,7 +319,8 @@ textarea:focus {
   list-style: none;
 }
 
-.override-list li {
+.override-list li,
+.profile-list li {
   display: grid;
   gap: 3px;
   padding: 8px;
@@ -327,7 +329,8 @@ textarea:focus {
   background: #fff;
 }
 
-.override-list strong {
+.override-list strong,
+.profile-list strong {
   min-width: 0;
   overflow: hidden;
   color: var(--ink-soft);
@@ -337,7 +340,8 @@ textarea:focus {
   white-space: nowrap;
 }
 
-.override-list span {
+.override-list span,
+.profile-list span {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.35;

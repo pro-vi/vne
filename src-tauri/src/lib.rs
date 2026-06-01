@@ -11,6 +11,7 @@ pub struct ProjectSnapshot {
     pub files: Vec<EnvFile>,
     pub comparison: Option<EnvComparison>,
     pub layer_report: EnvLayerReport,
+    pub framework_profiles: Vec<FrameworkEnvProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -85,6 +86,26 @@ pub struct EnvLayerOverride {
     pub conflict: bool,
     pub redacted: bool,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameworkEnvProfile {
+    pub framework: String,
+    pub mode: String,
+    pub evidence: Vec<String>,
+    pub ordered_files: Vec<FrameworkEnvFile>,
+    pub missing_files: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameworkEnvFile {
+    pub path: String,
+    pub name: String,
+    pub layer_kind: String,
+    pub rank: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,12 +194,14 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
 
     let comparison = compare_actual_to_example(&files);
     let layer_report = build_layer_report(&files);
+    let framework_profiles = build_framework_profiles(&root, &files);
 
     Ok(ProjectSnapshot {
         root: root.to_string_lossy().to_string(),
         files,
         comparison,
         layer_report,
+        framework_profiles,
     })
 }
 
@@ -654,6 +677,173 @@ fn build_layer_report(files: &[EnvFile]) -> EnvLayerReport {
         overrides,
         placeholder_keys: placeholder_keys.into_iter().collect(),
     }
+}
+
+fn build_framework_profiles(root: &Path, files: &[EnvFile]) -> Vec<FrameworkEnvProfile> {
+    let Some(package_json) = read_package_json(root) else {
+        return Vec::new();
+    };
+    let mut profiles = Vec::new();
+
+    if let Some(evidence) = dependency_evidence(&package_json, "next") {
+        for mode in ["development", "production", "test"] {
+            let desired = next_env_order(mode);
+            let (ordered_files, missing_files) = framework_file_order(root, files, &desired);
+            profiles.push(FrameworkEnvProfile {
+                framework: "Next.js".to_string(),
+                mode: mode.to_string(),
+                evidence: vec![evidence.clone()],
+                ordered_files,
+                missing_files,
+                notes: vec![
+                    "Effective order is highest priority first; process.env is checked before files."
+                        .to_string(),
+                    "Next.js stops lookup once a key is found.".to_string(),
+                    "`NEXT_PUBLIC_` keys are browser-exposed by convention.".to_string(),
+                ],
+            });
+        }
+    }
+
+    let vite_evidence = dependency_evidence(&package_json, "vite")
+        .or_else(|| dependency_evidence(&package_json, "@sveltejs/kit"));
+    if let Some(evidence) = vite_evidence {
+        for mode in vite_modes(&package_json) {
+            let desired = vite_env_order(&mode);
+            let (ordered_files, missing_files) = framework_file_order(root, files, &desired);
+            profiles.push(FrameworkEnvProfile {
+                framework: "Vite".to_string(),
+                mode,
+                evidence: vec![evidence.clone()],
+                ordered_files,
+                missing_files,
+                notes: vec![
+                    "Effective order is highest priority first; existing process env wins over env files."
+                        .to_string(),
+                    "Mode-specific env files override generic env files.".to_string(),
+                    "`VITE_` keys are browser-exposed by convention.".to_string(),
+                ],
+            });
+        }
+    }
+
+    profiles
+}
+
+fn read_package_json(root: &Path) -> Option<serde_json::Value> {
+    let content = fs::read_to_string(root.join("package.json")).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn dependency_evidence(package_json: &serde_json::Value, dependency: &str) -> Option<String> {
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        let Some(version) = package_json
+            .get(section)
+            .and_then(serde_json::Value::as_object)
+            .and_then(|dependencies| dependencies.get(dependency))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+
+        return Some(format!("package.json {section}.{dependency} = {version}"));
+    }
+
+    None
+}
+
+fn next_env_order(mode: &str) -> Vec<String> {
+    let mut names = vec![format!(".env.{mode}.local")];
+    if mode != "test" {
+        names.push(".env.local".to_string());
+    }
+    names.push(format!(".env.{mode}"));
+    names.push(".env".to_string());
+    names
+}
+
+fn vite_env_order(mode: &str) -> Vec<String> {
+    vec![
+        format!(".env.{mode}.local"),
+        format!(".env.{mode}"),
+        ".env.local".to_string(),
+        ".env".to_string(),
+    ]
+}
+
+fn vite_modes(package_json: &serde_json::Value) -> Vec<String> {
+    let mut modes = BTreeSet::from(["development".to_string(), "production".to_string()]);
+
+    if let Some(scripts) = package_json
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+    {
+        for script in scripts.values().filter_map(serde_json::Value::as_str) {
+            let tokens = shell_tokens(script);
+            for (index, token) in tokens.iter().enumerate() {
+                if let Some(mode) = token.strip_prefix("--mode=") {
+                    if is_mode_name(mode) {
+                        modes.insert(mode.to_string());
+                    }
+                    continue;
+                }
+
+                if token == "--mode" {
+                    if let Some(mode) = tokens.get(index + 1).filter(|mode| is_mode_name(mode)) {
+                        modes.insert(mode.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    modes.into_iter().collect()
+}
+
+fn framework_file_order(
+    root: &Path,
+    files: &[EnvFile],
+    desired: &[String],
+) -> (Vec<FrameworkEnvFile>, Vec<String>) {
+    let mut ordered_files = Vec::new();
+    let mut missing_files = Vec::new();
+
+    for (index, name) in desired.iter().enumerate() {
+        if let Some(file) = files
+            .iter()
+            .find(|file| file_has_root_relative_name(root, file, name))
+        {
+            ordered_files.push(FrameworkEnvFile {
+                path: file.path.clone(),
+                name: file.name.clone(),
+                layer_kind: layer_kind(&file.name).to_string(),
+                rank: index + 1,
+            });
+        } else {
+            missing_files.push(name.clone());
+        }
+    }
+
+    (ordered_files, missing_files)
+}
+
+fn file_has_root_relative_name(root: &Path, file: &EnvFile, name: &str) -> bool {
+    Path::new(&file.path)
+        .strip_prefix(root)
+        .ok()
+        .is_some_and(|relative| relative == Path::new(name))
+}
+
+fn is_mode_name(mode: &str) -> bool {
+    !mode.is_empty()
+        && mode
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
 fn is_layer_file(file: &EnvFile) -> bool {
@@ -1303,5 +1493,145 @@ mod tests {
             .unwrap();
         assert!(secret.redacted);
         assert!(!secret.summary.contains("local-secret"));
+    }
+
+    #[test]
+    fn reports_next_framework_env_load_order() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.2.0"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join(".env"), "DATABASE_URL=postgres://base\n").unwrap();
+        fs::write(
+            dir.path().join(".env.local"),
+            "DATABASE_URL=postgres://local\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".env.development"),
+            "DATABASE_URL=postgres://development\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".env.development.local"),
+            "DATABASE_URL=postgres://development-local\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".env.test"),
+            "DATABASE_URL=postgres://test\n",
+        )
+        .unwrap();
+
+        let snapshot = snapshot_project(dir.path()).unwrap();
+        let development = snapshot
+            .framework_profiles
+            .iter()
+            .find(|profile| profile.framework == "Next.js" && profile.mode == "development")
+            .unwrap();
+        let names = development
+            .ordered_files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                ".env.development.local",
+                ".env.local",
+                ".env.development",
+                ".env"
+            ]
+        );
+        assert!(development
+            .notes
+            .iter()
+            .any(|note| note.contains("process.env")));
+
+        let test_profile = snapshot
+            .framework_profiles
+            .iter()
+            .find(|profile| profile.framework == "Next.js" && profile.mode == "test")
+            .unwrap();
+        let test_names = test_profile
+            .ordered_files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(test_names, vec![".env.test", ".env"]);
+        assert!(!test_profile
+            .missing_files
+            .iter()
+            .any(|name| name == ".env.local"));
+    }
+
+    #[test]
+    fn reports_vite_framework_env_load_order_and_script_modes() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"staging":"vite build --mode staging"},"devDependencies":{"vite":"8.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join(".env"), "VITE_APP_NAME=base\n").unwrap();
+        fs::write(dir.path().join(".env.local"), "VITE_APP_NAME=local\n").unwrap();
+        fs::write(
+            dir.path().join(".env.development"),
+            "VITE_APP_NAME=development\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".env.development.local"),
+            "VITE_APP_NAME=development-local\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".env.staging"), "VITE_APP_NAME=staging\n").unwrap();
+        fs::write(
+            dir.path().join(".env.staging.local"),
+            "VITE_APP_NAME=staging-local\n",
+        )
+        .unwrap();
+
+        let snapshot = snapshot_project(dir.path()).unwrap();
+        let development = snapshot
+            .framework_profiles
+            .iter()
+            .find(|profile| profile.framework == "Vite" && profile.mode == "development")
+            .unwrap();
+        let names = development
+            .ordered_files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                ".env.development.local",
+                ".env.development",
+                ".env.local",
+                ".env"
+            ]
+        );
+
+        let staging = snapshot
+            .framework_profiles
+            .iter()
+            .find(|profile| profile.framework == "Vite" && profile.mode == "staging")
+            .unwrap();
+        let staging_names = staging
+            .ordered_files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            staging_names,
+            vec![".env.staging.local", ".env.staging", ".env.local", ".env"]
+        );
     }
 }

@@ -3,6 +3,7 @@ export interface ProjectSnapshot {
   files: EnvFile[];
   comparison: EnvComparison | null;
   layerReport: EnvLayerReport;
+  frameworkProfiles: FrameworkEnvProfile[];
 }
 
 export interface EnvFile {
@@ -63,6 +64,22 @@ export interface EnvLayerOverride {
   conflict: boolean;
   redacted: boolean;
   summary: string;
+}
+
+export interface FrameworkEnvProfile {
+  framework: string;
+  mode: string;
+  evidence: string[];
+  orderedFiles: FrameworkEnvFile[];
+  missingFiles: string[];
+  notes: string[];
+}
+
+export interface FrameworkEnvFile {
+  path: string;
+  name: string;
+  layerKind: string;
+  rank: number;
 }
 
 export type KeyStatus = 'ok' | 'missing' | 'extra' | 'duplicate';

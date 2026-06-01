@@ -12,7 +12,7 @@
     ShieldCheck
   } from '@lucide/svelte';
   import { isTauriRuntime, loadProject, pickProjectDirectory, saveEnvValue } from './lib/tauri';
-  import type { EnvEntry, EnvFile, ProjectSnapshot } from './lib/types';
+  import type { EnvEntry, EnvFile, FrameworkEnvProfile, ProjectSnapshot } from './lib/types';
   import { keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
   type Notice = {
@@ -39,6 +39,7 @@
   $: issueCount = totalIssueCount(snapshot);
   $: canSave = Boolean(isTauriRuntime() && selectedFile && selectedEntry && editValue !== selectedEntry.value);
   $: layerConflicts = snapshot?.layerReport.overrides.filter((override) => override.conflict) ?? [];
+  $: frameworkMissingCount = snapshot?.frameworkProfiles.reduce((total, profile) => total + profile.missingFiles.length, 0) ?? 0;
 
   async function openProject(): Promise<void> {
     notice = { kind: 'loading', message: 'Scanning env files...' };
@@ -138,6 +139,10 @@
         entry.shape.kind.toLowerCase().includes(normalized)
       );
     });
+  }
+
+  function profileOrder(profile: FrameworkEnvProfile): string {
+    return profile.orderedFiles.map((file) => file.name).join(' -> ') || 'No matching env files';
   }
 
   function errorMessage(error: unknown): string {
@@ -256,6 +261,30 @@
               {/each}
             </ul>
           {/if}
+        </div>
+      {/if}
+
+      {#if snapshot && snapshot.frameworkProfiles.length > 0}
+        <div class="comparison-block">
+          <h2>Framework profiles</h2>
+          <dl>
+            <div>
+              <dt>Profiles</dt>
+              <dd>{snapshot.frameworkProfiles.length}</dd>
+            </div>
+            <div>
+              <dt>Missing files</dt>
+              <dd>{frameworkMissingCount}</dd>
+            </div>
+          </dl>
+          <ul class="profile-list">
+            {#each snapshot.frameworkProfiles.slice(0, 4) as profile}
+              <li>
+                <strong>{profile.framework} / {profile.mode}</strong>
+                <span>{profileOrder(profile)}</span>
+              </li>
+            {/each}
+          </ul>
         </div>
       {/if}
     </aside>

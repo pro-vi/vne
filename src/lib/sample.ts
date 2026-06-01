@@ -116,6 +116,33 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
       ],
       placeholderKeys: []
     },
+    frameworkProfiles: [
+      {
+        framework: 'Next.js',
+        mode: 'development',
+        evidence: ['package.json dependencies.next = ^14.2.0'],
+        orderedFiles: [
+          {
+            path: localPath,
+            name: '.env.local',
+            layerKind: 'local',
+            rank: 2
+          },
+          {
+            path: basePath,
+            name: '.env',
+            layerKind: 'base',
+            rank: 4
+          }
+        ],
+        missingFiles: ['.env.development.local', '.env.development'],
+        notes: [
+          'Effective order is highest priority first; process.env is checked before files.',
+          'Next.js stops lookup once a key is found.',
+          '`NEXT_PUBLIC_` keys are browser-exposed by convention.'
+        ]
+      }
+    ],
     comparison: {
       basePath,
       examplePath,
