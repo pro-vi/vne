@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -149,6 +150,47 @@ struct EnvEntryTarget {
     entry_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppendEnvKeyError {
+    InvalidKey,
+    EmptyValue,
+    Duplicate { line_numbers: Vec<usize> },
+}
+
+impl AppendEnvKeyError {
+    pub fn message(&self, key: &str) -> String {
+        match self {
+            Self::InvalidKey => format!("`{key}` is not a valid env key"),
+            Self::EmptyValue => format!("`{key}` needs a value before it can be added"),
+            Self::Duplicate { line_numbers } => {
+                let lines = line_numbers
+                    .iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let label = if line_numbers.len() == 1 {
+                    "line"
+                } else {
+                    "lines"
+                };
+                format!("`{key}` already exists at {label} {lines}; edit the existing occurrence instead")
+            }
+        }
+    }
+}
+
+impl fmt::Display for AppendEnvKeyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidKey => formatter.write_str("invalid env key"),
+            Self::EmptyValue => formatter.write_str("empty env value"),
+            Self::Duplicate { .. } => formatter.write_str("duplicate env key"),
+        }
+    }
+}
+
+impl std::error::Error for AppendEnvKeyError {}
+
 const RAW_PREVIEW_WITHHELD: &str =
     "[raw preview withheld because this file contains redacted or secret-like text]";
 
@@ -210,9 +252,8 @@ fn add_env_key(
         .map_err(|error| error.to_string())?;
     let path = resolve_project_file(&root, &path)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let updated = append_env_key(&content, &key, &value).ok_or_else(|| {
-        format!("Key `{key}` already exists, has an empty value, or is not a valid env key")
-    })?;
+    let updated =
+        append_env_key_result(&content, &key, &value).map_err(|error| error.message(&key))?;
 
     atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
     snapshot_project(&root_path)
@@ -299,22 +340,31 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     })
 }
 
-fn redact_snapshot(mut snapshot: ProjectSnapshot) -> ProjectSnapshot {
+pub fn redact_snapshot(mut snapshot: ProjectSnapshot) -> ProjectSnapshot {
     for file in &mut snapshot.files {
-        let mut has_redacted_entry = false;
-        for entry in &mut file.entries {
-            if entry.shape.redacted_by_default {
-                entry.value.clear();
-                has_redacted_entry = true;
-            }
-        }
-
-        if has_redacted_entry || content_has_unparsed_secretish_text(&file.content) {
-            file.content = RAW_PREVIEW_WITHHELD.to_string();
-        }
+        redact_env_file_in_place(file);
     }
 
     snapshot
+}
+
+pub fn redact_env_file(mut file: EnvFile) -> EnvFile {
+    redact_env_file_in_place(&mut file);
+    file
+}
+
+fn redact_env_file_in_place(file: &mut EnvFile) {
+    let mut has_redacted_entry = false;
+    for entry in &mut file.entries {
+        if entry.shape.redacted_by_default {
+            entry.value.clear();
+            has_redacted_entry = true;
+        }
+    }
+
+    if has_redacted_entry || content_has_unparsed_secretish_text(&file.content) {
+        file.content = RAW_PREVIEW_WITHHELD.to_string();
+    }
 }
 
 fn content_has_unparsed_secretish_text(content: &str) -> bool {
@@ -480,13 +530,31 @@ where
 }
 
 pub fn append_env_key(content: &str, key: &str, value: &str) -> Option<String> {
-    if !is_valid_env_key(key)
-        || value.trim().is_empty()
-        || parse_env_entries(content)
-            .iter()
-            .any(|entry| entry.key == key)
-    {
-        return None;
+    append_env_key_result(content, key, value).ok()
+}
+
+pub fn append_env_key_result(
+    content: &str,
+    key: &str,
+    value: &str,
+) -> Result<String, AppendEnvKeyError> {
+    if !is_valid_env_key(key) {
+        return Err(AppendEnvKeyError::InvalidKey);
+    }
+
+    if value.trim().is_empty() {
+        return Err(AppendEnvKeyError::EmptyValue);
+    }
+
+    let duplicate_lines = parse_env_entries(content)
+        .iter()
+        .filter(|entry| entry.key == key)
+        .map(|entry| entry.line_number)
+        .collect::<Vec<_>>();
+    if !duplicate_lines.is_empty() {
+        return Err(AppendEnvKeyError::Duplicate {
+            line_numbers: duplicate_lines,
+        });
     }
 
     let mut output = String::with_capacity(content.len() + key.len() + value.len() + 4);
@@ -507,7 +575,7 @@ pub fn append_env_key(content: &str, key: &str, value: &str) -> Option<String> {
     }
     output.push('\n');
 
-    Some(output)
+    Ok(output)
 }
 
 pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
@@ -856,14 +924,18 @@ fn compare_actual_to_example(files: &[EnvFile]) -> Option<EnvComparison> {
         )
     })?;
 
+    Some(compare_env_files(base, example))
+}
+
+pub fn compare_env_files(base: &EnvFile, example: &EnvFile) -> EnvComparison {
     let base_keys = key_set(base);
     let example_keys = key_set(example);
 
     let missing_keys = example_keys.difference(&base_keys).cloned().collect();
     let extra_keys = base_keys.difference(&example_keys).cloned().collect();
     let shared_keys = base_keys.intersection(&example_keys).cloned().collect();
-    let duplicate_keys = files
-        .iter()
+    let duplicate_keys = [base, example]
+        .into_iter()
         .flat_map(|file| {
             file.duplicate_keys
                 .iter()
@@ -871,14 +943,14 @@ fn compare_actual_to_example(files: &[EnvFile]) -> Option<EnvComparison> {
         })
         .collect();
 
-    Some(EnvComparison {
+    EnvComparison {
         base_path: base.path.clone(),
         example_path: example.path.clone(),
         missing_keys,
         extra_keys,
         shared_keys,
         duplicate_keys,
-    })
+    }
 }
 
 fn build_layer_report(files: &[EnvFile]) -> EnvLayerReport {
@@ -1685,7 +1757,7 @@ fn env_file_sort_key(name: &str) -> (u8, String) {
     (priority, name.to_string())
 }
 
-fn atomic_write_preserving_permissions(path: &Path, content: &str) -> io::Result<()> {
+pub fn atomic_write_preserving_permissions(path: &Path, content: &str) -> io::Result<()> {
     let permissions = fs::metadata(path)
         .map(|metadata| metadata.permissions())
         .ok();
@@ -2140,6 +2212,23 @@ mod tests {
         assert!(append_env_key("PORT=1420\n", "1INVALID", "value").is_none());
         assert!(append_env_key("PORT=1420\n", "REDIS_URL", "").is_none());
         assert!(append_env_key("PORT=1420\n", "REDIS_URL", "   ").is_none());
+    }
+
+    #[test]
+    fn reports_duplicate_lines_when_appending_existing_key() {
+        let error = append_env_key_result("PORT=1420\nPORT=3000\n", "PORT", "8080")
+            .expect_err("duplicate append should fail");
+
+        assert_eq!(
+            error,
+            AppendEnvKeyError::Duplicate {
+                line_numbers: vec![1, 2]
+            }
+        );
+        assert_eq!(
+            error.message("PORT"),
+            "`PORT` already exists at lines 1, 2; edit the existing occurrence instead"
+        );
     }
 
     #[test]
