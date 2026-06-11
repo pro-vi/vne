@@ -5,6 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub mod cli;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSnapshot {
@@ -194,6 +196,14 @@ impl std::error::Error for AppendEnvKeyError {}
 const RAW_PREVIEW_WITHHELD: &str =
     "[raw preview withheld because this file contains redacted or secret-like text]";
 
+#[derive(Clone)]
+struct InitialProjectPath(Option<String>);
+
+#[tauri::command]
+fn initial_project_path(path: tauri::State<'_, InitialProjectPath>) -> Option<String> {
+    path.0.clone()
+}
+
 #[tauri::command]
 fn load_project(path: String) -> Result<ProjectSnapshot, String> {
     snapshot_project(Path::new(&path))
@@ -263,9 +273,15 @@ fn add_env_key(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    run_with_initial_project_path(None);
+}
+
+pub fn run_with_initial_project_path(initial_path: Option<String>) {
     tauri::Builder::default()
+        .manage(InitialProjectPath(initial_path))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            initial_project_path,
             load_project,
             reveal_env_value,
             save_env_value,

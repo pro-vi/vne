@@ -50,6 +50,12 @@ vne add .env PORT --value 1420
 
 `add` refuses duplicate keys and reports existing line numbers, so the copied command is still easy to recover from.
 
+To open the desktop editor at a project, run:
+
+```sh
+vne .
+```
+
 ## Privacy
 
 Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Default Tauri snapshots scrub secret-like entry values and withhold raw preview payloads for files with redacted values or secret-like comments/malformed lines; Reveal fetches only the selected key occurrence into the local webview and clears it on hide, selection change, reload, or save.
@@ -76,18 +82,20 @@ Run the desktop app:
 npm run tauri dev
 ```
 
-Run the local CLI:
+Run the local `vne` binary:
 
 ```sh
-cargo run --manifest-path src-tauri/Cargo.toml --bin vne-cli -- inspect fixtures/demo
-cargo run --manifest-path src-tauri/Cargo.toml --bin vne-cli -- check fixtures/demo/.env --example fixtures/demo/.env.example --json
-cargo run --manifest-path src-tauri/Cargo.toml --bin vne-cli -- add fixtures/demo/.env FEATURE_FLAG true
-cargo run --manifest-path src-tauri/Cargo.toml --bin vne-cli -- add fixtures/demo/.env FEATURE_FLAG=true
-cargo run --manifest-path src-tauri/Cargo.toml --bin vne-cli -- add fixtures/demo/.env OPENAI_API_KEY --prompt
-cargo run --manifest-path src-tauri/Cargo.toml --bin vne-cli -- format fixtures/demo/.env --dry-run
+cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- inspect fixtures/demo
+cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- check fixtures/demo/.env --example fixtures/demo/.env.example --json
+cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- add fixtures/demo/.env FEATURE_FLAG true
+cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- add fixtures/demo/.env FEATURE_FLAG=true
+cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- add fixtures/demo/.env OPENAI_API_KEY --prompt
+cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- format fixtures/demo/.env --dry-run
 ```
 
 `inspect` and `check` return exit code `1` when diagnostics or contract drift are found. `add` accepts `<KEY> <VALUE>`, `<KEY=VALUE>`, `--value`, `--stdin`, or `--prompt`; it refuses duplicate keys and reports the existing line numbers instead of appending another occurrence.
+
+The compatibility binary still exists for local automation that already calls `--bin vne-cli`, but the product command and default Cargo binary are `vne`.
 
 Run checks:
 

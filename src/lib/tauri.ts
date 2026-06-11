@@ -16,6 +16,14 @@ export async function loadProject(path: string): Promise<ProjectSnapshot> {
   return invoke<ProjectSnapshot>('load_project', { path });
 }
 
+export async function initialProjectPath(): Promise<string | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+
+  return invoke<string | null>('initial_project_path');
+}
+
 export async function revealEnvValue(root: string, path: string, key: string, lineNumber: number): Promise<string> {
   if (!isTauriRuntime()) {
     await delay(180);

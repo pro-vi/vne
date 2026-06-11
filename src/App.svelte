@@ -11,7 +11,15 @@
     Save,
     Search,
   } from '@lucide/svelte';
-  import { addEnvKey, isTauriRuntime, loadProject, pickProjectDirectory, revealEnvValue, saveEnvValue } from './lib/tauri';
+  import {
+    addEnvKey,
+    initialProjectPath,
+    isTauriRuntime,
+    loadProject,
+    pickProjectDirectory,
+    revealEnvValue,
+    saveEnvValue
+  } from './lib/tauri';
   import type { EnvEntry, EnvFile, EnvFinding, ProjectSnapshot } from './lib/types';
   import { isEntryValueHidden, keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
@@ -101,6 +109,20 @@
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
     }
+  }
+
+  async function bootProject(): Promise<void> {
+    try {
+      const initialPath = await initialProjectPath();
+      if (initialPath) {
+        projectPath = initialPath;
+      }
+    } catch (error) {
+      notice = { kind: 'error', message: errorMessage(error) };
+      return;
+    }
+
+    await openProject();
   }
 
   function handleSubmit(event: SubmitEvent): void {
@@ -627,7 +649,7 @@
     return error instanceof Error ? error.message : String(error);
   }
 
-  void openProject();
+  void bootProject();
 </script>
 
 <svelte:head>
