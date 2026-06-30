@@ -49,6 +49,8 @@ vne add .env PORT --value 1420
 ```
 
 `add` refuses duplicate keys and reports existing line numbers, so the copied command is still easy to recover from.
+When stdout is piped, data-bearing commands emit compact JSON by default. Use `--text` to force human output,
+`--json` for compact JSON explicitly, or `--pretty` for formatted JSON.
 
 To open the desktop editor at a project, run:
 
@@ -93,7 +95,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- add fixtures/demo/.e
 cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- format fixtures/demo/.env --dry-run
 ```
 
-`inspect` and `check` return exit code `1` when diagnostics or contract drift are found. `add` accepts `<KEY> <VALUE>`, `<KEY=VALUE>`, `--value`, `--stdin`, or `--prompt`; it refuses duplicate keys and reports the existing line numbers instead of appending another occurrence.
+`inspect` and `check` return exit code `1` when diagnostics or contract drift are found. `add` accepts `<KEY> <VALUE>`, `<KEY=VALUE>`, `--value`, `--stdin`, or `--prompt`; it refuses duplicate keys and reports the existing line numbers instead of appending another occurrence. Use `vne <command> --help` for command-specific examples.
 
 The compatibility binary still exists for local automation that already calls `--bin vne-cli`, but the product command and default Cargo binary are `vne`.
 

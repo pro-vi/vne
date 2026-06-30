@@ -20,12 +20,23 @@
     revealEnvValue,
     saveEnvValue
   } from './lib/tauri';
-  import type { EnvEntry, EnvFile, EnvFinding, ProjectSnapshot } from './lib/types';
+  import type { EnvComparison, EnvEntry, EnvFile, EnvFinding, KeyStatus, ProjectSnapshot } from './lib/types';
   import { isEntryValueHidden, keyStatus, statusLabel, totalIssueCount } from './lib/summary';
 
   type Notice = {
     kind: 'idle' | 'loading' | 'success' | 'error';
     message: string;
+  };
+
+  type EntryRow = {
+    entry: EnvEntry;
+    status: KeyStatus;
+    attentionClass: string;
+    attentionLabel: string;
+    categoryClass: string;
+    shapeLabel: string;
+    displayValue: string;
+    valueHidden: boolean;
   };
 
   let projectPath = '.';
@@ -49,7 +60,9 @@
 
   $: selectedFile = snapshot?.files.find((file) => file.path === selectedPath) ?? snapshot?.files[0] ?? null;
   $: selectedEntry = selectedFile?.entries.find((entry) => entry.id === selectedEntryId) ?? selectedFile?.entries[0] ?? null;
+  $: currentComparison = snapshot?.comparison ?? null;
   $: visibleEntries = selectedFile ? filterEntries(selectedFile, filter) : [];
+  $: entryRows = selectedFile ? buildEntryRows(selectedFile, visibleEntries, currentComparison) : [];
   $: selectedEntryRevealed = Boolean(selectedFile && selectedEntry && isEntryRevealed(selectedFile, selectedEntry));
   $: selectedEntryValue = selectedFile && selectedEntry ? entryValue(selectedFile, selectedEntry) : '';
   $: selectedValueHidden = selectedEntry ? isEntryValueHidden(selectedEntry, selectedEntryRevealed) : false;
@@ -84,11 +97,9 @@
     selectedFile && selectedEntry
       ? findings.filter((finding) => findingMatchesEntry(finding, selectedFile, selectedEntry))
       : [];
-  $: attentionKeyCount = selectedFile
-    ? selectedFile.entries.filter((entry) => lineAttentionClass(selectedFile, entry).length > 0).length
-    : 0;
+  $: attentionKeyCount = selectedFile ? countAttentionKeys(selectedFile, currentComparison) : 0;
   $: selectedVisibleIndex =
-    selectedFile && selectedEntry ? visibleEntries.findIndex((entry) => entry.id === selectedEntry.id) : -1;
+    selectedFile && selectedEntry ? entryRows.findIndex((row) => row.entry.id === selectedEntry.id) : -1;
   $: if (selectedFileHasHiddenSecrets && showRaw) {
     showRaw = false;
   }
@@ -447,32 +458,31 @@
     return `${index === -1 ? 1 : index + 1} of ${occurrences.length || 1}`;
   }
 
-  function quoteLabel(entry: EnvEntry): string {
-    if (entry.quote === '"') {
-      return 'double quoted';
-    }
-
-    if (entry.quote === "'") {
-      return 'single quoted';
-    }
-
-    return 'unquoted';
-  }
-
-  function diagnosticsLabel(entry: EnvEntry): string {
-    return entry.diagnostics.length ? entry.diagnostics.join(', ') : 'none';
-  }
-
   function exposureLabel(entry: EnvEntry): string {
     return entry.shape.exposure === 'browser' ? 'browser-exposed' : 'local process';
   }
 
-  function displayValue(file: EnvFile, entry: EnvEntry): string {
-    if (!isEntryValueHidden(entry, isEntryRevealed(file, entry))) {
-      return entryValue(file, entry) || '(empty)';
-    }
+  function buildEntryRows(file: EnvFile, entries: EnvEntry[], comparison: EnvComparison | null): EntryRow[] {
+    return entries.map((entry) => {
+      const status = keyStatus(file, entry, comparison);
+      const attentionClass = entryAttentionClass(entry, status);
+      const valueHidden = isEntryValueHidden(entry, isEntryRevealed(file, entry));
 
-    return entry.displayValue;
+      return {
+        entry,
+        status,
+        attentionClass,
+        attentionLabel: attentionClass ? entryAttentionLabel(entry, status) : '',
+        categoryClass: entryCategoryClass(entry),
+        shapeLabel: shapeShortLabel(entry),
+        displayValue: valueHidden ? entry.displayValue : entryValue(file, entry) || '(empty)',
+        valueHidden
+      };
+    });
+  }
+
+  function countAttentionKeys(file: EnvFile, comparison: EnvComparison | null): number {
+    return file.entries.filter((entry) => entryAttentionClass(entry, keyStatus(file, entry, comparison)).length > 0).length;
   }
 
   function entryCategoryClass(entry: EnvEntry): string {
@@ -495,8 +505,7 @@
     return 'cat-config';
   }
 
-  function lineAttentionClass(file: EnvFile, entry: EnvEntry): string {
-    const status = keyStatus(file, entry, snapshot?.comparison ?? null);
+  function entryAttentionClass(entry: EnvEntry, status: KeyStatus): string {
     if (status === 'duplicate' || status === 'missing' || entry.diagnostics.length > 0) {
       return 'att-hard';
     }
@@ -512,8 +521,7 @@
     return '';
   }
 
-  function lineAttentionLabel(file: EnvFile, entry: EnvEntry): string {
-    const status = keyStatus(file, entry, snapshot?.comparison ?? null);
+  function entryAttentionLabel(entry: EnvEntry, status: KeyStatus): string {
     if (status === 'duplicate') {
       return 'duplicate key';
     }
@@ -751,32 +759,31 @@
 
       <div class="buffer" role="table" aria-label="Parsed env lines">
         {#if selectedFile && visibleEntries.length > 0}
-          {#each visibleEntries as entry, rowIndex}
-            {@const status = keyStatus(selectedFile, entry, snapshot?.comparison ?? null)}
-            {@const att = lineAttentionClass(selectedFile, entry)}
-            <div class={`row-wrap ${entryCategoryClass(entry)}`} class:open={entry.id === selectedEntryId}>
+          {#each entryRows as row, rowIndex}
+            {@const entry = row.entry}
+            <div class={`row-wrap ${row.categoryClass}`} class:open={entry.id === selectedEntryId}>
               <button
                 class="line"
                 class:sel={entry.id === selectedEntryId}
-                class:ghost={status === 'missing'}
+                class:ghost={row.status === 'missing'}
                 data-row-index={rowIndex}
                 type="button"
                 role="row"
                 onclick={() => chooseEntry(entry)}
                 onkeydown={handleKeyTableKeydown}
               >
-                <span class="marker" role="cell"><span class={`pip ${att}`}></span></span>
+                <span class="marker" role="cell"><span class={`pip ${row.attentionClass}`}></span></span>
                 <span class="gutter" role="cell">{entry.lineNumber}</span>
                 <span class="code" role="cell">
                   <span class="k">{entry.key}</span><span class="eq">=</span><span
-                    class:redacted={isEntryValueHidden(entry, isEntryRevealed(selectedFile, entry))}
+                    class:redacted={row.valueHidden}
                     class="v"
-                  >{displayValue(selectedFile, entry)}</span>{#if entry.comment}<span class="comment"> {entry.comment}</span>{/if}
+                  >{row.displayValue}</span>{#if entry.comment}<span class="comment"> {entry.comment}</span>{/if}
                 </span>
                 <span class="annot" role="cell">
-                  <span class="typ">{shapeShortLabel(entry)}</span>
+                  <span class="typ">{row.shapeLabel}</span>
                   <span class="exp">{exposureLabel(entry)}</span>
-                  {#if att}<span class="attention">{lineAttentionLabel(selectedFile, entry)}</span>{/if}
+                  {#if row.attentionClass}<span class="attention">{row.attentionLabel}</span>{/if}
                 </span>
               </button>
 
@@ -784,7 +791,7 @@
                 <section class="line-edit" aria-label={`Edit ${entry.key}`}>
                   <div class="line-edit-head">
                     <strong>{entry.key}</strong>
-                    <span>{entry.shape.label} / {entry.shape.confidence} / {statusLabel(status)}</span>
+                    <span>{entry.shape.label} / {entry.shape.confidence} / {statusLabel(row.status)}</span>
                   </div>
 
                   {#if selectedValueHidden}

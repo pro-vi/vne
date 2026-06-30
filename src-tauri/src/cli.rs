@@ -18,11 +18,11 @@ enum Command {
     Check {
         file: PathBuf,
         example: Option<PathBuf>,
-        json: bool,
+        output: OutputFormat,
     },
     Inspect {
         dir: PathBuf,
-        json: bool,
+        output: OutputFormat,
     },
     Format {
         file: PathBuf,
@@ -32,9 +32,9 @@ enum Command {
         file: PathBuf,
         key: String,
         value: AddValue,
-        json: bool,
+        output: OutputFormat,
     },
-    Help,
+    Help(HelpTopic),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -42,6 +42,38 @@ enum AddValue {
     Inline(String),
     Prompt,
     Stdin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Auto,
+    Text,
+    Json,
+    PrettyJson,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpTopic {
+    General,
+    Check,
+    Inspect,
+    Add,
+    Format,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParseError {
+    message: String,
+    topic: HelpTopic,
+}
+
+impl ParseError {
+    fn new(topic: HelpTopic, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            topic,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -63,8 +95,8 @@ pub fn run_from_env() -> ExitCode {
 
 pub fn run_from_args(args: impl IntoIterator<Item = String>) -> ExitCode {
     match parse_args(args) {
-        Ok(Command::Help) => {
-            if print_usage().is_ok() {
+        Ok(Command::Help(topic)) => {
+            if print_usage(topic).is_ok() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(2)
@@ -84,9 +116,9 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> ExitCode {
             }
         },
         Err(error) => {
-            let _ = stderr_line(format_args!("vne: {error}"));
+            let _ = stderr_line(format_args!("vne: {}", error.message));
             let _ = stderr_line(format_args!(""));
-            let _ = print_usage();
+            let _ = print_usage_to_stderr(error.topic);
             ExitCode::from(2)
         }
     }
@@ -97,20 +129,20 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
         Command::Check {
             file,
             example,
-            json,
-        } => run_check(&file, example.as_deref(), json),
-        Command::Inspect { dir, json } => run_inspect(&dir, json),
+            output,
+        } => run_check(&file, example.as_deref(), output),
+        Command::Inspect { dir, output } => run_inspect(&dir, output),
         Command::Format { file, dry_run } => run_format(&file, dry_run),
         Command::Add {
             file,
             key,
             value,
-            json,
+            output,
         } => {
             let value = read_add_value(&key, value)?;
-            run_add(&file, &key, &value, json)
+            run_add(&file, &key, &value, output)
         }
-        Command::Help => Ok(false),
+        Command::Help(_) => Ok(false),
     }
 }
 
@@ -182,7 +214,7 @@ fn set_terminal_echo_for_platform(_enabled: bool) -> bool {
 fn run_check(
     file_path: &Path,
     example_path: Option<&Path>,
-    json: bool,
+    output_format: OutputFormat,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let file = load_env_file(file_path)?;
     let example = example_path.map(load_env_file).transpose()?;
@@ -198,8 +230,8 @@ fn run_check(
         comparison,
     };
 
-    if json {
-        stdout_line(format_args!("{}", serde_json::to_string_pretty(&output)?))?;
+    if output_format.wants_json() {
+        print_json(&output, output_format)?;
     } else {
         print_file_summary(&output.file)?;
         if let Some(example) = &output.example {
@@ -213,12 +245,12 @@ fn run_check(
     Ok(has_findings)
 }
 
-fn run_inspect(dir: &Path, json: bool) -> Result<bool, Box<dyn std::error::Error>> {
+fn run_inspect(dir: &Path, output: OutputFormat) -> Result<bool, Box<dyn std::error::Error>> {
     let snapshot = redact_snapshot(crate::snapshot_project(dir)?);
     let has_findings = has_snapshot_findings(&snapshot);
 
-    if json {
-        stdout_line(format_args!("{}", serde_json::to_string_pretty(&snapshot)?))?;
+    if output.wants_json() {
+        print_json(&snapshot, output)?;
     } else {
         stdout_line(format_args!(
             "{}: {} env files, {} findings",
@@ -245,7 +277,7 @@ fn run_format(file: &Path, dry_run: bool) -> Result<bool, Box<dyn std::error::Er
         );
     }
 
-    let content = fs::read_to_string(file)?;
+    let content = read_to_string_with_path(file)?;
     let _ = parse_env_file(file, content.clone());
     stdout(format_args!("{content}"))?;
     Ok(false)
@@ -255,17 +287,17 @@ fn run_add(
     file: &Path,
     key: &str,
     value: &str,
-    json: bool,
+    output: OutputFormat,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(file)?;
+    let content = read_to_string_with_path(file)?;
     let updated =
         append_env_key_result(&content, key, value).map_err(|error| error.message(key))?;
 
     atomic_write_preserving_permissions(file, &updated)?;
 
-    if json {
+    if output.wants_json() {
         let file = redact_env_file(load_env_file(file)?);
-        stdout_line(format_args!("{}", serde_json::to_string_pretty(&file)?))?;
+        print_json(&file, output)?;
     } else {
         stdout_line(format_args!("added `{key}` to {}", file.display()))?;
     }
@@ -274,9 +306,41 @@ fn run_add(
 }
 
 fn load_env_file(path: &Path) -> Result<EnvFile, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(path)?;
+    let content = read_to_string_with_path(path)?;
     let display_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     Ok(parse_env_file(&display_path, content))
+}
+
+fn read_to_string_with_path(path: &Path) -> io::Result<String> {
+    fs::read_to_string(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not read {}: {error}", path.display()),
+        )
+    })
+}
+
+fn print_json<T: Serialize>(
+    value: &T,
+    output: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let serialized = if output == OutputFormat::PrettyJson {
+        serde_json::to_string_pretty(value)?
+    } else {
+        serde_json::to_string(value)?
+    };
+    stdout_line(format_args!("{serialized}"))?;
+    Ok(())
+}
+
+impl OutputFormat {
+    fn wants_json(self) -> bool {
+        match self {
+            Self::Auto => !io::stdout().is_terminal(),
+            Self::Text => false,
+            Self::Json | Self::PrettyJson => true,
+        }
+    }
 }
 
 fn print_file_summary(file: &EnvFile) -> io::Result<()> {
@@ -335,106 +399,156 @@ fn has_comparison_findings(comparison: &EnvComparison) -> bool {
         || !comparison.duplicate_keys.is_empty()
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, ParseError> {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
-        return Ok(Command::Help);
+        return Ok(Command::Help(HelpTopic::General));
     };
 
     match command.as_str() {
-        "-h" | "--help" | "help" => Ok(Command::Help),
+        "-h" | "--help" | "help" => Ok(Command::Help(HelpTopic::General)),
         "check" => parse_check_args(args),
         "inspect" => parse_inspect_args(args),
         "format" => parse_format_args(args),
         "add" => parse_add_args(args),
-        _ => Err(format!("unknown command `{command}`")),
+        _ => Err(ParseError::new(
+            HelpTopic::General,
+            format!("unknown command `{command}`"),
+        )),
     }
 }
 
-fn parse_check_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
+fn parse_check_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
     let mut file = None;
     let mut example = None;
-    let mut json = false;
+    let mut output = OutputFormat::Auto;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--json" => json = true,
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Check)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Check)?,
+            "--pretty" => {
+                set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Check)?
+            }
             "--example" => {
                 let Some(path) = args.next() else {
-                    return Err("--example requires a path".to_string());
+                    return Err(ParseError::new(
+                        HelpTopic::Check,
+                        "--example requires a path",
+                    ));
                 };
                 example = Some(PathBuf::from(path));
             }
-            "-h" | "--help" => return Ok(Command::Help),
-            _ if arg.starts_with('-') => return Err(format!("unknown check option `{arg}`")),
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Check)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Check,
+                    format!("unknown check option `{arg}`"),
+                ));
+            }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
-            _ => return Err(format!("unexpected check argument `{arg}`")),
+            _ => {
+                return Err(ParseError::new(
+                    HelpTopic::Check,
+                    format!("unexpected check argument `{arg}`"),
+                ));
+            }
         }
     }
 
-    let file = file.ok_or_else(|| "check requires an env file path".to_string())?;
+    let file =
+        file.ok_or_else(|| ParseError::new(HelpTopic::Check, "check requires an env file path"))?;
     Ok(Command::Check {
         file,
         example,
-        json,
+        output,
     })
 }
 
-fn parse_inspect_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
+fn parse_inspect_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
     let mut dir = None;
-    let mut json = false;
+    let mut output = OutputFormat::Auto;
 
     for arg in args {
         match arg.as_str() {
-            "--json" => json = true,
-            "-h" | "--help" => return Ok(Command::Help),
-            _ if arg.starts_with('-') => return Err(format!("unknown inspect option `{arg}`")),
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Inspect)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Inspect)?,
+            "--pretty" => {
+                set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Inspect)?
+            }
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Inspect)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Inspect,
+                    format!("unknown inspect option `{arg}`"),
+                ));
+            }
             _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
-            _ => return Err(format!("unexpected inspect argument `{arg}`")),
+            _ => {
+                return Err(ParseError::new(
+                    HelpTopic::Inspect,
+                    format!("unexpected inspect argument `{arg}`"),
+                ));
+            }
         }
     }
 
-    let dir = dir.ok_or_else(|| "inspect requires a project directory".to_string())?;
-    Ok(Command::Inspect { dir, json })
+    let dir = dir.ok_or_else(|| {
+        ParseError::new(HelpTopic::Inspect, "inspect requires a project directory")
+    })?;
+    Ok(Command::Inspect { dir, output })
 }
 
-fn parse_format_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
+fn parse_format_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
     let mut file = None;
     let mut dry_run = false;
 
     for arg in args {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
-            "-h" | "--help" => return Ok(Command::Help),
-            _ if arg.starts_with('-') => return Err(format!("unknown format option `{arg}`")),
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Format)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Format,
+                    format!("unknown format option `{arg}`"),
+                ));
+            }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
-            _ => return Err(format!("unexpected format argument `{arg}`")),
+            _ => {
+                return Err(ParseError::new(
+                    HelpTopic::Format,
+                    format!("unexpected format argument `{arg}`"),
+                ));
+            }
         }
     }
 
-    let file = file.ok_or_else(|| "format requires an env file path".to_string())?;
+    let file =
+        file.ok_or_else(|| ParseError::new(HelpTopic::Format, "format requires an env file path"))?;
     Ok(Command::Format { file, dry_run })
 }
 
-fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
-    let mut json = false;
+fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
+    let mut output = OutputFormat::Auto;
     let mut value = None;
     let mut positionals = Vec::new();
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--json" => json = true,
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Add)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Add)?,
+            "--pretty" => set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Add)?,
             "--prompt" => set_add_value_source(&mut value, AddValue::Prompt)?,
             "--stdin" => set_add_value_source(&mut value, AddValue::Stdin)?,
             "--value" => {
                 let Some(inline_value) = args.next() else {
-                    return Err("--value requires a value".to_string());
+                    return Err(ParseError::new(HelpTopic::Add, "--value requires a value"));
                 };
                 set_add_value_source(&mut value, AddValue::Inline(inline_value))?;
             }
-            "-h" | "--help" => return Ok(Command::Help),
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Add)),
             _ => positionals.push(arg),
         }
     }
@@ -443,7 +557,7 @@ fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, String>
         ([file, key], Some(value)) => (PathBuf::from(file), key.clone(), value),
         ([file, assignment], None) => {
             let Some((key, inline_value)) = assignment.split_once('=') else {
-                return Err("add requires <file> <KEY> <VALUE>, <file> <KEY=VALUE>, or <file> <KEY> --prompt".to_string());
+                return Err(add_usage_error());
             };
             (
                 PathBuf::from(file),
@@ -457,42 +571,90 @@ fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, String>
             AddValue::Inline(inline_value.clone()),
         ),
         ([_, _, _], Some(_)) => {
-            return Err(
-                "add accepts either <VALUE> or --prompt/--stdin/--value, not both".to_string(),
-            );
+            return Err(ParseError::new(
+                HelpTopic::Add,
+                "add accepts either <VALUE> or --prompt/--stdin/--value, not both",
+            ));
         }
         _ => {
-            return Err(
-                "add requires <file> <KEY> <VALUE>, <file> <KEY=VALUE>, or <file> <KEY> --prompt"
-                    .to_string(),
-            );
+            return Err(add_usage_error());
         }
     };
 
     if key.is_empty() {
-        return Err("add requires a non-empty key".to_string());
+        return Err(ParseError::new(
+            HelpTopic::Add,
+            "add requires a non-empty key",
+        ));
     }
 
     Ok(Command::Add {
         file,
         key,
         value,
-        json,
+        output,
     })
 }
 
-fn set_add_value_source(target: &mut Option<AddValue>, value: AddValue) -> Result<(), String> {
+fn set_output_format(
+    target: &mut OutputFormat,
+    value: OutputFormat,
+    topic: HelpTopic,
+) -> Result<(), ParseError> {
+    if *target != OutputFormat::Auto && *target != value {
+        return Err(ParseError::new(
+            topic,
+            "choose only one output format: --text, --json, or --pretty",
+        ));
+    }
+    *target = value;
+    Ok(())
+}
+
+fn set_add_value_source(target: &mut Option<AddValue>, value: AddValue) -> Result<(), ParseError> {
     if target.is_some() {
-        return Err("add accepts only one of --prompt, --stdin, or --value".to_string());
+        return Err(ParseError::new(
+            HelpTopic::Add,
+            "add accepts only one of --prompt, --stdin, or --value",
+        ));
     }
     *target = Some(value);
     Ok(())
 }
 
-fn print_usage() -> io::Result<()> {
-    stdout_line(format_args!(
-        "vne\n\nUSAGE:\n  vne [project-dir]\n  vne check <file> [--example <file>] [--json]\n  vne inspect <dir> [--json]\n  vne add <file> <KEY> <VALUE> [--json]\n  vne add <file> <KEY=VALUE> [--json]\n  vne add <file> <KEY> --prompt [--json]\n  vne add <file> <KEY> --stdin [--json]\n  vne format <file> --dry-run"
-    ))
+fn add_usage_error() -> ParseError {
+    ParseError::new(
+        HelpTopic::Add,
+        "add requires <file> <KEY> <VALUE>, <file> <KEY=VALUE>, <file> <KEY> --value <VALUE>, <file> <KEY> --stdin, or <file> <KEY> --prompt",
+    )
+}
+
+fn print_usage(topic: HelpTopic) -> io::Result<()> {
+    stdout(format_args!("{}", usage_text(topic)))
+}
+
+fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
+    stderr(format_args!("{}", usage_text(topic)))
+}
+
+fn usage_text(topic: HelpTopic) -> &'static str {
+    match topic {
+        HelpTopic::General => {
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne check <file> [--example <file>] [--text|--json|--pretty]\n  vne inspect <dir> [--text|--json|--pretty]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  --json emits compact one-line JSON; --pretty emits formatted JSON.\n\nEXAMPLES:\n  vne .\n  vne inspect fixtures/demo --json\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n"
+        }
+        HelpTopic::Check => {
+            "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON\n  --pretty          Emit formatted JSON\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n"
+        }
+        HelpTopic::Inspect => {
+            "vne inspect - scan a project directory for env files and findings\n\nUSAGE:\n  vne inspect <dir> [--text|--json|--pretty]\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit compact one-line JSON\n  --pretty  Emit formatted JSON\n\nEXAMPLES:\n  vne inspect .\n  vne inspect fixtures/demo --json\n"
+        }
+        HelpTopic::Add => {
+            "vne add - append one non-duplicate env key while preserving file formatting\n\nUSAGE:\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty]\n\nOPTIONS:\n  --value <VALUE>  Read the new value from a flag\n  --stdin          Read the new value from stdin\n  --prompt         Read the new value from an interactive hidden prompt\n  --text           Force human text output\n  --json           Emit compact one-line JSON\n  --pretty         Emit formatted JSON\n\nEXAMPLES:\n  vne add .env FEATURE_FLAG=true --json\n  printf '%s' 'sk-local' | vne add .env OPENAI_API_KEY --stdin --json\n  vne add .env OPENAI_API_KEY --prompt\n"
+        }
+        HelpTopic::Format => {
+            "vne format - print the parsed env file without rewriting it\n\nUSAGE:\n  vne format <file> --dry-run\n\nOPTIONS:\n  --dry-run  Required; print the current file content instead of writing\n\nEXAMPLE:\n  vne format .env --dry-run\n"
+        }
+    }
 }
 
 fn stdout(args: fmt::Arguments<'_>) -> io::Result<()> {
@@ -520,7 +682,7 @@ mod tests {
     use super::*;
 
     fn parse(input: &[&str]) -> Result<Command, String> {
-        parse_args(input.iter().map(|arg| arg.to_string()))
+        parse_args(input.iter().map(|arg| arg.to_string())).map_err(|error| error.message)
     }
 
     #[test]
@@ -538,18 +700,29 @@ mod tests {
             Ok(Command::Check {
                 file: PathBuf::from(".env"),
                 example: Some(PathBuf::from(".env.example")),
-                json: true,
+                output: OutputFormat::Json,
             })
         );
     }
 
     #[test]
-    fn parses_inspect_with_json() {
+    fn parses_inspect_with_default_auto_output() {
         assert_eq!(
-            parse(&["inspect", "fixtures/demo", "--json"]),
+            parse(&["inspect", "fixtures/demo"]),
             Ok(Command::Inspect {
                 dir: PathBuf::from("fixtures/demo"),
-                json: true,
+                output: OutputFormat::Auto,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_inspect_with_pretty_json() {
+        assert_eq!(
+            parse(&["inspect", "fixtures/demo", "--pretty"]),
+            Ok(Command::Inspect {
+                dir: PathBuf::from("fixtures/demo"),
+                output: OutputFormat::PrettyJson,
             })
         );
     }
@@ -573,7 +746,7 @@ mod tests {
                 file: PathBuf::from(".env"),
                 key: "REDIS_URL".to_string(),
                 value: AddValue::Inline("redis://localhost:6379".to_string()),
-                json: true,
+                output: OutputFormat::Json,
             })
         );
     }
@@ -586,7 +759,7 @@ mod tests {
                 file: PathBuf::from(".env"),
                 key: "FEATURE_FLAG".to_string(),
                 value: AddValue::Inline("true".to_string()),
-                json: false,
+                output: OutputFormat::Auto,
             })
         );
     }
@@ -599,7 +772,7 @@ mod tests {
                 file: PathBuf::from(".env"),
                 key: "OPENAI_API_KEY".to_string(),
                 value: AddValue::Prompt,
-                json: false,
+                output: OutputFormat::Auto,
             })
         );
     }
@@ -612,8 +785,17 @@ mod tests {
                 file: PathBuf::from(".env"),
                 key: "OPENAI_API_KEY".to_string(),
                 value: AddValue::Stdin,
-                json: true,
+                output: OutputFormat::Json,
             })
+        );
+    }
+
+    #[test]
+    fn parses_command_specific_help() {
+        assert_eq!(parse(&["add", "--help"]), Ok(Command::Help(HelpTopic::Add)));
+        assert_eq!(
+            parse(&["check", "--help"]),
+            Ok(Command::Help(HelpTopic::Check))
         );
     }
 
@@ -645,8 +827,8 @@ mod tests {
         let env_path = dir.path().join(".env");
         fs::write(&env_path, "PORT=1420\nPORT=3000\n").unwrap();
 
-        let error =
-            run_add(&env_path, "PORT", "8080", false).expect_err("duplicate add should fail");
+        let error = run_add(&env_path, "PORT", "8080", OutputFormat::Text)
+            .expect_err("duplicate add should fail");
 
         assert_eq!(
             error.to_string(),

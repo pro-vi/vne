@@ -5,6 +5,7 @@ const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
   plugins: [svelte()],
+  base: './',
   clearScreen: false,
   server: {
     host: host ?? '127.0.0.1',
