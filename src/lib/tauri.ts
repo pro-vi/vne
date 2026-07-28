@@ -10,7 +10,8 @@ export function isTauriRuntime(): boolean {
 export async function loadProject(path: string): Promise<ProjectSnapshot> {
   if (!isTauriRuntime()) {
     await delay(180);
-    return redactProject(sampleProject(path || '/demo/project'));
+    const sampleRoot = !path || path === '.' ? '/demo/project' : path;
+    return redactProject(sampleProject(sampleRoot));
   }
 
   return invoke<ProjectSnapshot>('load_project', { path });

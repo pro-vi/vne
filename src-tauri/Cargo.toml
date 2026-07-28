@@ -5,6 +5,10 @@ description = "A local private .env viewer and editor"
 authors = ["vne contributors"]
 edition = "2021"
 rust-version = "1.82"
+default-run = "vne"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
 
 [lib]
 name = "vne_lib"

@@ -60,6 +60,15 @@ To open the desktop editor at a project, run:
 vne .
 ```
 
+Install or refresh the local desktop/CLI binary with the production asset protocol enabled:
+
+```sh
+npm run install:local
+```
+
+Use this project command instead of plain `cargo install --path src-tauri`: Tauri release binaries need the
+`custom-protocol` feature to load the bundled interface when the Vite development server is not running.
+
 ## Privacy
 
 Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Default Tauri snapshots scrub classifier-detected entry values and secret-like inline comments, and withhold raw preview payloads for files with redacted values or secret-like comments/malformed lines. CLI JSON uses a stronger structural boundary: `inspect`, `check`, and `add` always withhold comments and raw previews, and withhold values unless `--values` is supplied. Reveal fetches only the selected key occurrence into the local webview and clears it on hide, selection change, reload, or save. `format --dry-run` is intentionally raw and warns when piped.
