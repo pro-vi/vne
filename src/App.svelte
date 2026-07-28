@@ -24,6 +24,31 @@
   } from './lib/tauri';
   import type { EnvComparison, EnvEntry, EnvFile, EnvFinding, KeyStatus, ProjectSnapshot } from './lib/types';
   import { isEntryValueHidden, keyStatus, statusLabel } from './lib/summary';
+  import {
+    canApplyTargetedOperation,
+    createEditDraft,
+    createEntryRef,
+    createPendingOperation,
+    draftForTarget,
+    fileHasProtectedEntries,
+    inputTypeForKey,
+    isCurrentOperation,
+    isDirtyDraft,
+    isDuplicateSaveConfirmed,
+    isReviewOpen as deriveReviewOpen,
+    parseDuplicateSaveConfirmation,
+    resolveFindingTarget,
+    revealedValueFor,
+    sameEntryRef,
+    setDuplicateSaveConfirmation,
+    updateEditDraft,
+    type DuplicateSaveConfirmations,
+    type EditDraft,
+    type EntryRef,
+    type OperationKind,
+    type PendingOperation,
+    type RevealedEntry
+  } from './lib/workbench-state';
 
   type Notice = {
     kind: 'idle' | 'loading' | 'success' | 'error';
@@ -41,25 +66,32 @@
     valueHidden: boolean;
   };
 
-  let projectPath = '.';
+  let projectPath = '';
   let snapshot: ProjectSnapshot | null = null;
   let selectedPath = '';
   let selectedEntryId = '';
-  let editValue = '';
+  let editorDraft: EditDraft | null = null;
   let filter = '';
   let filterInput: HTMLInputElement | null = null;
+  let addKeyToggleButton: HTMLButtonElement | null = null;
+  let reloadButton: HTMLButtonElement | null = null;
   let reviewToggleButton: HTMLButtonElement | null = null;
   let reviewCloseButton: HTMLButtonElement | null = null;
+  let reviewReturnTarget: HTMLElement | null = null;
   let viewportWidth = 1180;
   let showRaw = false;
   let showAddKey = false;
-  let showReview = false;
+  let reviewRequested = false;
+  let wasReviewModalOpen = false;
   let newEnvKey = '';
   let newEnvValue = '';
+  let showNewEnvValue = false;
   let missingKeyDrafts: Record<string, string> = {};
-  let duplicateSaveChoices: Record<string, string> = {};
-  let revealedEntryRef = '';
-  let revealedValue: string | null = null;
+  let visibleMissingKeyValues: Record<string, boolean> = {};
+  let duplicateSaveConfirmations: DuplicateSaveConfirmations = {};
+  let revealedEntry: RevealedEntry | null = null;
+  let pendingOperation: PendingOperation | null = null;
+  let operationGeneration = 0;
   let notice: Notice = {
     kind: 'idle',
     message: isTauriRuntime() ? 'Open a project directory to inspect env files.' : 'Browser preview is using local sample data.'
@@ -67,43 +99,46 @@
 
   $: selectedFile = snapshot?.files.find((file) => file.path === selectedPath) ?? snapshot?.files[0] ?? null;
   $: selectedEntry = selectedFile?.entries.find((entry) => entry.id === selectedEntryId) ?? null;
+  $: activeEntryRef =
+    snapshot && selectedFile && selectedEntry ? createEntryRef(snapshot.root, selectedFile, selectedEntry) : null;
+  $: selectedDraft = draftForTarget(editorDraft, activeEntryRef);
   $: currentComparison = snapshot?.comparison ?? null;
   $: visibleEntries = selectedFile ? filterEntries(selectedFile, filter) : [];
-  $: entryRows = selectedFile ? buildEntryRows(selectedFile, visibleEntries, currentComparison) : [];
-  $: selectedEntryRevealed = Boolean(selectedFile && selectedEntry && isEntryRevealed(selectedFile, selectedEntry));
-  $: selectedEntryValue = selectedFile && selectedEntry ? entryValue(selectedFile, selectedEntry) : '';
+  $: entryRows =
+    snapshot && selectedFile ? buildEntryRows(snapshot.root, selectedFile, visibleEntries, currentComparison, revealedEntry) : [];
+  $: selectedEntryValue =
+    selectedEntry && activeEntryRef ? revealedValueFor(revealedEntry, activeEntryRef) ?? selectedEntry.value : '';
+  $: selectedEntryRevealed = Boolean(activeEntryRef && revealedValueFor(revealedEntry, activeEntryRef) !== null);
   $: selectedValueHidden = selectedEntry ? isEntryValueHidden(selectedEntry, selectedEntryRevealed) : false;
   $: selectedEntryDuplicate = Boolean(selectedFile && selectedEntry && selectedFile.duplicateKeys.includes(selectedEntry.key));
-  $: duplicateSaveAllowed =
-    !selectedEntryDuplicate || Boolean(selectedFile && selectedEntry && duplicateSaveChoice(selectedFile, selectedEntry) === 'this-occurrence');
+  $: duplicateSaveAllowed = !selectedEntryDuplicate || isDuplicateSaveConfirmed(duplicateSaveConfirmations, activeEntryRef);
   $: normalizedNewEnvKey = newEnvKey.trim();
   $: newEnvDuplicateLines =
     selectedFile && normalizedNewEnvKey
       ? selectedFile.entries.filter((entry) => entry.key === normalizedNewEnvKey).map((entry) => entry.lineNumber)
       : [];
-  $: newEnvValueType = keyInputType(normalizedNewEnvKey);
-  $: selectedFileHasHiddenSecrets = Boolean(
-    selectedFile?.entries.some((entry) => isEntryValueHidden(entry, isEntryRevealed(selectedFile, entry)))
-  );
-  $: hasDirtyEdit = Boolean(selectedEntry && !selectedValueHidden && editValue !== selectedEntryValue);
+  $: newEnvValueType = inputTypeForKey(snapshot, normalizedNewEnvKey, showNewEnvValue);
+  $: newEnvValueProtected = inputTypeForKey(snapshot, normalizedNewEnvKey) === 'password';
+  $: selectedFileHasProtectedEntries = fileHasProtectedEntries(selectedFile);
+  $: hasDirtyEdit = Boolean(selectedDraft && !selectedValueHidden && isDirtyDraft(selectedDraft));
   $: hasNewKeyDraft = Boolean(newEnvKey || newEnvValue);
   $: hasMissingKeyDrafts = Object.values(missingKeyDrafts).some((value) => value.length > 0);
   $: canSave = Boolean(
     isTauriRuntime() &&
-      notice.kind !== 'loading' &&
       selectedFile &&
       selectedEntry &&
+      selectedDraft &&
       !selectedValueHidden &&
       duplicateSaveAllowed &&
-      editValue !== selectedEntryValue
+      selectedVisibleIndex >= 0 &&
+      isDirtyDraft(selectedDraft)
   );
   $: canAddNewEnv = Boolean(
     isTauriRuntime() &&
       selectedFile &&
       normalizedNewEnvKey &&
       newEnvValue.trim().length > 0 &&
-      newEnvDuplicateLines.length === 0 &&
-      notice.kind !== 'loading'
+      newEnvDuplicateLines.length === 0
   );
   $: findings = snapshot?.findings ?? [];
   $: missingKeyFindings = findings.filter(isAddMissingKeyFinding);
@@ -115,56 +150,123 @@
   $: attentionKeyCount = selectedFile ? countAttentionKeys(selectedFile, currentComparison) : 0;
   $: selectedVisibleIndex =
     selectedFile && selectedEntry ? entryRows.findIndex((row) => row.entry.id === selectedEntry.id) : -1;
-  $: projectRoot = snapshot?.root ?? (projectPath.trim() || '.');
-  $: projectLabel = projectName(projectRoot);
+  $: isBusy = pendingOperation !== null;
+  $: projectRoot = snapshot?.root ?? projectPath.trim();
+  $: projectLabel = projectRoot ? projectName(projectRoot) : 'No project open';
   $: reviewIsModal = viewportWidth <= 980;
-  $: if (selectedFileHasHiddenSecrets && showRaw) {
+  $: reviewOpen = deriveReviewOpen(reviewRequested, snapshot);
+  $: reviewModalOpen = reviewOpen && reviewIsModal;
+  $: hiddenDirtyDraft = Boolean(hasDirtyEdit && selectedVisibleIndex === -1 && selectedEntry);
+  $: if (selectedFileHasProtectedEntries && showRaw) {
     showRaw = false;
+  }
+  $: {
+    const enteringModal = reviewModalOpen && !wasReviewModalOpen;
+    wasReviewModalOpen = reviewModalOpen;
+    if (enteringModal) {
+      window.requestAnimationFrame(() => reviewCloseButton?.focus());
+    }
+  }
+
+  function beginOperation(
+    kind: OperationKind,
+    message: string,
+    target: EntryRef | null = null,
+    draftRevision: number | null = null
+  ): PendingOperation | null {
+    if (pendingOperation) {
+      return null;
+    }
+
+    const operation = createPendingOperation(++operationGeneration, kind, target, draftRevision);
+    pendingOperation = operation;
+    notice = { kind: 'loading', message };
+    return operation;
+  }
+
+  function settleOperation(operation: PendingOperation, nextNotice: Notice): boolean {
+    if (!isCurrentOperation(pendingOperation, operation)) {
+      return false;
+    }
+
+    pendingOperation = null;
+    notice = nextNotice;
+    return true;
+  }
+
+  function applyLoadedProject(loaded: ProjectSnapshot): void {
+    showRaw = false;
+    showAddKey = false;
+    reviewRequested = false;
+    filter = '';
+    newEnvKey = '';
+    newEnvValue = '';
+    showNewEnvValue = false;
+    missingKeyDrafts = {};
+    visibleMissingKeyValues = {};
+    clearRevealedEntry();
+    const firstFile = loaded.files[0];
+    applySnapshotSelection(loaded, firstFile?.path ?? '', '', '');
+  }
+
+  async function loadProjectPath(requestedPath: string, confirmDiscard = true): Promise<boolean> {
+    if (pendingOperation || !requestedPath || (confirmDiscard && !confirmDiscardedWork('project'))) {
+      return false;
+    }
+
+    const operation = beginOperation('load-project', 'Scanning env files...');
+    if (!operation) {
+      return false;
+    }
+
+    try {
+      const loaded = await loadProject(requestedPath);
+      if (!isCurrentOperation(pendingOperation, operation)) {
+        return false;
+      }
+      applyLoadedProject(loaded);
+      settleOperation(operation, {
+        kind: 'success',
+        message: loaded.files.length
+          ? `Loaded ${loaded.files.length} env file${loaded.files.length === 1 ? '' : 's'}.`
+          : 'No env files found.'
+      });
+      return true;
+    } catch (error) {
+      settleOperation(operation, { kind: 'error', message: errorMessage(error) });
+      return false;
+    }
   }
 
   async function openProject(confirmDiscard = true): Promise<void> {
-    if (confirmDiscard && !confirmDiscardedWork('project')) {
-      return;
-    }
-
-    const requestedPath = projectPath.trim() || '.';
-    notice = { kind: 'loading', message: 'Scanning env files...' };
-    try {
-      const loaded = await loadProject(requestedPath);
-      showRaw = false;
-      showAddKey = false;
-      showReview = false;
-      filter = '';
-      newEnvKey = '';
-      newEnvValue = '';
-      missingKeyDrafts = {};
-      clearRevealedEntry();
-      const firstFile = loaded.files[0];
-      applySnapshotSelection(loaded, firstFile?.path ?? '', '', '');
-      notice = {
-        kind: 'success',
-        message: loaded.files.length ? `Loaded ${loaded.files.length} env file${loaded.files.length === 1 ? '' : 's'}.` : 'No env files found.'
-      };
-    } catch (error) {
-      notice = { kind: 'error', message: errorMessage(error) };
-    }
+    const requestedPath = snapshot?.root ?? projectPath.trim();
+    await loadProjectPath(requestedPath, confirmDiscard);
   }
 
   async function bootProject(): Promise<void> {
     try {
       const initialPath = await initialProjectPath();
-      if (initialPath) {
-        projectPath = initialPath;
+      if (!isTauriRuntime()) {
+        await loadProjectPath(initialPath ?? '.', false);
+        return;
       }
+
+      if (initialPath) {
+        await loadProjectPath(initialPath, false);
+        return;
+      }
+
+      notice = { kind: 'idle', message: 'Choose a project directory to inspect env files.' };
     } catch (error) {
       notice = { kind: 'error', message: errorMessage(error) };
-      return;
     }
-
-    await openProject(false);
   }
 
   async function browseProject(): Promise<void> {
+    if (pendingOperation) {
+      return;
+    }
+
     if (!confirmDiscardedWork('project')) {
       return;
     }
@@ -174,36 +276,62 @@
       return;
     }
 
+    const operation = beginOperation('browse-project', 'Choose a project folder...');
+    if (!operation) {
+      return;
+    }
+
     try {
-      const selected = await pickProjectDirectory(projectPath);
+      const selected = await pickProjectDirectory(snapshot?.root ?? projectPath);
       if (!selected) {
-        notice = { kind: 'idle', message: 'Folder selection cancelled.' };
+        settleOperation(operation, { kind: 'idle', message: 'Folder selection cancelled.' });
         return;
       }
-      projectPath = selected;
-      await openProject(false);
+
+      notice = { kind: 'loading', message: 'Scanning selected folder...' };
+      const loaded = await loadProject(selected);
+      if (!isCurrentOperation(pendingOperation, operation)) {
+        return;
+      }
+      applyLoadedProject(loaded);
+      settleOperation(operation, {
+        kind: 'success',
+        message: loaded.files.length
+          ? `Loaded ${loaded.files.length} env file${loaded.files.length === 1 ? '' : 's'}.`
+          : 'No env files found.'
+      });
     } catch (error) {
-      notice = { kind: 'error', message: errorMessage(error) };
+      settleOperation(operation, { kind: 'error', message: errorMessage(error) });
     }
   }
 
   function chooseFile(file: EnvFile): void {
-    if (file.path === selectedPath || !confirmDiscardedWork('file')) {
+    if (pendingOperation || file.path === selectedPath || !confirmDiscardedWork('file')) {
       return;
     }
 
+    const revealedKey = revealedEntry?.target.key ?? null;
     clearRevealedEntry();
+    if (revealedKey) {
+      notice = { kind: 'success', message: `${revealedKey} hidden after file selection changed.` };
+    }
     showRaw = false;
     showAddKey = false;
     newEnvKey = '';
     newEnvValue = '';
+    showNewEnvValue = false;
     selectedPath = file.path;
     selectedEntryId = '';
-    editValue = '';
+    editorDraft = null;
   }
 
-  function chooseEntry(entry: EnvEntry, confirmDiscard = true): boolean {
-    if (entry.id === selectedEntryId) {
+  function chooseEntry(file: EnvFile, entry: EnvEntry, confirmDiscard = true): boolean {
+    if (pendingOperation || !snapshot) {
+      return false;
+    }
+
+    const target = createEntryRef(snapshot.root, file, entry);
+    if (sameEntryRef(target, activeEntryRef)) {
       return true;
     }
 
@@ -211,24 +339,28 @@
       return false;
     }
 
-    const nextRef = selectedFile ? entryRevealRef(selectedFile, entry) : '';
-    if (nextRef !== revealedEntryRef) {
+    const revealedKey = revealedEntry?.target.key ?? null;
+    if (!sameEntryRef(target, revealedEntry?.target)) {
       clearRevealedEntry();
+      if (revealedKey) {
+        notice = { kind: 'success', message: `${revealedKey} hidden after selection changed.` };
+      }
     }
+    selectedPath = file.path;
     selectedEntryId = entry.id;
-    editValue = selectedFile ? entryValue(selectedFile, entry) : entry.value;
+    editorDraft = createEditDraft(target, revealedValueFor(revealedEntry, target) ?? entry.value);
     return true;
   }
 
   function moveSelection(delta: number): void {
-    if (!selectedFile || visibleEntries.length === 0) {
+    if (pendingOperation || !selectedFile || visibleEntries.length === 0) {
       return;
     }
 
     const foundIndex = visibleEntries.findIndex((entry) => entry.id === selectedEntryId);
     const currentIndex = foundIndex === -1 ? (delta > 0 ? -1 : 0) : foundIndex;
     const nextIndex = Math.min(Math.max(currentIndex + delta, 0), visibleEntries.length - 1);
-    if (!chooseEntry(visibleEntries[nextIndex])) {
+    if (!chooseEntry(selectedFile, visibleEntries[nextIndex])) {
       return;
     }
     window.requestAnimationFrame(() => {
@@ -253,50 +385,76 @@
     const isEditing =
       target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
 
-    if (event.key === '/' && !isEditing) {
+    if (event.key === 'Escape' && reviewOpen) {
+      event.preventDefault();
+      if (!pendingOperation) {
+        closeReview();
+      }
+      return;
+    }
+
+    if (reviewModalOpen) {
+      return;
+    }
+
+    if (event.key === '/' && !isEditing && !pendingOperation) {
       event.preventDefault();
       filterInput?.focus();
     }
 
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
       event.preventDefault();
-      if (canSave) {
+      if (canSave && !pendingOperation) {
         void saveValue();
       }
     }
 
-    if (event.key === 'Escape' && showReview) {
-      event.preventDefault();
-      closeReview();
-      return;
-    }
-
     if (event.key === 'Escape' && filter) {
-      filter = '';
+      event.preventDefault();
+      clearFilter();
     }
   }
 
   async function saveValue(): Promise<void> {
-    if (!selectedFile || !selectedEntry) {
+    if (!selectedFile || !selectedEntry || !selectedDraft || !canSave || pendingOperation) {
       return;
     }
 
-    notice = { kind: 'loading', message: `Saving ${selectedEntry.key}...` };
+    const draft = selectedDraft;
+    const operation = beginOperation('save-entry', `Saving ${draft.target.key}...`, draft.target, draft.revision);
+    if (!operation) {
+      return;
+    }
+
     try {
-      const root = snapshot?.root ?? (projectPath.trim() || '.');
-      const savedPath = selectedFile.path;
-      const savedEntryId = selectedEntry.id;
-      const savedKey = selectedEntry.key;
-      const saved = await saveEnvValue(root, savedPath, savedKey, selectedEntry.lineNumber, editValue);
-      applySnapshotSelection(saved, savedPath, savedEntryId, savedKey);
-      notice = { kind: 'success', message: `${savedKey} saved and project diagnostics rescanned.` };
+      const saved = await saveEnvValue(
+        draft.target.root,
+        draft.target.filePath,
+        draft.target.key,
+        draft.target.lineNumber,
+        draft.value
+      );
+      if (!canApplyTargetedOperation(pendingOperation, operation, activeEntryRef)) {
+        settleOperation(operation, {
+          kind: 'success',
+          message: `${draft.target.key} saved. Reload to see the refreshed project state.`
+        });
+        return;
+      }
+
+      applySnapshotSelection(saved, draft.target.filePath, draft.target.entryId, draft.target.key);
+      settleOperation(operation, {
+        kind: 'success',
+        message: `${draft.target.key} saved and project diagnostics rescanned.`
+      });
+      window.requestAnimationFrame(() => focusSelectedEntry());
     } catch (error) {
-      notice = { kind: 'error', message: errorMessage(error) };
+      settleOperation(operation, { kind: 'error', message: errorMessage(error) });
     }
   }
 
   async function addMissingKey(finding: EnvFinding): Promise<void> {
-    if (!canAddMissingKey(finding) || !finding.filePath || !finding.key) {
+    if (!canAddMissingKey(finding, missingKeyDrafts) || !finding.filePath || !finding.key || pendingOperation) {
       return;
     }
 
@@ -311,26 +469,35 @@
       newEnvValue = '';
     }
 
-    const value = missingKeyDraft(finding).trim();
-    notice = { kind: 'loading', message: `Adding ${finding.key}...` };
+    const value = missingKeyDraft(finding, missingKeyDrafts).trim();
+    const filePath = finding.filePath;
+    const key = finding.key;
+    const operation = beginOperation('add-entry', `Adding ${key}...`);
+    if (!operation) {
+      return;
+    }
+
     try {
-      const root = snapshot?.root ?? (projectPath.trim() || '.');
-      const loaded = await addEnvKey(root, finding.filePath, finding.key, value);
+      const loaded = await addEnvKey(currentProjectRoot(), filePath, key, value);
+      if (!isCurrentOperation(pendingOperation, operation)) {
+        return;
+      }
       deleteMissingKeyDraft(finding);
+      deleteVisibleMissingKeyValue(finding);
       filter = '';
-      applySnapshotSelection(loaded, finding.filePath, '', finding.key);
+      applySnapshotSelection(loaded, filePath, '', key);
       closeReview(false);
-      window.requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('.line.sel')?.focus());
-      notice = { kind: 'success', message: `${finding.key} was added and project diagnostics rescanned.` };
+      settleOperation(operation, { kind: 'success', message: `${key} was added and project diagnostics rescanned.` });
+      window.requestAnimationFrame(() => focusSelectedEntry());
     } catch (error) {
-      notice = { kind: 'error', message: errorMessage(error) };
+      settleOperation(operation, { kind: 'error', message: errorMessage(error) });
     }
   }
 
   async function addNewEnv(event: SubmitEvent): Promise<void> {
     event.preventDefault();
 
-    if (!selectedFile || !normalizedNewEnvKey) {
+    if (!selectedFile || !normalizedNewEnvKey || pendingOperation) {
       return;
     }
 
@@ -359,23 +526,31 @@
     const targetPath = selectedFile.path;
     const key = normalizedNewEnvKey;
     const value = newEnvValue;
-    notice = { kind: 'loading', message: `Adding ${key}...` };
+    const operation = beginOperation('add-entry', `Adding ${key}...`);
+    if (!operation) {
+      return;
+    }
 
     try {
       const loaded = await addEnvKey(currentProjectRoot(), targetPath, key, value);
+      if (!isCurrentOperation(pendingOperation, operation)) {
+        return;
+      }
       newEnvKey = '';
       newEnvValue = '';
+      showNewEnvValue = false;
       filter = '';
       applySnapshotSelection(loaded, targetPath, '', key);
       showAddKey = false;
-      notice = { kind: 'success', message: `${key} was added and project diagnostics rescanned.` };
+      settleOperation(operation, { kind: 'success', message: `${key} was added and project diagnostics rescanned.` });
+      window.requestAnimationFrame(() => focusSelectedEntry());
     } catch (error) {
-      notice = { kind: 'error', message: errorMessage(error) };
+      settleOperation(operation, { kind: 'error', message: errorMessage(error) });
     }
   }
 
   async function toggleSelectedReveal(): Promise<void> {
-    if (!snapshot || !selectedFile || !selectedEntry || !selectedEntry.shape.redactedByDefault) {
+    if (!snapshot || !selectedFile || !selectedEntry || !activeEntryRef || !selectedEntry.shape.redactedByDefault || pendingOperation) {
       return;
     }
 
@@ -384,49 +559,48 @@
         return;
       }
       clearRevealedEntry();
-      editValue = selectedEntry.value;
+      editorDraft = createEditDraft(activeEntryRef, selectedEntry.value);
       showRaw = false;
       notice = { kind: 'success', message: `${selectedEntry.key} hidden.` };
       return;
     }
 
-    const root = currentProjectRoot();
-    const filePath = selectedFile.path;
-    const { key, lineNumber } = selectedEntry;
-    notice = { kind: 'loading', message: `Revealing ${key}...` };
+    const target = activeEntryRef;
+    const operation = beginOperation('reveal-entry', `Revealing ${target.key}...`, target);
+    if (!operation) {
+      return;
+    }
 
     try {
-      const value = await revealEnvValue(root, filePath, key, lineNumber);
-      revealedEntryRef = entryRevealRef(selectedFile, selectedEntry);
-      revealedValue = value;
-      editValue = value;
-      notice = {
+      const value = await revealEnvValue(target.root, target.filePath, target.key, target.lineNumber);
+      if (!canApplyTargetedOperation(pendingOperation, operation, activeEntryRef)) {
+        settleOperation(operation, { kind: 'idle', message: `${target.key} reveal was discarded after the selection changed.` });
+        return;
+      }
+
+      revealedEntry = { target, value };
+      editorDraft = createEditDraft(target, value);
+      settleOperation(operation, {
         kind: 'success',
-        message: `${key} revealed until selection, hide, reload, or save.`
-      };
+        message: `${target.key} revealed until selection, hide, reload, or save.`
+      });
     } catch (error) {
-      notice = { kind: 'error', message: errorMessage(error) };
+      settleOperation(operation, { kind: 'error', message: errorMessage(error) });
     }
   }
 
   function inspectFinding(finding: EnvFinding): boolean {
-    if (!finding.key || !snapshot) {
+    if (!snapshot || pendingOperation) {
       return false;
     }
 
-    const file = finding.filePath
-      ? snapshot.files.find((candidate) => candidate.path === finding.filePath)
-      : snapshot.files.find((candidate) => candidate.entries.some((entry) => entry.key === finding.key));
-    const entry =
-      file?.entries.find((candidate) => candidate.id === finding.entryId) ??
-      file?.entries.find((candidate) => candidate.key === finding.key && candidate.lineNumber === finding.lineNumber) ??
-      file?.entries.find((candidate) => candidate.key === finding.key);
-    if (!file || !entry) {
-      notice = { kind: 'error', message: `Could not find ${finding.key} in the current snapshot.` };
+    const resolved = resolveFindingTarget(snapshot, finding);
+    if (!resolved) {
+      notice = { kind: 'error', message: `Could not find ${finding.key ?? 'that key'} in the current snapshot.` };
       return false;
     }
 
-    const changesFile = file.path !== selectedPath;
+    const changesFile = resolved.file.path !== selectedPath;
     if (!confirmDiscardedWork(changesFile ? 'file' : 'entry')) {
       return false;
     }
@@ -438,9 +612,7 @@
     }
 
     filter = '';
-    selectedPath = file.path;
-    chooseEntry(entry, false);
-    return true;
+    return chooseEntry(resolved.file, resolved.entry, false);
   }
 
   function openFinding(finding: EnvFinding): void {
@@ -454,19 +626,24 @@
   }
 
   function toggleReview(): void {
-    if (showReview) {
+    if (pendingOperation) {
+      return;
+    }
+
+    if (reviewOpen) {
       closeReview();
       return;
     }
 
-    showReview = true;
+    reviewReturnTarget = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    reviewRequested = true;
     window.requestAnimationFrame(() => reviewCloseButton?.focus());
   }
 
   function closeReview(restoreFocus = true): void {
-    showReview = false;
+    reviewRequested = false;
     if (restoreFocus) {
-      window.requestAnimationFrame(() => reviewToggleButton?.focus());
+      window.requestAnimationFrame(() => focusReviewReturnTarget());
     }
   }
 
@@ -474,25 +651,24 @@
     return finding.actionKind === 'add-missing-key' && Boolean(finding.filePath && finding.key);
   }
 
-  function canAddMissingKey(finding: EnvFinding): boolean {
+  function canAddMissingKey(finding: EnvFinding, drafts: Record<string, string>): boolean {
     return (
       isTauriRuntime() &&
-      notice.kind !== 'loading' &&
       isAddMissingKeyFinding(finding) &&
-      missingKeyDraft(finding).trim().length > 0
+      missingKeyDraft(finding, drafts).trim().length > 0
     );
   }
 
-  function canInspectFinding(finding: EnvFinding): boolean {
-    return Boolean(finding.key && snapshot?.files.some((file) => file.entries.some((entry) => entry.key === finding.key)));
+  function canInspectFinding(currentSnapshot: ProjectSnapshot | null, finding: EnvFinding): boolean {
+    return Boolean(currentSnapshot && resolveFindingTarget(currentSnapshot, finding));
   }
 
   function currentProjectRoot(): string {
-    return snapshot?.root ?? (projectPath.trim() || '.');
+    return snapshot?.root ?? projectPath.trim();
   }
 
-  function missingKeyDraft(finding: EnvFinding): string {
-    return missingKeyDrafts[missingKeyDraftRef(finding)] ?? '';
+  function missingKeyDraft(finding: EnvFinding, drafts: Record<string, string>): string {
+    return drafts[missingKeyDraftRef(finding)] ?? '';
   }
 
   function setMissingKeyDraft(finding: EnvFinding, value: string): void {
@@ -509,39 +685,57 @@
     return `${finding.filePath ?? ''}\u0000${finding.key ?? ''}`;
   }
 
-  function missingKeyInputType(finding: EnvFinding): 'password' | 'text' {
-    return keyInputType(finding.key ?? '');
+  function missingKeyInputType(
+    currentSnapshot: ProjectSnapshot | null,
+    finding: EnvFinding,
+    visibility: Record<string, boolean>
+  ): 'password' | 'text' {
+    return inputTypeForKey(currentSnapshot, finding.key ?? '', isMissingKeyValueVisible(finding, visibility));
   }
 
-  function keyInputType(key: string): 'password' | 'text' {
-    const upperKey = key.toUpperCase();
-    const secretLike = ['SECRET', 'TOKEN', 'PASSWORD', 'API_KEY', 'PRIVATE_KEY', 'ACCESS_KEY', 'CLIENT_SECRET', 'WEBHOOK_SECRET'].some(
-      (part) => upperKey.includes(part)
-    );
-    return secretLike ? 'password' : 'text';
+  function isMissingKeyValueVisible(finding: EnvFinding, visibility: Record<string, boolean>): boolean {
+    return Boolean(visibility[missingKeyDraftRef(finding)]);
+  }
+
+  function toggleMissingKeyValue(finding: EnvFinding): void {
+    const key = missingKeyDraftRef(finding);
+    visibleMissingKeyValues = { ...visibleMissingKeyValues, [key]: !visibleMissingKeyValues[key] };
+  }
+
+  function deleteVisibleMissingKeyValue(finding: EnvFinding): void {
+    const next = { ...visibleMissingKeyValues };
+    delete next[missingKeyDraftRef(finding)];
+    visibleMissingKeyValues = next;
   }
 
   function duplicateLineLabel(lines: number[]): string {
     return `${lines.length === 1 ? 'line' : 'lines'} ${lines.join(', ')}`;
   }
 
-  function duplicateSaveChoice(file: EnvFile, entry: EnvEntry): string {
-    return duplicateSaveChoices[duplicateSaveRef(file, entry)] ?? '';
+  function duplicateSaveChoice(target: EntryRef | null, confirmations: DuplicateSaveConfirmations): string {
+    return isDuplicateSaveConfirmed(confirmations, target) ? 'this-occurrence' : '';
   }
 
   function setDuplicateSaveChoice(file: EnvFile, entry: EnvEntry, value: string): void {
-    duplicateSaveChoices = { ...duplicateSaveChoices, [duplicateSaveRef(file, entry)]: value };
-  }
-
-  function duplicateSaveRef(file: EnvFile, entry: EnvEntry): string {
-    return `${file.path}\u0000${entry.id}`;
+    if (!snapshot) {
+      return;
+    }
+    const target = createEntryRef(snapshot.root, file, entry);
+    duplicateSaveConfirmations = setDuplicateSaveConfirmation(
+      duplicateSaveConfirmations,
+      target,
+      parseDuplicateSaveConfirmation(value)
+    );
   }
 
   function applySnapshotSelection(loaded: ProjectSnapshot, preferredPath: string, preferredEntryId: string, preferredKey: string): void {
     clearRevealedEntry();
-    duplicateSaveChoices = {};
+    duplicateSaveConfirmations = {};
     snapshot = loaded;
     projectPath = loaded.root;
+    if (loaded.findings.length === 0) {
+      reviewRequested = false;
+    }
     const refreshedFile = loaded.files.find((file) => file.path === preferredPath) ?? loaded.files[0] ?? null;
     selectedPath = refreshedFile?.path ?? preferredPath;
     const refreshedEntry =
@@ -549,28 +743,79 @@
       (preferredKey ? refreshedFile?.entries.find((entry) => entry.key === preferredKey) : undefined) ??
       null;
     selectedEntryId = refreshedEntry?.id ?? '';
-    editValue = refreshedEntry?.value ?? '';
+    editorDraft = refreshedFile && refreshedEntry ? createEditDraft(createEntryRef(loaded.root, refreshedFile, refreshedEntry), refreshedEntry.value) : null;
   }
 
   function clearRevealedEntry(): void {
-    revealedEntryRef = '';
-    revealedValue = null;
+    revealedEntry = null;
   }
 
-  function entryRevealRef(file: EnvFile, entry: EnvEntry): string {
-    return `${file.path}\u0000${entry.id}`;
+  function updateEditorValue(value: string): void {
+    if (pendingOperation || !selectedDraft) {
+      return;
+    }
+    editorDraft = updateEditDraft(selectedDraft, value);
   }
 
-  function isEntryRevealed(file: EnvFile, entry: EnvEntry): boolean {
-    return revealedValue !== null && revealedEntryRef === entryRevealRef(file, entry);
+  function toggleAddKeyForm(): void {
+    if (!pendingOperation) {
+      showAddKey = !showAddKey;
+    }
   }
 
-  function entryValue(file: EnvFile, entry: EnvEntry): string {
-    if (isEntryRevealed(file, entry)) {
-      return revealedValue ?? '';
+  function closeAddKeyForm(): void {
+    if (pendingOperation) {
+      return;
     }
 
-    return entry.value;
+    showAddKey = false;
+    window.requestAnimationFrame(() => addKeyToggleButton?.focus({ preventScroll: true }));
+  }
+
+  function focusSelectedEntry(): void {
+    document.querySelector<HTMLButtonElement>('.line.sel')?.focus({ preventScroll: true });
+  }
+
+  function clearFilter(): void {
+    if (pendingOperation) {
+      return;
+    }
+
+    filter = '';
+    window.requestAnimationFrame(() => filterInput?.focus({ preventScroll: true }));
+  }
+
+  function showHiddenDraft(): void {
+    if (pendingOperation) {
+      return;
+    }
+
+    filter = '';
+    window.requestAnimationFrame(() => {
+      const editor = document.querySelector<HTMLTextAreaElement>('.row-wrap.open .line-editor');
+      editor?.focus({ preventScroll: true });
+    });
+  }
+
+  function focusReviewReturnTarget(): void {
+    const candidates = [
+      reviewReturnTarget,
+      reviewToggleButton,
+      document.querySelector<HTMLButtonElement>('.line.sel'),
+      filterInput,
+      reloadButton
+    ];
+    const target = candidates.find(
+      (candidate): candidate is HTMLElement => Boolean(candidate?.isConnected && !candidate.closest('[inert]'))
+    );
+    target?.focus({ preventScroll: true });
+    reviewReturnTarget = null;
+  }
+
+  function rowAriaLabel(row: EntryRow): string {
+    const valueProtected = row.entry.shape.sensitive || row.entry.shape.redactedByDefault;
+    const value = row.valueHidden || valueProtected ? '' : `, value ${row.displayValue}`;
+    return `${row.entry.key}, line ${row.entry.lineNumber}${value}, ${row.shapeLabel}, ${row.attentionLabel || statusLabel(row.status)}`;
   }
 
   function occurrenceLabel(file: EnvFile, entry: EnvEntry): string {
@@ -580,14 +825,25 @@
   }
 
   function exposureLabel(entry: EnvEntry): string {
-    return entry.shape.exposure === 'browser' ? 'browser-exposed' : 'local process';
+    if (entry.shape.exposure === 'browser') {
+      return 'browser-exposed';
+    }
+    return entry.shape.exposure === null ? 'local process' : 'exposure unknown';
   }
 
-  function buildEntryRows(file: EnvFile, entries: EnvEntry[], comparison: EnvComparison | null): EntryRow[] {
+  function buildEntryRows(
+    root: string,
+    file: EnvFile,
+    entries: EnvEntry[],
+    comparison: EnvComparison | null,
+    revealed: RevealedEntry | null
+  ): EntryRow[] {
     return entries.map((entry) => {
+      const target = createEntryRef(root, file, entry);
       const status = keyStatus(file, entry, comparison);
       const attentionClass = entryAttentionClass(entry, status);
-      const valueHidden = isEntryValueHidden(entry, isEntryRevealed(file, entry));
+      const revealedValue = revealedValueFor(revealed, target);
+      const valueHidden = isEntryValueHidden(entry, revealedValue !== null);
 
       return {
         entry,
@@ -596,7 +852,7 @@
         attentionLabel: attentionClass ? entryAttentionLabel(entry, status) : '',
         categoryClass: entryCategoryClass(entry),
         shapeLabel: shapeShortLabel(entry),
-        displayValue: valueHidden ? entry.displayValue : entryValue(file, entry) || '(empty)',
+        displayValue: valueHidden ? entry.displayValue : (revealedValue ?? entry.value) || '(empty)',
         valueHidden
       };
     });
@@ -698,8 +954,7 @@
     return entry.shape.reasons[0] ?? entry.shape.label;
   }
 
-  function contractNote(file: EnvFile, entry: EnvEntry): string {
-    const comparison = snapshot?.comparison;
+  function contractNote(comparison: EnvComparison | null, file: EnvFile, entry: EnvEntry): string {
     if (!comparison) {
       return 'No example contract loaded for this project.';
     }
@@ -717,24 +972,6 @@
     }
 
     return `Optional in ${file.name}.`;
-  }
-
-  function fileRoleNote(file: EnvFile, entry: EnvEntry): string {
-    const layer = snapshot?.layerReport.orderedFiles.find((candidate) => candidate.path === file.path);
-    const layerText = layer ? `${layer.layerKind} layer, precedence ${layer.precedence}` : file.discoveryReasons[0] ?? 'opened directly';
-    if (entry.shape.exposure === 'browser') {
-      return `${file.name} exposes this key to browser bundles by name.`;
-    }
-
-    if (entry.shape.sensitive) {
-      return `${file.name} is ${layerText}; keep this value server-side and redacted by default.`;
-    }
-
-    if (entry.value.includes('${')) {
-      return `${file.name} references another value; vne preserves the expression instead of evaluating shell semantics.`;
-    }
-
-    return `${file.name} is ${layerText}.`;
   }
 
   function shapeShortLabel(entry: EnvEntry): string {
@@ -798,13 +1035,13 @@
 
 <svelte:window bind:innerWidth={viewportWidth} onkeydown={handleGlobalKeydown} />
 
-<main class="app-shell">
-  <header class="chrome" inert={showReview && reviewIsModal}>
+<main class="app-shell" class:review-modal-open={reviewModalOpen} aria-busy={isBusy}>
+  <header class="chrome" inert={reviewModalOpen}>
     <div class="project-lockup" title={projectRoot}>
       <span class="app-mark" title="vne"><FileKey2 size={16} aria-hidden="true" /></span>
       <span class="project-identity">
         <strong>{projectLabel}</strong>
-        <span>{projectRoot}</span>
+        <span>{projectRoot || 'Choose a folder to begin'}</span>
       </span>
     </div>
 
@@ -813,18 +1050,21 @@
         type="button"
         class="chrome-action"
         title={isTauriRuntime() ? 'Choose another project folder' : 'Folder picking requires the desktop app'}
-        disabled={notice.kind === 'loading' || !isTauriRuntime()}
+        disabled={!isTauriRuntime()}
+        aria-disabled={isBusy}
         onclick={() => void browseProject()}
       >
         <FolderOpen size={15} aria-hidden="true" />
         <span>Change folder</span>
       </button>
       <button
+        bind:this={reloadButton}
         type="button"
         class="chrome-action icon-only"
         title="Reload project"
         aria-label="Reload project"
-        disabled={notice.kind === 'loading'}
+        disabled={!snapshot && !projectPath}
+        aria-disabled={isBusy}
         onclick={() => void openProject()}
       >
         <RefreshCw size={15} aria-hidden="true" />
@@ -832,12 +1072,14 @@
     </div>
   </header>
 
+  {#if reviewModalOpen}<div class="modal-scrim" aria-hidden="true"></div>{/if}
+
   <div
-    class:with-review={showReview && findings.length > 0}
-    class:review-overlay={showReview && findings.length > 0 && reviewIsModal}
+    class:with-review={reviewOpen}
+    class:review-overlay={reviewModalOpen}
     class="semantic-main"
   >
-    <section class="editor" aria-label="Environment workspace" inert={showReview && reviewIsModal}>
+    <section class="editor" aria-label="Environment workspace" inert={reviewModalOpen} aria-busy={isBusy}>
       {#if snapshot && snapshot.files.length > 0}
         <div class="workspace-bar">
           <nav class="file-tabs" aria-label="Environment files">
@@ -846,6 +1088,7 @@
                 class:active={file.path === selectedPath}
                 type="button"
                 aria-pressed={file.path === selectedPath}
+                aria-disabled={isBusy}
                 title={file.path}
                 onclick={() => chooseFile(file)}
               >
@@ -866,23 +1109,33 @@
               placeholder="Filter keys  /"
               autocomplete="off"
               spellcheck="false"
+              readonly={isBusy}
             />
             {#if filter}
-              <button type="button" aria-label="Clear key filter" title="Clear filter" onclick={() => (filter = '')}>
+              <button
+                type="button"
+                aria-label="Clear key filter"
+                title="Clear filter"
+                aria-disabled={isBusy}
+                onclick={clearFilter}
+              >
                 <X size={13} aria-hidden="true" />
               </button>
             {/if}
           </label>
 
           <button
+            bind:this={addKeyToggleButton}
             type="button"
             class:on={showAddKey}
             class="toolbar-action"
             aria-expanded={showAddKey}
-            onclick={() => (showAddKey = !showAddKey)}
+            aria-disabled={isBusy}
+            onclick={toggleAddKeyForm}
           >
             <Plus size={14} aria-hidden="true" />
             <span>Add key</span>
+            {#if hasNewKeyDraft}<span class="draft-badge">draft</span>{/if}
           </button>
         </div>
 
@@ -890,7 +1143,7 @@
           <div class="inline-notice error" role="alert">
             <AlertTriangle size={15} aria-hidden="true" />
             <span>{notice.message} The loaded project is still shown below.</span>
-            <button type="button" onclick={() => void openProject()}>Try again</button>
+            <button type="button" aria-disabled={isBusy} onclick={() => void openProject()}>Try again</button>
           </div>
         {/if}
 
@@ -916,12 +1169,13 @@
             <button
               bind:this={reviewToggleButton}
               type="button"
-              class:on={showReview}
+              class:on={reviewOpen}
               class="review-toggle"
-              aria-expanded={showReview}
+              aria-expanded={reviewOpen}
+              aria-disabled={isBusy}
               onclick={toggleReview}
             >
-              {showReview ? 'Hide review' : 'Review findings'}
+              {reviewOpen ? 'Hide review' : 'Review findings'}
             </button>
           {/if}
         </section>
@@ -937,6 +1191,7 @@
               autocomplete="off"
               autocapitalize="off"
               spellcheck="false"
+              readonly={isBusy}
             />
             <input
               class="new-env-value"
@@ -946,12 +1201,33 @@
               placeholder="value"
               autocomplete="off"
               spellcheck="false"
+              readonly={isBusy}
             />
-            <button class="compact-action primary" type="submit" disabled={!canAddNewEnv}>
+            {#if newEnvValueProtected}
+              <button
+                type="button"
+                class="compact-action"
+                aria-pressed={showNewEnvValue}
+                aria-disabled={isBusy}
+                onclick={() => {
+                  if (!pendingOperation) showNewEnvValue = !showNewEnvValue;
+                }}
+              >
+                {#if showNewEnvValue}<EyeOff size={14} aria-hidden="true" />{:else}<Eye size={14} aria-hidden="true" />{/if}
+                <span>{showNewEnvValue ? 'Hide' : 'Show'} value</span>
+              </button>
+            {/if}
+            <button class="compact-action primary" type="submit" disabled={!canAddNewEnv} aria-disabled={isBusy}>
               <Plus size={14} aria-hidden="true" />
               <span>Add</span>
             </button>
-            <button type="button" class="compact-action" aria-label="Close add key form" onclick={() => (showAddKey = false)}>
+            <button
+              type="button"
+              class="compact-action"
+              aria-label="Close add key form; entered draft is retained"
+              aria-disabled={isBusy}
+              onclick={closeAddKeyForm}
+            >
               <X size={14} aria-hidden="true" />
             </button>
             {#if newEnvDuplicateLines.length > 0}
@@ -960,7 +1236,23 @@
           </form>
         {/if}
 
-        <div class="buffer" role="list" aria-label={`Parsed keys in ${selectedFile?.name ?? 'environment file'}`}>
+        {#if hiddenDirtyDraft && selectedEntry}
+          <section class="hidden-draft" role="status">
+            <span><strong>Unsaved {selectedEntry.key}</strong> is hidden by the current filter.</span>
+            <button
+              type="button"
+              class="compact-action"
+              aria-disabled={isBusy}
+              onclick={showHiddenDraft}
+            >Show draft</button>
+          </section>
+        {/if}
+
+        <div
+          class="buffer"
+          role={selectedFile && visibleEntries.length > 0 ? 'list' : undefined}
+          aria-label={selectedFile && visibleEntries.length > 0 ? `Parsed keys in ${selectedFile.name}` : undefined}
+        >
           {#if selectedFile && visibleEntries.length > 0}
             {#each entryRows as row, rowIndex}
               {@const entry = row.entry}
@@ -972,8 +1264,9 @@
                   data-row-index={rowIndex}
                   type="button"
                   aria-expanded={entry.id === selectedEntryId}
-                  aria-label={`${entry.key}, line ${entry.lineNumber}, ${row.shapeLabel}, ${row.attentionLabel || statusLabel(row.status)}`}
-                  onclick={() => chooseEntry(entry)}
+                  aria-label={rowAriaLabel(row)}
+                  aria-disabled={isBusy}
+                  onclick={() => selectedFile && chooseEntry(selectedFile, entry)}
                   onkeydown={handleKeyTableKeydown}
                 >
                   <span class="marker"><span class={`pip ${row.attentionClass}`}></span></span>
@@ -999,7 +1292,15 @@
                     {#if selectedValueHidden}
                       <textarea class="line-editor" value={entry.displayValue} aria-label={`${entry.key} hidden value`} spellcheck="false" rows="2" readonly></textarea>
                     {:else}
-                      <textarea class="line-editor" bind:value={editValue} aria-label={`Value for ${entry.key}`} spellcheck="false" rows="2"></textarea>
+                      <textarea
+                        class="line-editor"
+                        value={selectedDraft?.value ?? ''}
+                        aria-label={`Value for ${entry.key}`}
+                        spellcheck="false"
+                        rows="2"
+                        readonly={isBusy}
+                        oninput={(event) => updateEditorValue(event.currentTarget.value)}
+                      ></textarea>
                     {/if}
 
                     {#if selectedEntryDuplicate}
@@ -1007,7 +1308,8 @@
                         <span>Duplicate save target</span>
                         <select
                           id="peek-duplicate-save-target"
-                          value={duplicateSaveChoice(selectedFile, entry)}
+                          value={duplicateSaveChoice(activeEntryRef, duplicateSaveConfirmations)}
+                          disabled={isBusy}
                           onchange={(event) => setDuplicateSaveChoice(selectedFile, entry, event.currentTarget.value)}
                         >
                           <option value="">Choose target before saving</option>
@@ -1020,7 +1322,8 @@
                       <button
                         type="button"
                         class="compact-action"
-                        disabled={notice.kind === 'loading' || !entry.shape.redactedByDefault}
+                        disabled={!entry.shape.redactedByDefault}
+                        aria-disabled={isBusy}
                         onclick={() => void toggleSelectedReveal()}
                       >
                         {#if selectedEntryRevealed}
@@ -1031,14 +1334,20 @@
                           <span>Reveal value</span>
                         {/if}
                       </button>
-                      <button class="compact-action primary" type="button" disabled={!canSave} onclick={() => void saveValue()}>
+                      <button class="compact-action primary" type="button" disabled={!canSave} aria-disabled={isBusy} onclick={() => void saveValue()}>
                         <Save size={14} aria-hidden="true" />
                         <span>Save change</span>
                       </button>
-                      <button type="button" class="compact-action" disabled={selectedFileHasHiddenSecrets} onclick={() => (showRaw = !showRaw)}>
+                      <button
+                        type="button"
+                        class="compact-action"
+                        disabled={selectedFileHasProtectedEntries}
+                        title={selectedFileHasProtectedEntries ? 'Raw preview is unavailable while this file contains protected entries' : 'Toggle raw file preview'}
+                        onclick={() => (showRaw = !showRaw)}
+                      >
                         <span>{showRaw ? 'Hide raw file' : 'View raw file'}</span>
                       </button>
-                      <span class="line-hint">{selectedEntryFindings[0]?.title ?? expectedShapeLabel(entry)} · {contractNote(selectedFile, entry)}</span>
+                      <span class="line-hint">{selectedEntryFindings[0]?.title ?? expectedShapeLabel(entry)} · {contractNote(currentComparison, selectedFile, entry)}</span>
                     </div>
 
                     {#if showRaw}
@@ -1053,14 +1362,14 @@
               <Search size={20} aria-hidden="true" />
               <h2>No keys match “{filter.trim()}”</h2>
               <p>Try a key name, value type, “sensitive”, or exposure.</p>
-              <button type="button" class="state-action" onclick={() => (filter = '')}>Clear filter</button>
+              <button type="button" class="state-action" aria-disabled={isBusy} onclick={clearFilter}>Clear filter</button>
             </section>
           {:else if selectedFile}
             <section class="buffer-state compact">
               <FileKey2 size={22} aria-hidden="true" />
               <h2>{selectedFile.name} has no parsed keys</h2>
               <p>Add the first KEY=value pair without leaving the project.</p>
-              <button type="button" class="state-action primary" onclick={() => (showAddKey = true)}>
+              <button type="button" class="state-action primary" aria-disabled={isBusy} onclick={toggleAddKeyForm}>
                 <Plus size={15} aria-hidden="true" />
                 Add first key
               </button>
@@ -1072,7 +1381,7 @@
           <span class="state-icon"><LoaderCircle class="spin" size={24} aria-hidden="true" /></span>
           <p class="eyebrow">Scanning project</p>
           <h1>Looking for environment files</h1>
-          <code>{projectPath.trim() || '.'}</code>
+          <code>{projectPath.trim() || 'selected folder'}</code>
           <p>Checking conventional filenames and env references in project configuration.</p>
         </section>
       {:else if notice.kind === 'error'}
@@ -1080,14 +1389,16 @@
           <span class="state-icon"><AlertTriangle size={24} aria-hidden="true" /></span>
           <p class="eyebrow">Project could not be opened</p>
           <h1>Check the folder and try again</h1>
-          <code>{projectPath.trim() || '.'}</code>
+          {#if projectPath}<code>{projectPath}</code>{/if}
           <p>{notice.message}</p>
           <div class="state-actions">
-            <button type="button" class="state-action primary" disabled={!isTauriRuntime()} onclick={() => void browseProject()}>
+            <button type="button" class="state-action primary" disabled={!isTauriRuntime()} aria-disabled={isBusy} onclick={() => void browseProject()}>
               <FolderOpen size={15} aria-hidden="true" />
               Choose folder
             </button>
-            <button type="button" class="state-action" onclick={() => void openProject()}>Try again</button>
+            {#if snapshot || projectPath}
+              <button type="button" class="state-action" aria-disabled={isBusy} onclick={() => void openProject()}>Try again</button>
+            {/if}
           </div>
         </section>
       {:else if snapshot}
@@ -1098,11 +1409,11 @@
           <code>{projectRoot}</code>
           <p>vne checked common files such as <strong>.env</strong>, <strong>.env.local</strong>, and <strong>*.env</strong>, plus env files referenced by package and Compose configuration.</p>
           <div class="state-actions">
-            <button type="button" class="state-action primary" disabled={!isTauriRuntime()} onclick={() => void browseProject()}>
+            <button type="button" class="state-action primary" disabled={!isTauriRuntime()} aria-disabled={isBusy} onclick={() => void browseProject()}>
               <FolderOpen size={15} aria-hidden="true" />
               Choose another folder
             </button>
-            <button type="button" class="state-action" onclick={() => void openProject()}>
+            <button type="button" class="state-action" aria-disabled={isBusy} onclick={() => void openProject()}>
               <RefreshCw size={15} aria-hidden="true" />
               Scan again
             </button>
@@ -1114,7 +1425,7 @@
           <p class="eyebrow">Environment workbench</p>
           <h1>Open a project folder</h1>
           <p>Inspect env files, understand key shapes, and make focused edits without exposing secrets.</p>
-          <button type="button" class="state-action primary" disabled={!isTauriRuntime()} onclick={() => void browseProject()}>
+          <button type="button" class="state-action primary" disabled={!isTauriRuntime()} aria-disabled={isBusy} onclick={() => void browseProject()}>
             <FolderOpen size={15} aria-hidden="true" />
             Choose folder
           </button>
@@ -1122,12 +1433,13 @@
       {/if}
     </section>
 
-    {#if showReview && snapshot && findings.length > 0}
+    {#if reviewOpen && snapshot}
       <aside
         class="review-drawer"
         aria-label="Project findings"
-        aria-modal={reviewIsModal ? 'true' : undefined}
-        role={reviewIsModal ? 'dialog' : 'complementary'}
+        aria-modal={reviewModalOpen ? 'true' : undefined}
+        role={reviewModalOpen ? 'dialog' : 'complementary'}
+        aria-busy={isBusy}
       >
         <header class="review-head">
           <div>
@@ -1139,11 +1451,33 @@
             type="button"
             aria-label="Close project review"
             title="Close review"
-            onclick={() => closeReview()}
+            aria-disabled={isBusy}
+            onclick={() => {
+              if (!pendingOperation) closeReview();
+            }}
           >
             <X size={16} aria-hidden="true" />
           </button>
         </header>
+
+        {#if reviewModalOpen && notice.kind !== 'idle'}
+          <div
+            class="review-notice"
+            class:error={notice.kind === 'error'}
+            role={notice.kind === 'error' ? 'alert' : 'status'}
+            aria-live={notice.kind === 'error' ? 'assertive' : 'polite'}
+            aria-atomic="true"
+          >
+            {#if notice.kind === 'loading'}
+              <LoaderCircle class="spin" size={14} aria-hidden="true" />
+            {:else if notice.kind === 'error'}
+              <AlertTriangle size={14} aria-hidden="true" />
+            {:else}
+              <CheckCircle2 size={14} aria-hidden="true" />
+            {/if}
+            <span>{notice.message}</span>
+          </div>
+        {/if}
 
         {#if missingKeyFindings.length > 0}
           <section class="review-section">
@@ -1158,14 +1492,35 @@
                     <span>Value for {finding.key}</span>
                     <input
                       class="missing-key-value"
-                      type={missingKeyInputType(finding)}
-                      value={missingKeyDraft(finding)}
+                      type={missingKeyInputType(snapshot, finding, visibleMissingKeyValues)}
+                      value={missingKeyDraft(finding, missingKeyDrafts)}
                       autocomplete="off"
                       spellcheck="false"
+                      readonly={isBusy}
                       oninput={(event) => setMissingKeyDraft(finding, event.currentTarget.value)}
                     />
                   </label>
-                  <button type="button" class="compact-action primary" disabled={!canAddMissingKey(finding)} onclick={() => void addMissingKey(finding)}>
+                  {#if inputTypeForKey(snapshot, finding.key ?? '') === 'password'}
+                    <button
+                      type="button"
+                      class="compact-action"
+                      aria-pressed={isMissingKeyValueVisible(finding, visibleMissingKeyValues)}
+                      aria-disabled={isBusy}
+                      onclick={() => {
+                        if (!pendingOperation) toggleMissingKeyValue(finding);
+                      }}
+                    >
+                      {#if isMissingKeyValueVisible(finding, visibleMissingKeyValues)}<EyeOff size={14} aria-hidden="true" />{:else}<Eye size={14} aria-hidden="true" />{/if}
+                      {isMissingKeyValueVisible(finding, visibleMissingKeyValues) ? 'Hide value' : 'Show value'}
+                    </button>
+                  {/if}
+                  <button
+                    type="button"
+                    class="compact-action primary"
+                    disabled={!canAddMissingKey(finding, missingKeyDrafts)}
+                    aria-disabled={isBusy}
+                    onclick={() => void addMissingKey(finding)}
+                  >
                     <Plus size={14} aria-hidden="true" />
                     Add to {finding.filePath ? projectName(finding.filePath) : 'env file'}
                   </button>
@@ -1184,8 +1539,8 @@
                   <strong>{finding.title}</strong>
                   <p>{finding.detail}</p>
                   {#if finding.evidence.length > 0}<small>{finding.evidence[0]}</small>{/if}
-                  {#if canInspectFinding(finding)}
-                    <button type="button" class="compact-action" onclick={() => openFinding(finding)}>Inspect key</button>
+                  {#if canInspectFinding(snapshot, finding)}
+                    <button type="button" class="compact-action" aria-disabled={isBusy} onclick={() => openFinding(finding)}>Inspect key</button>
                   {/if}
                 </article>
               {/each}
@@ -1209,21 +1564,25 @@
     class="status-strip"
     class:error={notice.kind === 'error'}
     class:success={notice.kind === 'success'}
-    role="status"
-    aria-live="polite"
-    aria-atomic="true"
-    inert={showReview && reviewIsModal}
+    inert={reviewModalOpen}
   >
-    {#if notice.kind === 'loading'}
-      <LoaderCircle class="spin" size={14} aria-hidden="true" />
-    {:else if notice.kind === 'error'}
-      <AlertTriangle size={14} aria-hidden="true" />
-    {:else if notice.kind === 'success'}
-      <CheckCircle2 size={14} aria-hidden="true" />
-    {:else}
-      <FileKey2 size={14} aria-hidden="true" />
-    {/if}
-    <span class="status-message">{notice.message}</span>
+    <span
+      class="status-live"
+      role={notice.kind === 'error' ? 'alert' : 'status'}
+      aria-live={notice.kind === 'error' ? 'assertive' : 'polite'}
+      aria-atomic="true"
+    >
+      {#if notice.kind === 'loading'}
+        <LoaderCircle class="spin" size={14} aria-hidden="true" />
+      {:else if notice.kind === 'error'}
+        <AlertTriangle size={14} aria-hidden="true" />
+      {:else if notice.kind === 'success'}
+        <CheckCircle2 size={14} aria-hidden="true" />
+      {:else}
+        <FileKey2 size={14} aria-hidden="true" />
+      {/if}
+      <span class="status-message">{notice.message}</span>
+    </span>
     {#if snapshot && snapshot.files.length > 0}
       <span class="sep"></span>
       <span class:quiet={attentionKeyCount === 0} class="attention-summary">
@@ -1240,8 +1599,8 @@
     {/if}
     <span class="spacer"></span>
     {#if selectedFile && visibleEntries.length > 0}
-      <button type="button" onclick={() => moveSelection(-1)} disabled={selectedVisibleIndex <= 0}>prev</button>
-      <button type="button" onclick={() => moveSelection(1)} disabled={selectedVisibleIndex >= visibleEntries.length - 1}>next</button>
+      <button type="button" onclick={() => moveSelection(-1)} disabled={selectedVisibleIndex <= 0 || isBusy}>prev</button>
+      <button type="button" onclick={() => moveSelection(1)} disabled={selectedVisibleIndex >= visibleEntries.length - 1 || isBusy}>next</button>
       <span class="selection-status">{selectedVisibleIndex >= 0 && selectedEntry ? `ln ${selectedEntry.lineNumber} · ${selectedEntry.key}` : 'select a key to edit'}</span>
     {/if}
   </footer>

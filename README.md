@@ -129,11 +129,9 @@ scripts/security-check.sh
 npm run dev
 ```
 
-Then open the browser preview, or run the Tauri app and enter:
-
-```text
-fixtures/demo
-```
+The browser preview loads that fake project automatically. For the native app,
+run `npm run tauri dev`, choose **Choose folder**, and select `fixtures/demo`.
+An installed desktop binary can open it directly with `vne fixtures/demo`.
 
 The current minimal UI direction is captured in [docs/assets/vne-minimal-design.png](docs/assets/vne-minimal-design.png).
 
