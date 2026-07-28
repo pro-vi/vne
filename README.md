@@ -26,7 +26,7 @@ Most editors make `.env` editing feel like generic text editing. `vne` is meant 
 - Uses Next.js and Vite env load-order knowledge as evidence on related findings
 - Separates value-required missing-key insertion from advisory duplicate, placeholder, extra-key, and layered-conflict findings
 - Lets targetable advisory findings jump to the relevant file and key occurrence without mutating the env file
-- Redacts secret-like values and credential-bearing URLs by default
+- Redacts secret-like values and credential-bearing URLs in desktop snapshots, while CLI JSON withholds every env payload by default
 - Flags public-prefixed secret-looking names such as `NEXT_PUBLIC_API_KEY` as browser-exposed and sensitive-looking instead of treating them as safe public values
 - Shows structured source context such as duplicate occurrence, export prefix, quote style, inline comment, and parser diagnostics
 - Requires an explicit occurrence choice before saving duplicate keys
@@ -49,8 +49,10 @@ vne add .env PORT --value 1420
 ```
 
 `add` refuses duplicate keys and reports existing line numbers, so the copied command is still easy to recover from.
-When stdout is piped, data-bearing commands emit compact JSON by default. Use `--text` to force human output,
-`--json` for compact JSON explicitly, or `--pretty` for formatted JSON.
+When stdout is piped, data-bearing commands emit compact JSON with every env value, display value, comment,
+and raw preview withheld. Use `--text` for human output, `--json` for compact JSON explicitly, or `--pretty`
+for formatted JSON. `--values` explicitly includes values the local classifier considers non-sensitive; detected
+secrets remain redacted, while comments and raw previews stay withheld by output policy.
 
 To open the desktop editor at a project, run:
 
@@ -60,7 +62,7 @@ vne .
 
 ## Privacy
 
-Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Default Tauri snapshots scrub secret-like entry values and withhold raw preview payloads for files with redacted values or secret-like comments/malformed lines; Reveal fetches only the selected key occurrence into the local webview and clears it on hide, selection change, reload, or save.
+Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Default Tauri snapshots scrub classifier-detected entry values and secret-like inline comments, and withhold raw preview payloads for files with redacted values or secret-like comments/malformed lines. CLI JSON uses a stronger structural boundary: `inspect`, `check`, and `add` always withhold comments and raw previews, and withhold values unless `--values` is supplied. Reveal fetches only the selected key occurrence into the local webview and clears it on hide, selection change, reload, or save. `format --dry-run` is intentionally raw and warns when piped.
 
 See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the current local-only threat model and release safety checklist.
 
@@ -89,13 +91,14 @@ Run the local `vne` binary:
 ```sh
 cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- inspect fixtures/demo
 cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- check fixtures/demo/.env --example fixtures/demo/.env.example --json
+cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- inspect fixtures/demo --json --values
 cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- add fixtures/demo/.env FEATURE_FLAG true
 cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- add fixtures/demo/.env FEATURE_FLAG=true
 cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- add fixtures/demo/.env OPENAI_API_KEY --prompt
 cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- format fixtures/demo/.env --dry-run
 ```
 
-`inspect` and `check` return exit code `1` when diagnostics or contract drift are found. `add` accepts `<KEY> <VALUE>`, `<KEY=VALUE>`, `--value`, `--stdin`, or `--prompt`; it refuses duplicate keys and reports the existing line numbers instead of appending another occurrence. Use `vne <command> --help` for command-specific examples.
+`inspect` and `check` return exit code `1` when diagnostics or contract drift are found. `add` accepts `<KEY> <VALUE>`, `<KEY=VALUE>`, `--value`, `--stdin`, or `--prompt`; it refuses duplicate keys and reports the existing line numbers instead of appending another occurrence. JSON is payload-free by default; use `--values` only when classifier-approved non-secret values are required. Use `vne <command> --help` for command-specific examples.
 
 The compatibility binary still exists for local automation that already calls `--bin vne-cli`, but the product command and default Cargo binary are `vne`.
 
@@ -127,4 +130,4 @@ The current minimal UI direction is captured in [docs/assets/vne-minimal-design.
 
 ## Current Status
 
-The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table and source context, redact likely secrets, credential-bearing URLs, and public-prefixed secret-looking keys at the Tauri command boundary, reveal one selected key occurrence on demand, compare actual vs example files, report layered override conflicts, discover env files referenced by common config, attach Next.js and Vite load-order evidence to related findings, separate value-required missing-key insertion from advisory findings, support keyboard scanning, add new duplicate-aware env keys, and save one selected key occurrence while rescanning project diagnostics in the Tauri runtime. A minimal Rust CLI exposes the same local parser for `inspect`, `check --example`, duplicate-aware `add`, and safe `format --dry-run` workflows with redacted JSON output. Release packaging is still intentionally deferred.
+The current slice can scan a directory, pick a directory through the native desktop dialog, parse common env files, show a structured key table and source context, redact likely secrets, credential-bearing URLs, and public-prefixed secret-looking keys at the Tauri command boundary, reveal one selected key occurrence on demand, compare actual vs example files, report layered override conflicts, discover env files referenced by common project config, attach Next.js and Vite load-order evidence to related findings, separate value-required missing-key insertion from advisory findings, support keyboard scanning, add new duplicate-aware env keys, and save one selected key occurrence while rescanning project diagnostics in the Tauri runtime. The Rust CLI exposes the same local parser for `inspect`, `check --example`, and duplicate-aware `add`; their JSON output withholds all env payloads by default and requires `--values` to include classifier-approved values, while comments and raw previews remain withheld. `format --dry-run` remains an explicitly raw local inspection command. Release packaging is still intentionally deferred.

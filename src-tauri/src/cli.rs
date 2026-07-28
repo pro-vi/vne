@@ -1,6 +1,7 @@
 use crate::{
     append_env_key_result, atomic_write_preserving_permissions, compare_env_files, parse_env_file,
-    redact_env_file, redact_snapshot, EnvComparison, EnvFile, ProjectSnapshot,
+    redact_env_file_values_only, redact_snapshot_values_only, withhold_all_env_file_payloads,
+    withhold_all_snapshot_payloads, EnvComparison, EnvFile, ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
@@ -19,10 +20,12 @@ enum Command {
         file: PathBuf,
         example: Option<PathBuf>,
         output: OutputFormat,
+        values: ValueOutput,
     },
     Inspect {
         dir: PathBuf,
         output: OutputFormat,
+        values: ValueOutput,
     },
     Format {
         file: PathBuf,
@@ -33,6 +36,7 @@ enum Command {
         key: String,
         value: AddValue,
         output: OutputFormat,
+        values: ValueOutput,
     },
     Help(HelpTopic),
 }
@@ -50,6 +54,12 @@ enum OutputFormat {
     Text,
     Json,
     PrettyJson,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueOutput {
+    Hidden,
+    Classified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,17 +140,23 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             file,
             example,
             output,
-        } => run_check(&file, example.as_deref(), output),
-        Command::Inspect { dir, output } => run_inspect(&dir, output),
+            values,
+        } => run_check(&file, example.as_deref(), output, values),
+        Command::Inspect {
+            dir,
+            output,
+            values,
+        } => run_inspect(&dir, output, values),
         Command::Format { file, dry_run } => run_format(&file, dry_run),
         Command::Add {
             file,
             key,
             value,
             output,
+            values,
         } => {
             let value = read_add_value(&key, value)?;
-            run_add(&file, &key, &value, output)
+            run_add(&file, &key, &value, output, values)
         }
         Command::Help(_) => Ok(false),
     }
@@ -215,6 +231,7 @@ fn run_check(
     file_path: &Path,
     example_path: Option<&Path>,
     output_format: OutputFormat,
+    value_output: ValueOutput,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let file = load_env_file(file_path)?;
     let example = example_path.map(load_env_file).transpose()?;
@@ -225,8 +242,8 @@ fn run_check(
         || example.as_ref().is_some_and(has_file_findings)
         || comparison.as_ref().is_some_and(has_comparison_findings);
     let output = CheckOutput {
-        file: redact_env_file(file),
-        example: example.map(redact_env_file),
+        file: project_env_file_for_output(file, value_output),
+        example: example.map(|file| project_env_file_for_output(file, value_output)),
         comparison,
     };
 
@@ -245,9 +262,14 @@ fn run_check(
     Ok(has_findings)
 }
 
-fn run_inspect(dir: &Path, output: OutputFormat) -> Result<bool, Box<dyn std::error::Error>> {
-    let snapshot = redact_snapshot(crate::snapshot_project(dir)?);
+fn run_inspect(
+    dir: &Path,
+    output: OutputFormat,
+    value_output: ValueOutput,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let snapshot = crate::snapshot_project(dir)?;
     let has_findings = has_snapshot_findings(&snapshot);
+    let snapshot = project_snapshot_for_output(snapshot, value_output);
 
     if output.wants_json() {
         print_json(&snapshot, output)?;
@@ -279,6 +301,11 @@ fn run_format(file: &Path, dry_run: bool) -> Result<bool, Box<dyn std::error::Er
 
     let content = read_to_string_with_path(file)?;
     let _ = parse_env_file(file, content.clone());
+    if !io::stdout().is_terminal() {
+        stderr_line(format_args!(
+            "warning: format --dry-run emits raw env content to stdout"
+        ))?;
+    }
     stdout(format_args!("{content}"))?;
     Ok(false)
 }
@@ -288,6 +315,7 @@ fn run_add(
     key: &str,
     value: &str,
     output: OutputFormat,
+    value_output: ValueOutput,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let content = read_to_string_with_path(file)?;
     let updated =
@@ -296,13 +324,30 @@ fn run_add(
     atomic_write_preserving_permissions(file, &updated)?;
 
     if output.wants_json() {
-        let file = redact_env_file(load_env_file(file)?);
+        let file = project_env_file_for_output(load_env_file(file)?, value_output);
         print_json(&file, output)?;
     } else {
         stdout_line(format_args!("added `{key}` to {}", file.display()))?;
     }
 
     Ok(false)
+}
+
+fn project_snapshot_for_output(
+    snapshot: ProjectSnapshot,
+    value_output: ValueOutput,
+) -> ProjectSnapshot {
+    match value_output {
+        ValueOutput::Hidden => withhold_all_snapshot_payloads(snapshot),
+        ValueOutput::Classified => redact_snapshot_values_only(snapshot),
+    }
+}
+
+fn project_env_file_for_output(file: EnvFile, value_output: ValueOutput) -> EnvFile {
+    match value_output {
+        ValueOutput::Hidden => withhold_all_env_file_payloads(file),
+        ValueOutput::Classified => redact_env_file_values_only(file),
+    }
 }
 
 fn load_env_file(path: &Path) -> Result<EnvFile, Box<dyn std::error::Error>> {
@@ -422,6 +467,7 @@ fn parse_check_args(args: impl Iterator<Item = String>) -> Result<Command, Parse
     let mut file = None;
     let mut example = None;
     let mut output = OutputFormat::Auto;
+    let mut values = ValueOutput::Hidden;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
@@ -431,6 +477,7 @@ fn parse_check_args(args: impl Iterator<Item = String>) -> Result<Command, Parse
             "--pretty" => {
                 set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Check)?
             }
+            "--values" => values = ValueOutput::Classified,
             "--example" => {
                 let Some(path) = args.next() else {
                     return Err(ParseError::new(
@@ -463,12 +510,14 @@ fn parse_check_args(args: impl Iterator<Item = String>) -> Result<Command, Parse
         file,
         example,
         output,
+        values,
     })
 }
 
 fn parse_inspect_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
     let mut dir = None;
     let mut output = OutputFormat::Auto;
+    let mut values = ValueOutput::Hidden;
 
     for arg in args {
         match arg.as_str() {
@@ -477,6 +526,7 @@ fn parse_inspect_args(args: impl Iterator<Item = String>) -> Result<Command, Par
             "--pretty" => {
                 set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Inspect)?
             }
+            "--values" => values = ValueOutput::Classified,
             "-h" | "--help" => return Ok(Command::Help(HelpTopic::Inspect)),
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
@@ -497,7 +547,11 @@ fn parse_inspect_args(args: impl Iterator<Item = String>) -> Result<Command, Par
     let dir = dir.ok_or_else(|| {
         ParseError::new(HelpTopic::Inspect, "inspect requires a project directory")
     })?;
-    Ok(Command::Inspect { dir, output })
+    Ok(Command::Inspect {
+        dir,
+        output,
+        values,
+    })
 }
 
 fn parse_format_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
@@ -531,6 +585,7 @@ fn parse_format_args(args: impl Iterator<Item = String>) -> Result<Command, Pars
 
 fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
     let mut output = OutputFormat::Auto;
+    let mut values = ValueOutput::Hidden;
     let mut value = None;
     let mut positionals = Vec::new();
     let mut args = args.peekable();
@@ -540,6 +595,7 @@ fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, ParseEr
             "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Add)?,
             "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Add)?,
             "--pretty" => set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Add)?,
+            "--values" => values = ValueOutput::Classified,
             "--prompt" => set_add_value_source(&mut value, AddValue::Prompt)?,
             "--stdin" => set_add_value_source(&mut value, AddValue::Stdin)?,
             "--value" => {
@@ -593,6 +649,7 @@ fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, ParseEr
         key,
         value,
         output,
+        values,
     })
 }
 
@@ -640,19 +697,19 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne check <file> [--example <file>] [--text|--json|--pretty]\n  vne inspect <dir> [--text|--json|--pretty]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  --json emits compact one-line JSON; --pretty emits formatted JSON.\n\nEXAMPLES:\n  vne .\n  vne inspect fixtures/demo --json\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n"
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n"
         }
         HelpTopic::Check => {
-            "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON\n  --pretty          Emit formatted JSON\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n"
+            "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
         }
         HelpTopic::Inspect => {
-            "vne inspect - scan a project directory for env files and findings\n\nUSAGE:\n  vne inspect <dir> [--text|--json|--pretty]\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit compact one-line JSON\n  --pretty  Emit formatted JSON\n\nEXAMPLES:\n  vne inspect .\n  vne inspect fixtures/demo --json\n"
+            "vne inspect - scan a project directory for env files and findings\n\nUSAGE:\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit compact one-line JSON; payloads are withheld by default\n  --pretty  Emit formatted JSON; payloads are withheld by default\n  --values  Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne inspect .\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n"
         }
         HelpTopic::Add => {
-            "vne add - append one non-duplicate env key while preserving file formatting\n\nUSAGE:\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty]\n\nOPTIONS:\n  --value <VALUE>  Read the new value from a flag\n  --stdin          Read the new value from stdin\n  --prompt         Read the new value from an interactive hidden prompt\n  --text           Force human text output\n  --json           Emit compact one-line JSON\n  --pretty         Emit formatted JSON\n\nEXAMPLES:\n  vne add .env FEATURE_FLAG=true --json\n  printf '%s' 'sk-local' | vne add .env OPENAI_API_KEY --stdin --json\n  vne add .env OPENAI_API_KEY --prompt\n"
+            "vne add - append one non-duplicate env key while preserving file formatting\n\nUSAGE:\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --value <VALUE>  Read the new value from a flag\n  --stdin          Read the new value from stdin\n  --prompt         Read the new value from an interactive hidden prompt\n  --text           Force human text output\n  --json           Emit compact one-line JSON; payloads are withheld by default\n  --pretty         Emit formatted JSON; payloads are withheld by default\n  --values         Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne add .env FEATURE_FLAG=true --json\n  printf '%s' 'sk-local' | vne add .env OPENAI_API_KEY --stdin --json\n  vne add .env OPENAI_API_KEY --prompt\n"
         }
         HelpTopic::Format => {
-            "vne format - print the parsed env file without rewriting it\n\nUSAGE:\n  vne format <file> --dry-run\n\nOPTIONS:\n  --dry-run  Required; print the current file content instead of writing\n\nEXAMPLE:\n  vne format .env --dry-run\n"
+            "vne format - print the parsed env file without rewriting it\n\nWARNING:\n  This command emits raw env content. It does not apply JSON payload withholding or classified redaction.\n\nUSAGE:\n  vne format <file> --dry-run\n\nOPTIONS:\n  --dry-run  Required; print the current raw file content instead of writing\n\nEXAMPLE:\n  vne format .env --dry-run\n"
         }
     }
 }
@@ -701,6 +758,7 @@ mod tests {
                 file: PathBuf::from(".env"),
                 example: Some(PathBuf::from(".env.example")),
                 output: OutputFormat::Json,
+                values: ValueOutput::Hidden,
             })
         );
     }
@@ -712,6 +770,7 @@ mod tests {
             Ok(Command::Inspect {
                 dir: PathBuf::from("fixtures/demo"),
                 output: OutputFormat::Auto,
+                values: ValueOutput::Hidden,
             })
         );
     }
@@ -723,6 +782,7 @@ mod tests {
             Ok(Command::Inspect {
                 dir: PathBuf::from("fixtures/demo"),
                 output: OutputFormat::PrettyJson,
+                values: ValueOutput::Hidden,
             })
         );
     }
@@ -747,6 +807,7 @@ mod tests {
                 key: "REDIS_URL".to_string(),
                 value: AddValue::Inline("redis://localhost:6379".to_string()),
                 output: OutputFormat::Json,
+                values: ValueOutput::Hidden,
             })
         );
     }
@@ -760,6 +821,7 @@ mod tests {
                 key: "FEATURE_FLAG".to_string(),
                 value: AddValue::Inline("true".to_string()),
                 output: OutputFormat::Auto,
+                values: ValueOutput::Hidden,
             })
         );
     }
@@ -773,6 +835,7 @@ mod tests {
                 key: "OPENAI_API_KEY".to_string(),
                 value: AddValue::Prompt,
                 output: OutputFormat::Auto,
+                values: ValueOutput::Hidden,
             })
         );
     }
@@ -786,6 +849,28 @@ mod tests {
                 key: "OPENAI_API_KEY".to_string(),
                 value: AddValue::Stdin,
                 output: OutputFormat::Json,
+                values: ValueOutput::Hidden,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_values_as_explicit_classified_output() {
+        assert_eq!(
+            parse(&["inspect", "fixtures/demo", "--values", "--json"]),
+            Ok(Command::Inspect {
+                dir: PathBuf::from("fixtures/demo"),
+                output: OutputFormat::Json,
+                values: ValueOutput::Classified,
+            })
+        );
+        assert_eq!(
+            parse(&["check", ".env", "--values"]),
+            Ok(Command::Check {
+                file: PathBuf::from(".env"),
+                example: None,
+                output: OutputFormat::Auto,
+                values: ValueOutput::Classified,
             })
         );
     }
@@ -797,6 +882,20 @@ mod tests {
             parse(&["check", "--help"]),
             Ok(Command::Help(HelpTopic::Check))
         );
+    }
+
+    #[test]
+    fn help_documents_safe_json_defaults_and_raw_format() {
+        for topic in [HelpTopic::Check, HelpTopic::Inspect, HelpTopic::Add] {
+            let help = usage_text(topic);
+            assert!(help.contains("--values"));
+            assert!(help.contains("payloads are withheld by default"));
+            assert!(help.contains("comments and raw content stay withheld"));
+        }
+        let general = usage_text(HelpTopic::General);
+        assert!(general.contains("JSON withholds all env values"));
+        assert!(general.contains("comments and raw content stay withheld"));
+        assert!(usage_text(HelpTopic::Format).contains("emits raw env content"));
     }
 
     #[test]
@@ -827,8 +926,14 @@ mod tests {
         let env_path = dir.path().join(".env");
         fs::write(&env_path, "PORT=1420\nPORT=3000\n").unwrap();
 
-        let error = run_add(&env_path, "PORT", "8080", OutputFormat::Text)
-            .expect_err("duplicate add should fail");
+        let error = run_add(
+            &env_path,
+            "PORT",
+            "8080",
+            OutputFormat::Text,
+            ValueOutput::Hidden,
+        )
+        .expect_err("duplicate add should fail");
 
         assert_eq!(
             error.to_string(),

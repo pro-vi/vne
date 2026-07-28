@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -195,6 +196,31 @@ impl std::error::Error for AppendEnvKeyError {}
 
 const RAW_PREVIEW_WITHHELD: &str =
     "[raw preview withheld because this file contains redacted or secret-like text]";
+const INLINE_COMMENT_WITHHELD: &str = "# [secret-like comment withheld]";
+const ALL_VALUES_WITHHELD: &str = "[value withheld by output policy]";
+const ALL_COMMENTS_WITHHELD: &str = "# [comment withheld by output policy]";
+const ALL_CONTENT_WITHHELD: &str = "[raw content withheld by output policy]";
+const SECRET_KEY_MARKERS: &[&str] = &[
+    "SECRET",
+    "PASSWORD",
+    "TOKEN",
+    "PRIVATE_KEY",
+    "API_KEY",
+    "ACCESS_KEY",
+    "CLIENT_SECRET",
+    "WEBHOOK_SECRET",
+    "CREDENTIAL",
+    "SERVICE_ROLE_KEY",
+];
+const SECRET_VALUE_PREFIXES: &[&str] = &[
+    "sk-", "sk_", "ghp_", "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "AKIA",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownKeyProfile {
+    Secret(&'static str),
+    Public(&'static str),
+}
 
 #[derive(Clone)]
 struct InitialProjectPath(Option<String>);
@@ -369,12 +395,169 @@ pub fn redact_env_file(mut file: EnvFile) -> EnvFile {
     file
 }
 
+pub fn withhold_all_snapshot_payloads(snapshot: ProjectSnapshot) -> ProjectSnapshot {
+    let ProjectSnapshot {
+        root,
+        files,
+        comparison,
+        layer_report,
+        framework_profiles,
+        findings,
+    } = snapshot;
+
+    ProjectSnapshot {
+        root,
+        files: files
+            .into_iter()
+            .map(withhold_all_env_file_payloads)
+            .collect(),
+        comparison,
+        layer_report,
+        framework_profiles,
+        findings,
+    }
+}
+
+pub fn redact_snapshot_values_only(snapshot: ProjectSnapshot) -> ProjectSnapshot {
+    let ProjectSnapshot {
+        root,
+        files,
+        comparison,
+        layer_report,
+        framework_profiles,
+        findings,
+    } = snapshot;
+
+    ProjectSnapshot {
+        root,
+        files: files.into_iter().map(redact_env_file_values_only).collect(),
+        comparison,
+        layer_report,
+        framework_profiles,
+        findings,
+    }
+}
+
+pub fn redact_env_file_values_only(file: EnvFile) -> EnvFile {
+    let EnvFile {
+        path,
+        name,
+        discovery_reasons,
+        entries,
+        diagnostics,
+        duplicate_keys,
+        content: _,
+    } = redact_env_file(file);
+
+    EnvFile {
+        path,
+        name,
+        discovery_reasons,
+        entries: entries
+            .into_iter()
+            .map(withhold_env_entry_context)
+            .collect(),
+        diagnostics,
+        duplicate_keys,
+        content: ALL_CONTENT_WITHHELD.to_string(),
+    }
+}
+
+pub fn withhold_all_env_file_payloads(file: EnvFile) -> EnvFile {
+    let EnvFile {
+        path,
+        name,
+        discovery_reasons,
+        entries,
+        diagnostics,
+        duplicate_keys,
+        content: _,
+    } = file;
+
+    EnvFile {
+        path,
+        name,
+        discovery_reasons,
+        entries: entries
+            .into_iter()
+            .map(withhold_all_env_entry_payloads)
+            .collect(),
+        diagnostics,
+        duplicate_keys,
+        content: ALL_CONTENT_WITHHELD.to_string(),
+    }
+}
+
+fn withhold_env_entry_context(entry: EnvEntry) -> EnvEntry {
+    let EnvEntry {
+        id,
+        key,
+        value,
+        display_value,
+        line_number,
+        exported,
+        quote,
+        comment,
+        shape,
+        diagnostics,
+    } = entry;
+
+    EnvEntry {
+        id,
+        key,
+        value,
+        display_value,
+        line_number,
+        exported,
+        quote,
+        comment: comment.map(|_| ALL_COMMENTS_WITHHELD.to_string()),
+        shape,
+        diagnostics,
+    }
+}
+
+fn withhold_all_env_entry_payloads(entry: EnvEntry) -> EnvEntry {
+    let EnvEntry {
+        id,
+        key,
+        value: _,
+        display_value: _,
+        line_number,
+        exported,
+        quote,
+        comment,
+        shape,
+        diagnostics,
+    } = entry;
+
+    EnvEntry {
+        id,
+        key,
+        value: ALL_VALUES_WITHHELD.to_string(),
+        display_value: ALL_VALUES_WITHHELD.to_string(),
+        line_number,
+        exported,
+        quote,
+        comment: comment.map(|_| ALL_COMMENTS_WITHHELD.to_string()),
+        shape,
+        diagnostics,
+    }
+}
+
 fn redact_env_file_in_place(file: &mut EnvFile) {
     let mut has_redacted_entry = false;
     for entry in &mut file.entries {
         if entry.shape.redacted_by_default {
             entry.value.clear();
+            entry.display_value = "********".to_string();
             has_redacted_entry = true;
+        }
+
+        let withhold_comment = entry.comment.as_deref().is_some_and(|comment| {
+            entry.shape.redacted_by_default || contains_secretish_text(comment)
+        });
+        if withhold_comment {
+            entry.comment = Some(INLINE_COMMENT_WITHHELD.to_string());
         }
     }
 
@@ -408,23 +591,9 @@ fn content_has_unparsed_secretish_text(content: &str) -> bool {
 
 fn contains_secretish_text(text: &str) -> bool {
     let upper = text.to_ascii_uppercase();
-    contains_any(
-        &upper,
-        &[
-            "SECRET",
-            "TOKEN",
-            "PASSWORD",
-            "API_KEY",
-            "PRIVATE_KEY",
-            "ACCESS_KEY",
-            "CLIENT_SECRET",
-            "WEBHOOK_SECRET",
-            "CREDENTIAL",
-            "-----BEGIN",
-        ],
-    ) || text.contains("sk-")
-        || text.contains("ghp_")
-        || text.contains("xoxb-")
+    contains_secretish_key_name(&upper)
+        || upper.contains("-----BEGIN")
+        || value_has_credential_signature(text)
 }
 
 pub fn parse_env_file(path: &Path, content: String) -> EnvFile {
@@ -602,7 +771,8 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
     let public_prefix = upper.starts_with("NEXT_PUBLIC_")
         || upper.starts_with("VITE_")
         || upper.starts_with("PUBLIC_");
-    let provider = provider_reason(&upper);
+    let provider_key = key_without_public_prefix(&upper);
+    let provider = provider_reason(provider_key);
     if let Some(provider) = provider {
         reasons.push(provider);
     }
@@ -610,21 +780,22 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
         reasons.push("frontend-exposed prefix".to_string());
     }
 
-    let secretish = contains_any(
-        &upper,
-        &[
-            "SECRET",
-            "PASSWORD",
-            "TOKEN",
-            "PRIVATE_KEY",
-            "API_KEY",
-            "ACCESS_KEY",
-            "CLIENT_SECRET",
-            "WEBHOOK_SECRET",
-        ],
-    );
+    let known_profile = known_key_profile(&upper);
+    if let Some(profile) = known_profile {
+        let reason = match profile {
+            KnownKeyProfile::Secret(reason) | KnownKeyProfile::Public(reason) => reason,
+        };
+        reasons.push(reason.to_string());
+    }
 
-    if secretish && public_prefix {
+    let known_public_profile = matches!(known_profile, Some(KnownKeyProfile::Public(_)));
+    let browser_exposed = public_prefix || known_public_profile;
+    let known_public_value = known_public_profile && known_public_credential_value(&upper, trimmed);
+
+    let secretish = matches!(known_profile, Some(KnownKeyProfile::Secret(_)))
+        || contains_secretish_key_name(&upper);
+
+    if secretish && browser_exposed {
         reasons.push("secret-like key name".to_string());
         return shape_with_context(
             "public-secret",
@@ -644,7 +815,15 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
 
     if trimmed.starts_with("-----BEGIN ") {
         reasons.push("PEM block marker".to_string());
-        return shape("pem", "PEM / certificate", "high", true, reasons);
+        return shape_with_context(
+            "pem",
+            "PEM / certificate",
+            "high",
+            true,
+            true,
+            browser_exposed.then_some("browser"),
+            reasons,
+        );
     }
 
     let url_like = upper.ends_with("_URL") || upper.ends_with("_URI") || trimmed.contains("://");
@@ -659,7 +838,7 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
             "high",
             true,
             true,
-            public_prefix.then_some("browser"),
+            browser_exposed.then_some("browser"),
             reasons,
         );
     }
@@ -673,7 +852,7 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
             "high",
             true,
             true,
-            public_prefix.then_some("browser"),
+            browser_exposed.then_some("browser"),
             reasons,
         );
     }
@@ -687,7 +866,35 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
             "high",
             true,
             true,
-            public_prefix.then_some("browser"),
+            browser_exposed.then_some("browser"),
+            reasons,
+        );
+    }
+
+    if value_has_credential_signature(trimmed) && !known_public_value {
+        reasons.push("credential-like value signature".to_string());
+        if browser_exposed {
+            return shape_with_context(
+                "public-secret",
+                "Browser-exposed secret",
+                "high",
+                true,
+                true,
+                Some("browser"),
+                reasons,
+            );
+        }
+        return shape("secret", "Secret", "high", true, reasons);
+    }
+
+    if matches!(known_profile, Some(KnownKeyProfile::Public(_))) {
+        return shape_with_context(
+            "public",
+            "Public provider key",
+            "high",
+            false,
+            false,
+            Some("browser"),
             reasons,
         );
     }
@@ -1737,7 +1944,7 @@ fn shell_tokens(input: &str) -> Vec<String> {
                     tokens.push(std::mem::take(&mut current));
                 }
             }
-            (None, value) if matches!(value, ',' | '[' | ']' | '{' | '}') => {
+            (None, ',' | '[' | ']' | '{' | '}') => {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
                 }
@@ -1833,6 +2040,111 @@ fn entry_id(key: &str, line_number: usize) -> String {
     format!("{key}@{line_number}")
 }
 
+fn key_without_public_prefix(upper: &str) -> &str {
+    upper
+        .strip_prefix("NEXT_PUBLIC_")
+        .or_else(|| upper.strip_prefix("VITE_"))
+        .or_else(|| upper.strip_prefix("PUBLIC_"))
+        .unwrap_or(upper)
+}
+
+fn known_key_profile(upper: &str) -> Option<KnownKeyProfile> {
+    match key_without_public_prefix(upper) {
+        "SUPABASE_SERVICE_ROLE_KEY" => {
+            Some(KnownKeyProfile::Secret("Supabase service-role credential"))
+        }
+        "SUPABASE_ANON_KEY" => Some(KnownKeyProfile::Public("Supabase anonymous public key")),
+        _ => None,
+    }
+}
+
+fn contains_secretish_key_name(upper: &str) -> bool {
+    contains_any(upper, SECRET_KEY_MARKERS)
+}
+
+fn contains_secret_value_token(value: &str) -> bool {
+    SECRET_VALUE_PREFIXES.iter().any(|prefix| {
+        value.match_indices(prefix).any(|(index, _)| {
+            index == 0
+                || value[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| !is_credential_identifier_character(character))
+        })
+    })
+}
+
+fn is_credential_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+fn value_has_credential_signature(value: &str) -> bool {
+    contains_secret_value_token(value) || contains_jwt_token(value)
+}
+
+fn contains_jwt_token(value: &str) -> bool {
+    value.match_indices("eyJ").any(|(start, _)| {
+        let candidate = &value[start..];
+        let end = candidate
+            .char_indices()
+            .find_map(|(index, character)| {
+                (!is_jwt_candidate_character(character)).then_some(index)
+            })
+            .unwrap_or(candidate.len());
+        let segments = candidate[..end].split('.').collect::<Vec<_>>();
+        segments.windows(3).any(jwt_segments_are_valid)
+    })
+}
+
+fn is_jwt_candidate_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '=')
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    let segments = value.split('.').collect::<Vec<_>>();
+    jwt_segments_are_valid(&segments)
+}
+
+fn jwt_segments_are_valid(segments: &[&str]) -> bool {
+    segments.len() == 3
+        && segments[0].starts_with("eyJ")
+        && segments.iter().all(|segment| {
+            let unpadded = segment.trim_end_matches('=');
+            let padding = segment.len() - unpadded.len();
+            !unpadded.is_empty()
+                && padding <= 2
+                && !unpadded.contains('=')
+                && unpadded.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+        })
+}
+
+fn known_public_credential_value(upper: &str, value: &str) -> bool {
+    match key_without_public_prefix(upper) {
+        "SUPABASE_ANON_KEY" => jwt_has_role(value, "anon"),
+        _ => false,
+    }
+}
+
+fn jwt_has_role(value: &str, expected_role: &str) -> bool {
+    if !looks_like_jwt(value) {
+        return false;
+    }
+
+    let Some(payload) = value.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')) else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+        return false;
+    };
+
+    payload.get("role").and_then(|role| role.as_str()) == Some(expected_role)
+}
+
 fn provider_reason(upper: &str) -> Option<String> {
     let provider = if upper.starts_with("AWS_") {
         "AWS"
@@ -1904,7 +2216,7 @@ fn url_value_has_secretish_parts(value: &str) -> bool {
     };
 
     let authority_end = after_scheme
-        .find(|character| matches!(character, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
     if after_scheme[..authority_end].contains('@') {
         return true;
@@ -2267,6 +2579,126 @@ mod tests {
     }
 
     #[test]
+    fn classifies_supabase_service_role_and_public_siblings() {
+        let service_role = infer_key_shape("SUPABASE_SERVICE_ROLE_KEY", "ServiceRoleA1X");
+        assert_eq!(service_role.kind, "secret");
+        assert!(service_role.sensitive);
+        assert!(service_role.redacted_by_default);
+        assert!(service_role
+            .reasons
+            .contains(&"Supabase service-role credential".to_string()));
+
+        let exposed_service_role =
+            infer_key_shape("NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY", "ServiceRoleA1X");
+        assert_eq!(exposed_service_role.kind, "public-secret");
+        assert_eq!(exposed_service_role.exposure.as_deref(), Some("browser"));
+        assert!(exposed_service_role.sensitive);
+
+        let anon_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.signature";
+        for key in ["SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY"] {
+            let anon = infer_key_shape(key, anon_jwt);
+            assert_eq!(anon.kind, "public");
+            assert!(!anon.sensitive);
+            assert!(!anon.redacted_by_default);
+            assert_eq!(anon.exposure.as_deref(), Some("browser"));
+        }
+
+        for key in ["SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY"] {
+            for value in [
+                "sk-live-public-profile-override",
+                "ghp_public_profile_override",
+                "AKIAPUBLICPROFILEOVERRIDE",
+                "-----BEGIN PRIVATE KEY-----",
+                "postgres://user:pass@example.test/app",
+                "eyJhbGciOiJIUzI1NiJ9.invalid.signature",
+                "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.signature",
+            ] {
+                let misplaced_secret = infer_key_shape(key, value);
+                assert!(
+                    misplaced_secret.sensitive,
+                    "strong secret evidence must override a public key profile: {key}={value}"
+                );
+                assert_eq!(misplaced_secret.exposure.as_deref(), Some("browser"));
+            }
+        }
+
+        let padded_anon_payload =
+            base64::engine::general_purpose::URL_SAFE.encode(br#"{"role":"anon","padding":"x"}"#);
+        let padded_service_payload = base64::engine::general_purpose::URL_SAFE
+            .encode(br#"{"role":"service_role","padding":"x"}"#);
+        assert!(padded_anon_payload.ends_with('='));
+        assert!(padded_service_payload.ends_with('='));
+
+        let padded_anon = infer_key_shape(
+            "SUPABASE_ANON_KEY",
+            &format!("eyJhbGciOiJIUzI1NiJ9.{padded_anon_payload}.signature"),
+        );
+        assert!(!padded_anon.sensitive);
+
+        let padded_service_role = infer_key_shape(
+            "SUPABASE_ANON_KEY",
+            &format!("eyJhbGciOiJIUzI1NiJ9.{padded_service_payload}.signature"),
+        );
+        assert!(padded_service_role.sensitive);
+        assert_eq!(padded_service_role.exposure.as_deref(), Some("browser"));
+    }
+
+    #[test]
+    fn classifies_known_credential_value_signatures_without_broad_lookalikes() {
+        for value in [
+            "sk-test",
+            "sk_test",
+            "ghp_test",
+            "xoxb-test",
+            "AKIATEST123",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.signature",
+            "Bearer ghp_wrapped",
+            "token=ghp_wrapped",
+            "https://example.test/sk-embedded",
+        ] {
+            let shape = infer_key_shape("UNRECOGNIZED", value);
+            assert_eq!(shape.kind, "secret", "{value} should be credential-like");
+            assert!(shape.sensitive);
+            assert!(shape.redacted_by_default);
+        }
+
+        for (key, value) in [
+            ("SK_THEME", "dark"),
+            ("SERVICE_ROLE_NAME", "worker"),
+            ("UNRECOGNIZED", "flask_config"),
+            ("UNRECOGNIZED", "eyJ.not-a-complete-token"),
+        ] {
+            assert!(!infer_key_shape(key, value).sensitive, "{key}={value}");
+        }
+
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwdW5jdHVhdGVkIn0.signature";
+        for value in [format!("{jwt}."), format!("prefix.{jwt}")] {
+            assert!(
+                infer_key_shape("UNRECOGNIZED", &value).sensitive,
+                "JWT evidence must survive adjacent dot punctuation: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_shape_sensitivity_and_default_redaction_stay_in_lockstep() {
+        for (key, value) in [
+            ("FEATURE_FLAG", "true"),
+            ("OPENAI_API_KEY", "sk-test"),
+            ("NEXT_PUBLIC_API_KEY", "sk-browser"),
+            ("SUPABASE_ANON_KEY", "anon"),
+            ("SUPABASE_SERVICE_ROLE_KEY", "service-role"),
+            ("DATABASE_URL", "postgres://user:pass@localhost/app"),
+        ] {
+            let shape = infer_key_shape(key, value);
+            assert_eq!(
+                shape.sensitive, shape.redacted_by_default,
+                "{key} must preserve the classification invariant"
+            );
+        }
+    }
+
+    #[test]
     fn redacts_credential_bearing_urls_and_dsns() {
         let database = infer_key_shape("DATABASE_URL", "postgres://user:pass@localhost/app");
         assert_eq!(database.kind, "credential-url");
@@ -2530,7 +2962,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(".env"),
-            "# API_TOKEN=comment-secret\nPORT=1420\nBROKEN TOKEN line\n",
+            "# API_TOKEN=whole-line-secret\nPORT=1420 # API_TOKEN=inline-comment-secret\nBROKEN TOKEN line\n",
         )
         .unwrap();
 
@@ -2547,9 +2979,154 @@ mod tests {
             .unwrap();
 
         assert_eq!(port.value, "1420");
+        assert_eq!(port.comment.as_deref(), Some(INLINE_COMMENT_WITHHELD));
         assert_eq!(hidden_file.content, RAW_PREVIEW_WITHHELD);
-        assert!(!hidden_file.content.contains("comment-secret"));
+        assert!(!hidden_file.content.contains("whole-line-secret"));
+        assert!(!hidden_file.content.contains("inline-comment-secret"));
         assert!(!hidden_file.content.contains("BROKEN TOKEN"));
+    }
+
+    #[test]
+    fn classified_redaction_scrubs_every_payload_surface() {
+        let file = parse_env_file(
+            Path::new(".env"),
+            "SUPABASE_SERVICE_ROLE_KEY=ServiceRoleA1X # deployment\nPORT=1420 # TOKEN=CommentC3Z\n"
+                .to_string(),
+        );
+        let hidden = redact_env_file(file);
+        let service_role = &hidden.entries[0];
+        let port = &hidden.entries[1];
+
+        assert_eq!(service_role.value, "");
+        assert_eq!(service_role.display_value, "********");
+        assert_eq!(
+            service_role.comment.as_deref(),
+            Some(INLINE_COMMENT_WITHHELD)
+        );
+        assert_eq!(port.value, "1420");
+        assert_eq!(port.display_value, "1420");
+        assert_eq!(port.comment.as_deref(), Some(INLINE_COMMENT_WITHHELD));
+        assert_eq!(hidden.content, RAW_PREVIEW_WITHHELD);
+        assert!(!serde_json::to_string(&hidden)
+            .unwrap()
+            .contains("ServiceRoleA1X"));
+        assert!(!serde_json::to_string(&hidden)
+            .unwrap()
+            .contains("CommentC3Z"));
+    }
+
+    #[test]
+    fn classified_redaction_scrubs_jwt_comments_and_raw_content() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJDb21tZW50Snd0In0.signature";
+        let file = parse_env_file(Path::new(".env"), format!("PORT=1420 # {jwt}.\n"));
+        let hidden = redact_env_file(file);
+        let serialized = serde_json::to_string(&hidden).unwrap();
+
+        assert_eq!(
+            hidden.entries[0].comment.as_deref(),
+            Some(INLINE_COMMENT_WITHHELD)
+        );
+        assert_eq!(hidden.content, RAW_PREVIEW_WITHHELD);
+        assert!(!serialized.contains(jwt));
+    }
+
+    #[test]
+    fn classified_redaction_scrubs_jwt_in_unparsed_text() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJSYXdKd3QifQ.signature";
+        let file = parse_env_file(Path::new(".env"), format!("# {jwt}\nPORT=1420\n"));
+        let hidden = redact_env_file(file);
+
+        assert_eq!(hidden.content, RAW_PREVIEW_WITHHELD);
+        assert!(!serde_json::to_string(&hidden).unwrap().contains(jwt));
+    }
+
+    #[test]
+    fn credential_prefix_lookalikes_preserve_comments_and_raw_content() {
+        let content = "PORT=1420 # load flask_config before task_queue startup\n";
+        let file = parse_env_file(Path::new(".env"), content.to_string());
+        let visible = redact_env_file(file);
+
+        assert_eq!(
+            visible.entries[0].comment.as_deref(),
+            Some("# load flask_config before task_queue startup")
+        );
+        assert_eq!(visible.content, content);
+    }
+
+    #[test]
+    fn hide_all_projection_withholds_payloads_without_changing_classification() {
+        let file = parse_env_file(
+            Path::new(".env"),
+            "PLAIN_SETTING=OrdinaryB2Y # ordinary comment\nSUPABASE_SERVICE_ROLE_KEY=ServiceRoleA1X\n"
+                .to_string(),
+        );
+        let original_shapes = file
+            .entries
+            .iter()
+            .map(|entry| entry.shape.clone())
+            .collect::<Vec<_>>();
+        let hidden = withhold_all_env_file_payloads(file);
+
+        assert!(hidden
+            .entries
+            .iter()
+            .all(|entry| entry.value == ALL_VALUES_WITHHELD));
+        assert!(hidden
+            .entries
+            .iter()
+            .all(|entry| entry.display_value == ALL_VALUES_WITHHELD));
+        assert_eq!(
+            hidden.entries[0].comment.as_deref(),
+            Some(ALL_COMMENTS_WITHHELD)
+        );
+        assert_eq!(hidden.entries[1].comment, None);
+        assert_eq!(hidden.content, "[raw content withheld by output policy]");
+        assert_eq!(
+            hidden
+                .entries
+                .iter()
+                .map(|entry| entry.shape.clone())
+                .collect::<Vec<_>>(),
+            original_shapes
+        );
+
+        let serialized = serde_json::to_string(&hidden).unwrap();
+        assert!(!serialized.contains("OrdinaryB2Y"));
+        assert!(!serialized.contains("ServiceRoleA1X"));
+        assert!(!serialized.contains("ordinary comment"));
+    }
+
+    #[test]
+    fn values_only_projection_preserves_classified_values_and_withholds_context() {
+        let file = parse_env_file(
+            Path::new(".env"),
+            "PLAIN_SETTING=OrdinaryB2Y # ordinary context\nSUPABASE_SERVICE_ROLE_KEY=ServiceRoleA1X # deployment\n"
+                .to_string(),
+        );
+        let original_shapes = file
+            .entries
+            .iter()
+            .map(|entry| entry.shape.clone())
+            .collect::<Vec<_>>();
+        let projected = redact_env_file_values_only(file);
+
+        assert_eq!(projected.entries[0].value, "OrdinaryB2Y");
+        assert_eq!(projected.entries[0].display_value, "OrdinaryB2Y");
+        assert_eq!(projected.entries[1].value, "");
+        assert_eq!(projected.entries[1].display_value, "********");
+        assert!(projected
+            .entries
+            .iter()
+            .all(|entry| entry.comment.as_deref() == Some(ALL_COMMENTS_WITHHELD)));
+        assert_eq!(projected.content, ALL_CONTENT_WITHHELD);
+        assert_eq!(
+            projected
+                .entries
+                .iter()
+                .map(|entry| entry.shape.clone())
+                .collect::<Vec<_>>(),
+            original_shapes
+        );
     }
 
     #[test]
