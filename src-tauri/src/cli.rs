@@ -2,13 +2,13 @@ use crate::{
     append_env_key_result, atomic_write_preserving_permissions, compare_env_files,
     ensure_project_env_file, parse_env_file, redact_env_file_values_only,
     redact_snapshot_values_only, withhold_all_env_file_payloads, withhold_all_snapshot_payloads,
-    EnvComparison, EnvFile, EnvFileCreationDisposition, ProjectSnapshot,
+    EnsureEnvFileOutcome, EnvComparison, EnvFile, EnvFileCreationDisposition, ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
@@ -163,7 +163,7 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             output,
             values,
         } => {
-            let value = read_add_value(&key, value)?;
+            let value = read_add_value(&file, &key, value)?;
             run_add(&file, &key, &value, output, values)
         }
         Command::Create { file, output } => run_create(&file, output),
@@ -171,12 +171,86 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
     }
 }
 
-fn read_add_value(key: &str, value: AddValue) -> Result<String, Box<dyn std::error::Error>> {
+fn read_add_value(
+    file: &Path,
+    key: &str,
+    value: AddValue,
+) -> Result<String, Box<dyn std::error::Error>> {
+    prepare_add_target(file, matches!(&value, AddValue::Prompt))?;
+
     match value {
         AddValue::Inline(value) => Ok(value),
         AddValue::Prompt => read_prompted_value(key),
         AddValue::Stdin => read_stdin_value(),
     }
+}
+
+fn prepare_add_target(
+    file: &Path,
+    prompt_if_missing: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match fs::symlink_metadata(file) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("could not inspect env file {}: {error}", file.display()),
+            )
+            .into());
+        }
+    }
+
+    if !prompt_if_missing {
+        return Err(format!(
+            "env file {} does not exist; run `vne create <file>` first",
+            file.display()
+        )
+        .into());
+    }
+
+    if !io::stdin().is_terminal() {
+        return Err(
+            "--prompt requires an interactive terminal; use `vne create <file>` first and --stdin for piped values"
+                .into(),
+        );
+    }
+
+    let stdin = io::stdin();
+    let stderr = io::stderr();
+    confirm_missing_env_file_creation(file, &mut stdin.lock(), &mut stderr.lock())
+}
+
+fn confirm_missing_env_file_creation(
+    file: &Path,
+    input: &mut impl BufRead,
+    diagnostics: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write!(
+        diagnostics,
+        "env file {} does not exist. Create it? [y/N] ",
+        file.display()
+    )?;
+    diagnostics.flush()?;
+
+    let mut response = String::new();
+    input.read_line(&mut response)?;
+    if !is_affirmative_confirmation(&response) {
+        return Err(format!("add cancelled; {} was not created", file.display()).into());
+    }
+
+    let outcome = ensure_env_file_path(file)?;
+    let action = match outcome.disposition {
+        EnvFileCreationDisposition::Created => "created",
+        EnvFileCreationDisposition::AlreadyExists => "using existing",
+    };
+    writeln!(diagnostics, "{action} {}", outcome.path)?;
+    Ok(())
+}
+
+fn is_affirmative_confirmation(response: &str) -> bool {
+    let response = response.trim();
+    response.eq_ignore_ascii_case("y") || response.eq_ignore_ascii_case("yes")
 }
 
 fn read_prompted_value(key: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -186,19 +260,24 @@ fn read_prompted_value(key: &str) -> Result<String, Box<dyn std::error::Error>> 
         );
     }
 
-    stderr(format_args!("value for {key}: "))?;
     if !set_terminal_echo(false) {
-        let _ = stderr_line(format_args!(""));
         return Err(
             "--prompt could not disable terminal echo; use --stdin or --value instead".into(),
         );
     }
 
-    let mut value = String::new();
-    let read_result = io::stdin().read_line(&mut value);
-    let _ = set_terminal_echo(true);
+    let read_result = (|| -> io::Result<String> {
+        stderr(format_args!("value for {key}: "))?;
+        let mut value = String::new();
+        io::stdin().read_line(&mut value)?;
+        Ok(value)
+    })();
+    let echo_restored = set_terminal_echo(true);
     let _ = stderr_line(format_args!(""));
-    read_result?;
+    if !echo_restored {
+        return Err("--prompt could not restore terminal echo; run `stty echo`".into());
+    }
+    let value = read_result?;
 
     Ok(strip_one_trailing_line_ending(value))
 }
@@ -343,30 +422,7 @@ fn run_add(
 }
 
 fn run_create(file: &Path, output: OutputFormat) -> Result<bool, Box<dyn std::error::Error>> {
-    let raw_path = file.to_string_lossy();
-    let terminal_component = raw_path.rsplit(['/', '\\']).next().unwrap_or_default();
-    if terminal_component.is_empty() || matches!(terminal_component, "." | "..") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "create requires a file path ending in an env filename",
-        )
-        .into());
-    }
-
-    let name = file
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "create requires an env file path with a UTF-8 filename",
-            )
-        })?;
-    let parent = file
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let outcome = ensure_project_env_file(parent, name)?;
+    let outcome = ensure_env_file_path(file)?;
 
     if output.wants_json() {
         print_json(&outcome, output)?;
@@ -379,6 +435,32 @@ fn run_create(file: &Path, output: OutputFormat) -> Result<bool, Box<dyn std::er
     }
 
     Ok(false)
+}
+
+fn ensure_env_file_path(file: &Path) -> io::Result<EnsureEnvFileOutcome> {
+    let raw_path = file.to_string_lossy();
+    let terminal_component = raw_path.rsplit(['/', '\\']).next().unwrap_or_default();
+    if terminal_component.is_empty() || matches!(terminal_component, "." | "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "env file path must end in an env filename",
+        ));
+    }
+
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "env file path requires a UTF-8 filename",
+            )
+        })?;
+    let parent = file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_project_env_file(parent, name)
 }
 
 fn project_snapshot_for_output(
@@ -788,7 +870,7 @@ fn usage_text(topic: HelpTopic) -> &'static str {
             "vne inspect - scan a project directory for env files and findings\n\nUSAGE:\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit compact one-line JSON; payloads are withheld by default\n  --pretty  Emit formatted JSON; payloads are withheld by default\n  --values  Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne inspect .\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n"
         }
         HelpTopic::Add => {
-            "vne add - append one non-duplicate env key while preserving file formatting\n\nUSAGE:\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --value <VALUE>  Read the new value from a flag\n  --stdin          Read the new value from stdin\n  --prompt         Read the new value from an interactive hidden prompt\n  --text           Force human text output\n  --json           Emit compact one-line JSON; payloads are withheld by default\n  --pretty         Emit formatted JSON; payloads are withheld by default\n  --values         Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne add .env FEATURE_FLAG=true --json\n  printf '%s' 'sk-local' | vne add .env OPENAI_API_KEY --stdin --json\n  vne add .env OPENAI_API_KEY --prompt\n"
+            "vne add - append one non-duplicate env key while preserving file formatting\n\nUSAGE:\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --value <VALUE>  Read the new value from a flag\n  --stdin          Read the new value from stdin\n  --prompt         Offer to create a missing env file, then read a hidden value\n  --text           Force human text output\n  --json           Emit compact one-line JSON; payloads are withheld by default\n  --pretty         Emit formatted JSON; payloads are withheld by default\n  --values         Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne add .env FEATURE_FLAG=true --json\n  printf '%s' 'sk-local' | vne add .env OPENAI_API_KEY --stdin --json\n  vne add .env OPENAI_API_KEY --prompt\n"
         }
         HelpTopic::Create => {
             "vne create - ensure one empty env file exists without overwriting it\n\nUSAGE:\n  vne create <file> [--text|--json|--pretty]\n\nBEHAVIOR:\n  The parent directory must already exist.\n  The filename must look like .env, .env.local, .envrc, .flaskenv, or worker.env.\n  A new file is empty and private to its owner on Unix.\n  An existing regular file is left unchanged and reported as alreadyExists.\n  Symlinks, directories, missing parent directories, and overwrite flags are rejected.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit a compact disposition and absolute path\n  --pretty  Emit a formatted disposition and absolute path\n\nEXAMPLES:\n  vne create .env\n  vne create config.env --json\n  vne create /path/to/project/.env.local --pretty\n"
@@ -1026,6 +1108,7 @@ mod tests {
         assert!(create.contains("without overwriting"));
         assert!(create.contains("existing regular file is left unchanged"));
         assert!(create.contains("Symlinks"));
+        assert!(usage_text(HelpTopic::Add).contains("Offer to create a missing env file"));
     }
 
     #[test]
@@ -1042,6 +1125,61 @@ mod tests {
             strip_one_trailing_line_ending("line1\nline2\n".to_string()),
             "line1\nline2"
         );
+    }
+
+    #[test]
+    fn missing_prompt_target_is_created_after_affirmative_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        let mut input = io::Cursor::new(b"yes\n");
+        let mut diagnostics = Vec::new();
+
+        confirm_missing_env_file_creation(&env_path, &mut input, &mut diagnostics).unwrap();
+
+        assert_eq!(fs::read(&env_path).unwrap(), b"");
+        let diagnostics = String::from_utf8(diagnostics).unwrap();
+        assert!(diagnostics.contains("does not exist. Create it? [y/N]"));
+        assert!(diagnostics.contains("created"));
+    }
+
+    #[test]
+    fn missing_prompt_target_decline_is_side_effect_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        let mut input = io::Cursor::new(b"no\n");
+        let mut diagnostics = Vec::new();
+
+        let error = confirm_missing_env_file_creation(&env_path, &mut input, &mut diagnostics)
+            .expect_err("declining creation should cancel add");
+
+        assert!(error.to_string().contains("add cancelled"));
+        assert!(!env_path.exists());
+    }
+
+    #[test]
+    fn prompt_creation_race_uses_existing_file_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        fs::write(&env_path, "EXISTING=keep\n").unwrap();
+        let mut input = io::Cursor::new(b"y\n");
+        let mut diagnostics = Vec::new();
+
+        confirm_missing_env_file_creation(&env_path, &mut input, &mut diagnostics).unwrap();
+
+        assert_eq!(fs::read_to_string(env_path).unwrap(), "EXISTING=keep\n");
+        assert!(String::from_utf8(diagnostics)
+            .unwrap()
+            .contains("using existing"));
+    }
+
+    #[test]
+    fn confirmation_accepts_only_explicit_yes_answers() {
+        for response in ["y", "Y\n", "yes", "YES\r\n", " yes "] {
+            assert!(is_affirmative_confirmation(response), "{response:?}");
+        }
+        for response in ["", "n", "no", "true", "1", "yep"] {
+            assert!(!is_affirmative_confirmation(response), "{response:?}");
+        }
     }
 
     #[test]

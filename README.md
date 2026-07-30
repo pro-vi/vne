@@ -51,8 +51,10 @@ vne add .env PORT --value 1420
 ```
 
 `create` is idempotent: it creates a zero-byte file once, leaves an existing regular file untouched, and rejects
-symlinks, directories, unsupported filenames, and missing parent directories. `add` refuses duplicate keys and
-reports existing line numbers, so the copied command is still easy to recover from.
+symlinks, directories, unsupported filenames, and missing parent directories. When `add --prompt` targets a missing
+env file, it offers to create the file before asking for the hidden value. Non-interactive flows can run `vne create`
+first. `add` refuses duplicate keys and reports existing line numbers, so the copied command is still easy to recover
+from.
 When stdout is piped, data-bearing commands emit compact JSON with every env value, display value, comment,
 and raw preview withheld. Use `--text` for human output, `--json` for compact JSON explicitly, or `--pretty`
 for formatted JSON. `--values` explicitly includes values the local classifier considers non-sensitive; detected

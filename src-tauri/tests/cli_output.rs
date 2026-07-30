@@ -198,6 +198,72 @@ fn create_reports_the_canonical_path_for_a_case_variant() {
     assert_eq!(fs::read_to_string(actual_file).unwrap(), ORDINARY_SENTINEL);
 }
 
+#[test]
+fn add_missing_file_fails_before_noninteractive_value_input() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+
+    for args in [
+        vec![
+            "add".to_string(),
+            env_file.display().to_string(),
+            "TOKEN".to_string(),
+            ADD_SENTINEL.to_string(),
+            "--json".to_string(),
+        ],
+        vec![
+            "add".to_string(),
+            env_file.display().to_string(),
+            "TOKEN".to_string(),
+            "--stdin".to_string(),
+            "--json".to_string(),
+        ],
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vne"));
+        command
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("vne process should start");
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as _;
+            let _ = stdin.write_all(ADD_SENTINEL.as_bytes());
+        }
+        let output = child.wait_with_output().expect("vne process should finish");
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("does not exist"));
+        assert!(stderr.contains("vne create <file>"));
+        assert!(!stderr.contains(ADD_SENTINEL));
+        assert!(!env_file.exists());
+    }
+}
+
+#[test]
+fn add_prompt_without_terminal_does_not_offer_or_create_missing_file() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+
+    let output = run_vne([
+        "add".to_string(),
+        env_file.display().to_string(),
+        "TOKEN".to_string(),
+        "--prompt".to_string(),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--prompt requires an interactive terminal"));
+    assert!(stderr.contains("vne create <file>"));
+    assert!(stderr.contains("--stdin"));
+    assert!(!env_file.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn create_retry_converges_after_post_create_output_failure() {
