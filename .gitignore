@@ -5,3 +5,6 @@ src-tauri/target/
 .DS_Store
 .vscode/
 .idea/
+
+# Local cross-project inbox notes
+.inbox/
