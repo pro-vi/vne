@@ -1,10 +1,14 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 pub mod cli;
 
@@ -17,6 +21,20 @@ pub struct ProjectSnapshot {
     pub layer_report: EnvLayerReport,
     pub framework_profiles: Vec<FrameworkEnvProfile>,
     pub findings: Vec<EnvFinding>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnvFileCreationDisposition {
+    Created,
+    AlreadyExists,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnsureEnvFileOutcome {
+    pub disposition: EnvFileCreationDisposition,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -297,6 +315,11 @@ fn add_env_key(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn ensure_env_file(root: String, name: String) -> Result<EnsureEnvFileOutcome, String> {
+    ensure_project_env_file(Path::new(&root), &name).map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     run_with_initial_project_path(None);
@@ -311,7 +334,8 @@ pub fn run_with_initial_project_path(initial_path: Option<String>) {
             load_project,
             reveal_env_value,
             save_env_value,
-            add_env_key
+            add_env_key,
+            ensure_env_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running vne");
@@ -1967,6 +1991,142 @@ fn is_env_file_name(name: &str) -> bool {
         || name.ends_with(".env")
 }
 
+pub fn ensure_project_env_file(root: &Path, name: &str) -> io::Result<EnsureEnvFileOutcome> {
+    validate_new_env_file_name(name)?;
+
+    let canonical_root = root.canonicalize().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("project root {} is not accessible: {error}", root.display()),
+        )
+    })?;
+    if !canonical_root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("project root {} is not a directory", root.display()),
+        ));
+    }
+
+    let target = canonical_root.join(name);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let disposition = match options.open(&target) {
+        Ok(file) => {
+            drop(file);
+            EnvFileCreationDisposition::Created
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&target).map_err(|metadata_error| {
+                io::Error::new(
+                    metadata_error.kind(),
+                    format!(
+                        "could not inspect existing env path {}: {metadata_error}",
+                        target.display()
+                    ),
+                )
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "refusing to use {} because it is not a regular file",
+                        target.display()
+                    ),
+                ));
+            }
+            EnvFileCreationDisposition::AlreadyExists
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("could not create env file {}: {error}", target.display()),
+            ));
+        }
+    };
+
+    let resolved_target = target
+        .canonicalize()
+        .ok()
+        .filter(|path| path.parent() == Some(canonical_root.as_path()))
+        .unwrap_or(target);
+
+    Ok(EnsureEnvFileOutcome {
+        disposition,
+        path: resolved_target.to_string_lossy().to_string(),
+    })
+}
+
+fn validate_new_env_file_name(name: &str) -> io::Result<()> {
+    let mut components = Path::new(name).components();
+    let is_single_normal_component = matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == OsStr::new(name)
+    ) && components.next().is_none();
+    let is_exact_basename = !name.is_empty()
+        && name.trim() == name
+        && is_single_normal_component
+        && !name.contains(['<', '>', ':', '"', '/', '\\', '|', '?', '*'])
+        && !name.chars().any(char::is_control)
+        && !name.ends_with('.')
+        && !has_windows_reserved_file_stem(name)
+        && name != "."
+        && name != "..";
+
+    if !is_exact_basename || !is_env_file_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "env file name must be one root-level name such as .env, .env.local, or worker.env",
+        ));
+    }
+
+    Ok(())
+}
+
+fn has_windows_reserved_file_stem(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "CONIN$"
+            | "CONOUT$"
+    )
+}
+
 fn env_file_sort_key(name: &str) -> (u8, String) {
     let priority = match name {
         ".env" => 0,
@@ -2845,6 +3005,205 @@ mod tests {
             outside_file.to_str().unwrap()
         )
         .is_err());
+    }
+
+    #[test]
+    fn accepts_supported_root_level_env_names() {
+        let project = tempdir().unwrap();
+
+        for name in [".env", ".env.local", ".envrc", ".flaskenv", "worker.env"] {
+            let outcome = ensure_project_env_file(project.path(), name).unwrap();
+            assert_eq!(outcome.disposition, EnvFileCreationDisposition::Created);
+            assert_eq!(fs::read(project.path().join(name)).unwrap(), b"");
+        }
+    }
+
+    #[test]
+    fn rejects_non_basename_env_names_without_writing() {
+        let project = tempdir().unwrap();
+
+        for name in [
+            "",
+            ".",
+            "..",
+            "notes.txt",
+            "../.env",
+            "config/app.env",
+            "config\\app.env",
+            " .env",
+            ".env ",
+            ".env\nlocal",
+            "/tmp/.env",
+            "C:.env",
+            ".env.x:y",
+            ".env.local.",
+            "CON.env",
+            "CON .env",
+            "com1.env",
+            "com1 .env",
+            "COM¹.env",
+            "LPT9.env",
+            "LPT³.env",
+            ".env<local",
+            ".env>local",
+            ".env\"local",
+            ".env|local",
+            ".env?local",
+            ".env*local",
+        ] {
+            assert!(
+                ensure_project_env_file(project.path(), name).is_err(),
+                "{name:?} should be rejected"
+            );
+        }
+
+        assert!(fs::read_dir(project.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn accepts_names_that_only_resemble_windows_devices() {
+        let project = tempdir().unwrap();
+
+        for name in ["COM10.env", "LPT0.env", "CONNECTION.env", ".env.CON"] {
+            let outcome = ensure_project_env_file(project.path(), name).unwrap();
+            assert_eq!(outcome.disposition, EnvFileCreationDisposition::Created);
+        }
+    }
+
+    #[test]
+    fn case_variant_outcome_path_matches_the_project_snapshot() {
+        let project = tempdir().unwrap();
+        let actual_path = project.path().join(".env.local");
+        let requested_path = project.path().join(".env.Local");
+        fs::write(&actual_path, b"KEEP=original\n").unwrap();
+        let names_alias = requested_path.exists();
+
+        let outcome = ensure_project_env_file(project.path(), ".env.Local").unwrap();
+        let snapshot = snapshot_project(project.path()).unwrap();
+
+        let expected_disposition = if names_alias {
+            EnvFileCreationDisposition::AlreadyExists
+        } else {
+            EnvFileCreationDisposition::Created
+        };
+        assert_eq!(outcome.disposition, expected_disposition);
+        assert!(snapshot.files.iter().any(|file| file.path == outcome.path));
+        assert_eq!(fs::read(actual_path).unwrap(), b"KEEP=original\n");
+    }
+
+    #[test]
+    fn existing_env_file_is_idempotent_and_byte_preserving() {
+        let project = tempdir().unwrap();
+        let env_path = project.path().join(".env");
+        fs::write(&env_path, b"API_TOKEN=keep-me\n").unwrap();
+
+        let outcome = ensure_project_env_file(project.path(), ".env").unwrap();
+
+        assert_eq!(
+            outcome.disposition,
+            EnvFileCreationDisposition::AlreadyExists
+        );
+        assert_eq!(fs::read(env_path).unwrap(), b"API_TOKEN=keep-me\n");
+    }
+
+    #[test]
+    fn concurrent_ensure_has_one_created_winner() {
+        let project = tempdir().unwrap();
+        let root = project.path().to_path_buf();
+        let first_root = root.clone();
+        let second_root = root.clone();
+        let first = std::thread::spawn(move || ensure_project_env_file(&first_root, ".env"));
+        let second = std::thread::spawn(move || ensure_project_env_file(&second_root, ".env"));
+
+        let outcomes = [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.disposition == EnvFileCreationDisposition::Created)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    outcome.disposition == EnvFileCreationDisposition::AlreadyExists
+                })
+                .count(),
+            1
+        );
+        assert_eq!(fs::read(root.join(".env")).unwrap(), b"");
+    }
+
+    #[test]
+    fn rejects_existing_directory_at_env_target() {
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join("worker.env")).unwrap();
+
+        assert!(ensure_project_env_file(project.path(), "worker.env").is_err());
+        assert!(project.path().join("worker.env").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_private_env_file_and_rejects_existing_symlink() {
+        use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
+        use std::os::unix::net::UnixListener;
+
+        let project = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("outside.env");
+        fs::write(&outside_file, b"OUTSIDE=untouched\n").unwrap();
+        symlink(&outside_file, project.path().join("linked.env")).unwrap();
+
+        assert!(ensure_project_env_file(project.path(), "linked.env").is_err());
+        assert_eq!(fs::read(&outside_file).unwrap(), b"OUTSIDE=untouched\n");
+
+        let socket_path = project.path().join("socket.env");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        assert!(ensure_project_env_file(project.path(), "socket.env").is_err());
+        assert!(fs::symlink_metadata(socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+
+        ensure_project_env_file(project.path(), ".env").unwrap();
+        let mode = fs::metadata(project.path().join(".env"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    #[test]
+    fn ensure_outcome_serializes_without_env_payload() {
+        let project = tempdir().unwrap();
+        let outcome = ensure_project_env_file(project.path(), ".env").unwrap();
+
+        let serialized = serde_json::to_value(outcome).unwrap();
+        assert_eq!(serialized["disposition"], "created");
+        assert_eq!(serialized.as_object().unwrap().len(), 2);
+        assert!(serialized["path"].as_str().unwrap().ends_with("/.env"));
+    }
+
+    #[test]
+    fn ensure_command_creates_a_discoverable_empty_file() {
+        let project = tempdir().unwrap();
+        let outcome = ensure_env_file(
+            project.path().to_string_lossy().to_string(),
+            ".env".to_string(),
+        )
+        .unwrap();
+
+        let snapshot = load_project(project.path().to_string_lossy().to_string()).unwrap();
+        assert_eq!(outcome.disposition, EnvFileCreationDisposition::Created);
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].path, outcome.path);
+        assert!(snapshot.files[0].content.is_empty());
+        assert!(snapshot.files[0].entries.is_empty());
     }
 
     #[cfg(unix)]

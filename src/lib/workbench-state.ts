@@ -20,7 +20,13 @@ export type EditDraft = {
   revision: number;
 };
 
-export type OperationKind = 'load-project' | 'browse-project' | 'reveal-entry' | 'save-entry' | 'add-entry';
+export type OperationKind =
+  | 'load-project'
+  | 'browse-project'
+  | 'reveal-entry'
+  | 'save-entry'
+  | 'add-entry'
+  | 'create-file';
 
 export type PendingOperation = {
   generation: number;
@@ -175,4 +181,61 @@ export function inputTypeForKey(snapshot: ProjectSnapshot | null, key: string, e
 
 export function fileHasProtectedEntries(file: EnvFile | null): boolean {
   return Boolean(file?.entries.some((entry) => entry.shape.redactedByDefault));
+}
+
+export function createEnvFileDraftIssue(name: string, root: string, files: EnvFile[]): string | null {
+  if (!name) {
+    return 'Enter a filename.';
+  }
+  if (name.trim() !== name) {
+    return 'Remove leading or trailing spaces.';
+  }
+  if (/[<>:"/\\|?*\u0000-\u001f\u007f-\u009f]/.test(name)) {
+    return 'Enter one filename, not a path.';
+  }
+  if (name.endsWith('.') || hasWindowsReservedFileStem(name)) {
+    return 'Choose a portable filename that is valid on macOS, Linux, and Windows.';
+  }
+
+  const conventional =
+    name === '.env' ||
+    name.startsWith('.env.') ||
+    name === '.envrc' ||
+    name === '.flaskenv' ||
+    name.endsWith('.env');
+  if (!conventional) {
+    return 'Use .env, .env.local, .envrc, .flaskenv, or a name ending in .env.';
+  }
+  if (files.some((file) => isRootEnvFile(root, file, name))) {
+    return `${name} already exists in this project.`;
+  }
+
+  return null;
+}
+
+function hasWindowsReservedFileStem(name: string): boolean {
+  const stem = name.split('.')[0].trimEnd().toUpperCase();
+  return /^(?:CON|PRN|AUX|NUL|COM(?:[1-9]|[¹²³])|LPT(?:[1-9]|[¹²³])|CONIN\$|CONOUT\$)$/.test(stem);
+}
+
+export function suggestedRootEnvFileName(root: string, files: EnvFile[]): string {
+  const existingNames = new Set(
+    files.filter((file) => isRootEnvFile(root, file, file.name)).map((file) => file.name)
+  );
+  for (const candidate of ['.env', '.env.local', '.env.development', '.env.test', '.env.production']) {
+    if (!existingNames.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  let suffix = 2;
+  while (existingNames.has(`.env.local-${suffix}`)) {
+    suffix += 1;
+  }
+  return `.env.local-${suffix}`;
+}
+
+function isRootEnvFile(root: string, file: EnvFile, name: string): boolean {
+  const normalizedRoot = root.replace(/[\\/]+$/, '');
+  return file.path === `${normalizedRoot}/${name}` || file.path === `${normalizedRoot}\\${name}`;
 }

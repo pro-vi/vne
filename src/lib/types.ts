@@ -7,6 +7,13 @@ export interface ProjectSnapshot {
   findings: EnvFinding[];
 }
 
+export type EnvFileCreationDisposition = 'created' | 'alreadyExists';
+
+export interface EnsureEnvFileOutcome {
+  disposition: EnvFileCreationDisposition;
+  path: string;
+}
+
 export interface EnvFile {
   path: string;
   name: string;

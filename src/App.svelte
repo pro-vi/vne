@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import {
     AlertTriangle,
     CheckCircle2,
@@ -15,6 +16,7 @@
   } from '@lucide/svelte';
   import {
     addEnvKey,
+    ensureEnvFile,
     initialProjectPath,
     isTauriRuntime,
     loadProject,
@@ -26,6 +28,7 @@
   import { isEntryValueHidden, keyStatus, statusLabel } from './lib/summary';
   import {
     canApplyTargetedOperation,
+    createEnvFileDraftIssue,
     createEditDraft,
     createEntryRef,
     createPendingOperation,
@@ -41,6 +44,7 @@
     revealedValueFor,
     sameEntryRef,
     setDuplicateSaveConfirmation,
+    suggestedRootEnvFileName,
     updateEditDraft,
     type DuplicateSaveConfirmations,
     type EditDraft,
@@ -73,6 +77,9 @@
   let editorDraft: EditDraft | null = null;
   let filter = '';
   let filterInput: HTMLInputElement | null = null;
+  let createFileDialog: HTMLDialogElement | null = null;
+  let createFileInput: HTMLInputElement | null = null;
+  let createFileReturnTarget: HTMLElement | null = null;
   let addKeyToggleButton: HTMLButtonElement | null = null;
   let reloadButton: HTMLButtonElement | null = null;
   let reviewToggleButton: HTMLButtonElement | null = null;
@@ -81,6 +88,9 @@
   let viewportWidth = 1180;
   let showRaw = false;
   let showAddKey = false;
+  let createFileOpen = false;
+  let createFileName = '.env';
+  let createFileError = '';
   let reviewRequested = false;
   let wasReviewModalOpen = false;
   let newEnvKey = '';
@@ -140,6 +150,8 @@
       newEnvValue.trim().length > 0 &&
       newEnvDuplicateLines.length === 0
   );
+  $: createFileIssue = createEnvFileDraftIssue(createFileName, snapshot?.root ?? '', snapshot?.files ?? []);
+  $: canCreateFile = Boolean(isTauriRuntime() && snapshot && !createFileIssue);
   $: findings = snapshot?.findings ?? [];
   $: missingKeyFindings = findings.filter(isAddMissingKeyFinding);
   $: advisoryFindings = findings.filter((finding) => !isAddMissingKeyFinding(finding));
@@ -195,6 +207,7 @@
   }
 
   function applyLoadedProject(loaded: ProjectSnapshot): void {
+    dismissCreateFileDialog(false);
     showRaw = false;
     showAddKey = false;
     reviewRequested = false;
@@ -305,6 +318,158 @@
     }
   }
 
+  async function openCreateFileDialog(trigger: HTMLElement): Promise<void> {
+    if (!snapshot || pendingOperation || createFileOpen || createFileDialog?.open || !isTauriRuntime()) {
+      return;
+    }
+
+    closeReview(false);
+    createFileReturnTarget = trigger;
+    createFileName = suggestedRootEnvFileName(snapshot.root, snapshot.files);
+    createFileError = '';
+    try {
+      if (!createFileDialog) {
+        throw new Error('The create-file dialog is not available.');
+      }
+      createFileDialog.showModal();
+      createFileOpen = true;
+      await focusCreateFileName(true);
+    } catch (error) {
+      if (createFileDialog?.open) {
+        createFileDialog.close();
+      }
+      createFileOpen = false;
+      notice = { kind: 'error', message: `Could not open the create-file dialog: ${errorMessage(error)}` };
+    }
+  }
+
+  async function focusCreateFileName(select: boolean): Promise<void> {
+    await tick();
+    if (!createFileDialog?.open) {
+      return;
+    }
+    createFileInput?.focus({ preventScroll: true });
+    if (select) {
+      createFileInput?.select();
+    }
+  }
+
+  function closeCreateFileDialog(restoreFocus = true): void {
+    if (pendingOperation?.kind === 'create-file') {
+      return;
+    }
+    dismissCreateFileDialog(restoreFocus);
+  }
+
+  function dismissCreateFileDialog(restoreFocus: boolean): void {
+    const returnTarget = createFileReturnTarget;
+    if (createFileDialog?.open) {
+      createFileDialog.close();
+    }
+    createFileOpen = false;
+    createFileError = '';
+    createFileReturnTarget = null;
+
+    if (restoreFocus) {
+      window.requestAnimationFrame(() => {
+        const target = [
+          returnTarget,
+          document.querySelector<HTMLButtonElement>('.file-tabs button.active'),
+          reloadButton
+        ].find((candidate): candidate is HTMLElement => Boolean(candidate?.isConnected && !candidate.closest('[inert]')));
+        target?.focus({ preventScroll: true });
+      });
+    }
+  }
+
+  function cancelCreateFileDialog(event: Event): void {
+    event.preventDefault();
+    closeCreateFileDialog();
+  }
+
+  function updateCreateFileName(value: string): void {
+    if (pendingOperation?.kind === 'create-file') {
+      return;
+    }
+    createFileName = value;
+    createFileError = '';
+  }
+
+  async function createEnvFile(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (!snapshot || createFileIssue || pendingOperation || !isTauriRuntime()) {
+      return;
+    }
+    if (!confirmDiscardedWork('file')) {
+      return;
+    }
+
+    const root = snapshot.root;
+    const name = createFileName;
+    const operation = beginOperation('create-file', `Creating ${name}...`);
+    if (!operation) {
+      return;
+    }
+    createFileError = '';
+
+    try {
+      const outcome = await ensureEnvFile(root, name);
+      if (!isCurrentOperation(pendingOperation, operation)) {
+        return;
+      }
+
+      const completedAction = outcome.disposition === 'created' ? `${name} was created` : `${name} already exists`;
+      notice = { kind: 'loading', message: `${completedAction}. Refreshing the project...` };
+
+      let loaded: ProjectSnapshot;
+      try {
+        loaded = await loadProject(root);
+      } catch (error) {
+        if (isCurrentOperation(pendingOperation, operation)) {
+          const message = `${completedAction}, but vne could not refresh the project: ${errorMessage(error)}`;
+          createFileError = message;
+          settleOperation(operation, { kind: 'error', message });
+          await focusCreateFileName(false);
+        }
+        return;
+      }
+
+      if (!isCurrentOperation(pendingOperation, operation)) {
+        return;
+      }
+
+      const loadedFile = loaded.files.find((file) => file.path === outcome.path);
+      if (!loadedFile) {
+        applySnapshotSelection(loaded, selectedPath, '', '');
+        const message = `${completedAction}, but it is not available in the refreshed project.`;
+        createFileError = message;
+        settleOperation(operation, { kind: 'error', message });
+        await focusCreateFileName(false);
+        return;
+      }
+
+      showRaw = false;
+      showAddKey = false;
+      filter = '';
+      newEnvKey = '';
+      newEnvValue = '';
+      showNewEnvValue = false;
+      applySnapshotSelection(loaded, loadedFile.path, '', '');
+      settleOperation(operation, {
+        kind: 'success',
+        message: outcome.disposition === 'created' ? `Created ${name}.` : `${name} already existed; opened it.`
+      });
+      dismissCreateFileDialog(false);
+      await tick();
+      document.querySelector<HTMLButtonElement>('.file-tabs button.active')?.focus({ preventScroll: true });
+    } catch (error) {
+      const message = errorMessage(error);
+      createFileError = message;
+      settleOperation(operation, { kind: 'error', message });
+      await focusCreateFileName(true);
+    }
+  }
+
   function chooseFile(file: EnvFile): void {
     if (pendingOperation || file.path === selectedPath || !confirmDiscardedWork('file')) {
       return;
@@ -384,6 +549,10 @@
     const target = event.target;
     const isEditing =
       target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+
+    if (createFileOpen) {
+      return;
+    }
 
     if (event.key === 'Escape' && reviewOpen) {
       event.preventDefault();
@@ -1082,22 +1251,37 @@
     <section class="editor" aria-label="Environment workspace" inert={reviewModalOpen} aria-busy={isBusy}>
       {#if snapshot && snapshot.files.length > 0}
         <div class="workspace-bar">
-          <nav class="file-tabs" aria-label="Environment files">
-            {#each snapshot.files as file}
-              <button
-                class:active={file.path === selectedPath}
-                type="button"
-                aria-pressed={file.path === selectedPath}
-                aria-disabled={isBusy}
-                title={file.path}
-                onclick={() => chooseFile(file)}
-              >
-                <span>{file.name}</span>
-                <span class="tab-count">{file.entries.length}</span>
-                {#if file.duplicateKeys.length > 0}<span class="tab-alert" aria-label={`${file.duplicateKeys.length} duplicate keys`}></span>{/if}
-              </button>
-            {/each}
-          </nav>
+          <div class="file-picker">
+            <nav class="file-tabs" aria-label="Environment files">
+              {#each snapshot.files as file}
+                <button
+                  class:active={file.path === selectedPath}
+                  type="button"
+                  aria-pressed={file.path === selectedPath}
+                  aria-disabled={isBusy}
+                  title={file.path}
+                  onclick={() => chooseFile(file)}
+                >
+                  <span>{file.name}</span>
+                  <span class="tab-count">{file.entries.length}</span>
+                  {#if file.duplicateKeys.length > 0}<span class="tab-alert" aria-label={`${file.duplicateKeys.length} duplicate keys`}></span>{/if}
+                </button>
+              {/each}
+            </nav>
+            <button
+              type="button"
+              class="toolbar-action new-file-action"
+              aria-haspopup="dialog"
+              aria-controls="create-env-file-dialog"
+              aria-disabled={isBusy}
+              disabled={!isTauriRuntime()}
+              title={isTauriRuntime() ? 'Create an empty env file in this project' : 'File creation requires the desktop app'}
+              onclick={(event) => void openCreateFileDialog(event.currentTarget)}
+            >
+              <Plus size={14} aria-hidden="true" />
+              <span>New file</span>
+            </button>
+          </div>
 
           <label class="search-field">
             <Search size={14} aria-hidden="true" />
@@ -1384,7 +1568,7 @@
           <code>{projectPath.trim() || 'selected folder'}</code>
           <p>Checking conventional filenames and env references in project configuration.</p>
         </section>
-      {:else if notice.kind === 'error'}
+      {:else if notice.kind === 'error' && !snapshot}
         <section class="project-state error" role="alert">
           <span class="state-icon"><AlertTriangle size={24} aria-hidden="true" /></span>
           <p class="eyebrow">Project could not be opened</p>
@@ -1407,9 +1591,21 @@
           <p class="eyebrow">Folder scanned</p>
           <h1>No environment files in {projectLabel}</h1>
           <code>{projectRoot}</code>
-          <p>vne checked common files such as <strong>.env</strong>, <strong>.env.local</strong>, and <strong>*.env</strong>, plus env files referenced by package and Compose configuration.</p>
+          <p>Create a conventional env file in the project root, or choose another folder.</p>
           <div class="state-actions">
-            <button type="button" class="state-action primary" disabled={!isTauriRuntime()} aria-disabled={isBusy} onclick={() => void browseProject()}>
+            <button
+              type="button"
+              class="state-action primary"
+              disabled={!isTauriRuntime()}
+              aria-disabled={isBusy}
+              aria-haspopup="dialog"
+              aria-controls="create-env-file-dialog"
+              onclick={(event) => void openCreateFileDialog(event.currentTarget)}
+            >
+              <Plus size={15} aria-hidden="true" />
+              Create env file
+            </button>
+            <button type="button" class="state-action" disabled={!isTauriRuntime()} aria-disabled={isBusy} onclick={() => void browseProject()}>
               <FolderOpen size={15} aria-hidden="true" />
               Choose another folder
             </button>
@@ -1559,6 +1755,81 @@
       </aside>
     {/if}
   </div>
+
+  <dialog
+    bind:this={createFileDialog}
+    id="create-env-file-dialog"
+    class="create-file-dialog"
+    aria-labelledby="create-file-title"
+    aria-describedby="create-file-summary"
+    oncancel={cancelCreateFileDialog}
+  >
+    <form class="create-file-form" onsubmit={(event) => void createEnvFile(event)}>
+      <header>
+        <span class="dialog-icon"><FileKey2 size={20} aria-hidden="true" /></span>
+        <div>
+          <p class="eyebrow">Project file</p>
+          <h2 id="create-file-title">Create env file</h2>
+        </div>
+      </header>
+
+      <p id="create-file-summary">Create an empty file, then add its first key in the workbench.</p>
+      <label for="create-file-name">File name</label>
+      <input
+        bind:this={createFileInput}
+        id="create-file-name"
+        type="text"
+        value={createFileName}
+        autocomplete="off"
+        spellcheck="false"
+        readonly={pendingOperation?.kind === 'create-file'}
+        aria-invalid={createFileIssue || createFileError ? 'true' : undefined}
+        aria-describedby="create-file-location create-file-feedback"
+        oninput={(event) => updateCreateFileName(event.currentTarget.value)}
+      />
+      <p id="create-file-location" class="create-file-location">
+        Created in <code>{snapshot?.root ?? projectRoot}</code>
+      </p>
+
+      {#if createFileError}
+        <p id="create-file-feedback" class="create-file-feedback error" role="alert">{createFileError}</p>
+      {:else if createFileIssue}
+        <p id="create-file-feedback" class="create-file-feedback" role="status">{createFileIssue}</p>
+      {:else if pendingOperation?.kind === 'create-file'}
+        <p id="create-file-feedback" class="create-file-feedback" role="status">
+          <LoaderCircle class="spin" size={14} aria-hidden="true" />
+          {notice.message}
+        </p>
+      {:else}
+        <p id="create-file-feedback" class="create-file-feedback">Try .env, .env.local, .envrc, .flaskenv, or worker.env.</p>
+      {/if}
+
+      <footer class="create-file-actions">
+        <button
+          type="button"
+          class="compact-action"
+          aria-disabled={pendingOperation?.kind === 'create-file'}
+          onclick={() => closeCreateFileDialog()}
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          class="compact-action primary"
+          disabled={!canCreateFile}
+          aria-disabled={pendingOperation?.kind === 'create-file'}
+        >
+          {#if pendingOperation?.kind === 'create-file'}
+            <LoaderCircle class="spin" size={14} aria-hidden="true" />
+            Creating…
+          {:else}
+            <Plus size={14} aria-hidden="true" />
+            Create file
+          {/if}
+        </button>
+      </footer>
+    </form>
+  </dialog>
 
   <footer
     class="status-strip"

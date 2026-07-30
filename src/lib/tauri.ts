@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { sampleProject } from './sample';
-import type { ProjectSnapshot } from './types';
+import type { EnsureEnvFileOutcome, ProjectSnapshot } from './types';
 
 export function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
@@ -64,6 +64,16 @@ export async function addEnvKey(root: string, path: string, key: string, value: 
   return invoke<ProjectSnapshot>('add_env_key', { root, path, key, value });
 }
 
+export async function ensureEnvFile(root: string, name: string): Promise<EnsureEnvFileOutcome> {
+  if (!isTauriRuntime()) {
+    await delay(180);
+    throw new Error('Creating env files is available in the Tauri desktop app. Browser preview uses read-only sample data.');
+  }
+
+  const outcome = await invoke<unknown>('ensure_env_file', { root, name });
+  return parseEnsureEnvFileOutcome(outcome);
+}
+
 export async function pickProjectDirectory(defaultPath: string): Promise<string | null> {
   if (!isTauriRuntime()) {
     return null;
@@ -81,6 +91,19 @@ export async function pickProjectDirectory(defaultPath: string): Promise<string 
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+export function parseEnsureEnvFileOutcome(value: unknown): EnsureEnvFileOutcome {
+  if (!value || typeof value !== 'object' || !('disposition' in value) || !('path' in value)) {
+    throw new Error('The native create-file response was malformed.');
+  }
+
+  const { disposition, path } = value;
+  if ((disposition !== 'created' && disposition !== 'alreadyExists') || typeof path !== 'string' || !path) {
+    throw new Error('The native create-file response was malformed.');
+  }
+
+  return { disposition, path };
 }
 
 function redactProject(snapshot: ProjectSnapshot): ProjectSnapshot {

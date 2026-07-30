@@ -274,8 +274,16 @@ p {
   background: var(--paper);
 }
 
+.file-picker {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
 .file-tabs {
   min-width: 0;
+  flex: 1;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -283,6 +291,13 @@ p {
   padding-bottom: 2px;
   scrollbar-width: thin;
   scrollbar-color: var(--rule) transparent;
+}
+
+.new-file-action {
+  min-height: 30px;
+  height: 30px;
+  flex: none;
+  padding-inline: 8px;
 }
 
 .file-tabs::-webkit-scrollbar {
@@ -925,6 +940,126 @@ pre {
   margin-top: 10px;
 }
 
+.create-file-dialog {
+  width: min(420px, calc(100vw - 32px));
+  max-width: none;
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 0;
+  overflow: auto;
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  background: var(--paper-raised);
+  color: var(--ink);
+  box-shadow: 0 24px 80px oklch(0.06 0.004 100 / 0.48);
+}
+
+.create-file-dialog::backdrop {
+  background: oklch(0.06 0.004 100 / 0.46);
+  backdrop-filter: blur(1px);
+}
+
+.create-file-form {
+  display: grid;
+  gap: 9px;
+  padding: 18px;
+}
+
+.create-file-form header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 2px;
+}
+
+.create-file-form h2 {
+  margin: 1px 0 0;
+  color: var(--ink);
+  font-size: 17px;
+  font-weight: 680;
+  letter-spacing: -0.015em;
+}
+
+.create-file-form > p,
+.create-file-form label {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.create-file-form label {
+  margin-top: 5px;
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.dialog-icon {
+  width: 38px;
+  height: 38px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper-inset);
+  color: var(--info);
+}
+
+.create-file-form input {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  outline: none;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.create-file-form input:focus {
+  border-color: var(--info);
+  box-shadow: 0 0 0 2px oklch(0.78 0.085 205 / 0.16);
+}
+
+.create-file-form input[aria-invalid="true"] {
+  border-color: color-mix(in oklch, var(--danger) 65%, var(--rule));
+}
+
+.create-file-location {
+  min-width: 0;
+  color: var(--dim) !important;
+}
+
+.create-file-location code {
+  overflow-wrap: anywhere;
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+}
+
+.create-file-feedback {
+  min-height: 20px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim) !important;
+}
+
+.create-file-feedback.error {
+  color: var(--danger) !important;
+}
+
+.create-file-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 5px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule-soft);
+}
+
 .review-drawer {
   min-width: 0;
   min-height: 0;
@@ -1246,7 +1381,7 @@ pre {
     grid-template-columns: minmax(0, 1fr) auto;
   }
 
-  .file-tabs {
+  .file-picker {
     grid-column: 1 / -1;
   }
 
@@ -1312,6 +1447,15 @@ pre {
 
   .line-edit-actions .compact-action,
   .state-actions .state-action {
+    width: 100%;
+  }
+
+  .create-file-actions {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+
+  .create-file-actions .compact-action {
     width: 100%;
   }
 

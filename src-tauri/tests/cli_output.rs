@@ -74,6 +74,161 @@ fn collect_strings<'a>(value: &'a Value, output: &mut Vec<&'a str>) {
 }
 
 #[test]
+fn create_auto_json_is_empty_idempotent_and_payload_free() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let args = ["create".to_string(), env_file.display().to_string()];
+
+    let created = run_vne(args.clone());
+    assert_eq!(created.status.code(), Some(0));
+    assert!(created.stderr.is_empty());
+    let created_json: Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(created_json["disposition"], "created");
+    assert_eq!(
+        created_json["path"],
+        env_file.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(created_json.as_object().unwrap().len(), 2);
+    assert_eq!(fs::read(&env_file).unwrap(), b"");
+
+    let retried = run_vne(args);
+    assert_eq!(retried.status.code(), Some(0));
+    assert!(retried.stderr.is_empty());
+    let retried_json: Value = serde_json::from_slice(&retried.stdout).unwrap();
+    assert_eq!(retried_json["disposition"], "alreadyExists");
+    assert_eq!(retried_json.as_object().unwrap().len(), 2);
+    assert_eq!(fs::read(&env_file).unwrap(), b"");
+}
+
+#[test]
+fn create_text_reports_existing_file_without_overwriting_it() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join("worker.env");
+    write(&env_file, ORDINARY_SENTINEL);
+
+    let output = run_vne([
+        "create".to_string(),
+        env_file.display().to_string(),
+        "--text".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "already exists {}\n",
+            env_file.canonicalize().unwrap().display()
+        )
+    );
+    assert_eq!(fs::read_to_string(env_file).unwrap(), ORDINARY_SENTINEL);
+}
+
+#[test]
+fn create_rejects_invalid_names_and_missing_parents_without_stdout() {
+    let dir = tempdir().unwrap();
+    let invalid_name = dir.path().join("notes.txt");
+    let missing_parent = dir.path().join("missing").join(".env");
+
+    for file in [invalid_name, missing_parent] {
+        let output = run_vne([
+            "create".to_string(),
+            file.display().to_string(),
+            "--json".to_string(),
+        ]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+        assert!(!file.exists());
+    }
+}
+
+#[test]
+fn create_rejects_a_trailing_separator_or_dot_component() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    for target in [
+        format!("{}/", env_file.display()),
+        format!("{}/.", env_file.display()),
+        format!("{}/..", env_file.display()),
+    ] {
+        let output = run_vne(["create", &target, "--json"]);
+
+        assert_eq!(output.status.code(), Some(2), "{target}");
+        assert!(output.stdout.is_empty(), "{target}");
+        assert!(!output.stderr.is_empty(), "{target}");
+    }
+    assert!(!env_file.exists());
+}
+
+#[test]
+fn create_reports_the_canonical_path_for_a_case_variant() {
+    let dir = tempdir().unwrap();
+    let actual_file = dir.path().join(".env.local");
+    let requested_file = dir.path().join(".env.Local");
+    write(&actual_file, ORDINARY_SENTINEL);
+    let names_alias = requested_file.exists();
+
+    let output = run_vne([
+        "create".to_string(),
+        requested_file.display().to_string(),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["disposition"],
+        if names_alias {
+            "alreadyExists"
+        } else {
+            "created"
+        }
+    );
+    assert_eq!(
+        json["path"],
+        if names_alias {
+            actual_file.canonicalize().unwrap()
+        } else {
+            requested_file.canonicalize().unwrap()
+        }
+        .display()
+        .to_string()
+    );
+    assert_eq!(fs::read_to_string(actual_file).unwrap(), ORDINARY_SENTINEL);
+}
+
+#[cfg(unix)]
+#[test]
+fn create_retry_converges_after_post_create_output_failure() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let args = vec![
+        "create".to_string(),
+        env_file.display().to_string(),
+        "--json".to_string(),
+    ];
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vne"))
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("vne process should start");
+    drop(child.stdout.take());
+    let failed_output = child.wait_with_output().expect("vne process should finish");
+
+    assert_eq!(failed_output.status.code(), Some(2));
+    assert_eq!(fs::read(&env_file).unwrap(), b"");
+
+    let retry = run_vne(args);
+    assert_eq!(retry.status.code(), Some(0));
+    let retry_json: Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(retry_json["disposition"], "alreadyExists");
+    assert_eq!(fs::read(&env_file).unwrap(), b"");
+}
+
+#[test]
 fn check_json_is_payload_free_by_default() {
     let dir = tempdir().unwrap();
     let actual = dir.path().join(".env");

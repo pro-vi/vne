@@ -12,8 +12,8 @@
 
 - Rust parser and writer: trusted local code that reads and writes files selected by the user.
 - Svelte UI: trusted local code that renders parsed values and sends explicit commands to the Tauri backend. Default snapshots do not include raw secret-like values in parsed entries; Reveal fetches only one selected key occurrence into the local webview.
-- Tauri command boundary: only local UI invokes project scan, value save, and value-required missing-key insertion.
-- CLI stdout and stderr: output may be retained by shells, CI, pipes, or agent transcripts. Structured JSON withholds env payloads by default; `--values` explicitly opts into classifier-approved entry values while comments and raw content remain withheld.
+- Tauri command boundary: only local UI invokes project scan, root-level env-file creation, value save, and value-required missing-key insertion.
+- CLI stdout and stderr: output may be retained by shells, CI, pipes, or agent transcripts. Structured JSON withholds env payloads by default; `--values` explicitly opts into classifier-approved entry values while comments and raw content remain withheld. `create` emits only a disposition and absolute path.
 - Native dialog: used only to pick a local directory.
 - Network: not part of the product path for env contents.
 
@@ -32,11 +32,13 @@
 - Save operations update one selected key occurrence at a time, use atomic write with permission preservation where practical, and return a fresh project snapshot so diagnostics do not stay stale after writes.
 - Duplicate-key saves require an explicit "this occurrence only" choice in the UI before the save button is enabled.
 - Missing-key insertion requires an explicit non-empty value; it refuses duplicate, invalid, or empty keys and returns a fresh project snapshot.
+- Env-file creation accepts one validated root-level filename in the desktop app. The shared Rust primitive canonicalizes the root, derives the target itself, and uses exclusive creation. It creates exactly zero bytes, uses owner-private permissions on Unix, never follows a final-component symlink, never truncates an existing regular file, and reports retries as `alreadyExists`.
+- Creation and project refresh are separate operations. A refresh failure after successful creation is reported as “created, refresh failed” so retrying cannot accidentally overwrite or obscure the durable outcome.
 - Missing/new-key form protection derives from Rust-produced key-shape metadata. Unknown or conflicting keys default to password input until the local user explicitly chooses Show; the Svelte UI does not maintain a second secret-name registry.
 - Write commands resolve the active project root and reject file paths outside that root, with regression tests for direct symlink escapes and nested symlink directory escapes.
 - Env files referenced by Docker Compose are canonicalized and ignored when they resolve outside the active project root.
 - Parser/write regression tests include CRLF, UTF-8 BOM, empty values, inline comments, hashes inside values, quoted values, multiline values, invalid keys, duplicates, quote-requiring replacements, and the public `fixtures/adversarial-dotenv` corpus.
-- Browser preview uses sample data and cannot save or add missing keys.
+- Browser preview uses sample data and cannot create files, save, or add missing keys.
 - Tauri CSP is enabled with local-only defaults, IPC connect sources, and no `unsafe-inline` or `unsafe-eval` allowance.
 - The app has no accounts, telemetry, sync, hosted validation, or cloud calls for env data.
 - `scripts/security-check.sh` fails on obvious network client APIs, telemetry SDK imports, raw logging calls, updater surfaces, broad dialog permissions, non-local Tauri dev URLs, and missing, null, or unsafe Tauri CSP.
@@ -56,15 +58,15 @@
 - `format --dry-run` intentionally writes the complete raw file to stdout and warns when piped. It is for explicit local inspection, not agent or transcript-safe diagnostics.
 - Raw preview remains disabled whenever the selected file has classified redacted entries, independent of whether one entry was explicitly revealed. Secret-like comments and malformed lines are withheld by heuristic; unknown sensitive text without recognizable markers can still appear in desktop raw preview for files with no classified sensitive entry.
 - A malicious local project can use misleading key names or comments; `vne` treats env files as data and does not execute them.
-- Active project root checks reduce accidental path escape, but they are not a substitute for operating-system file permissions or user caution when opening untrusted projects.
-- Screenshot or browser-inspection proof is still unavailable in this session because only navigation, not screenshot or DOM inspection, was exposed.
+- Active project root checks and root-plus-basename creation reduce accidental path escape, but they are not a substitute for operating-system file permissions or user caution when opening untrusted projects.
+- Browser-preview screenshots and DOM checks cover responsive layout and modal behavior; native runtime checks remain necessary for filesystem mutation and platform-webview behavior.
 - The security check is intentionally narrow. It is a regression harness for obvious source/config surfaces, not a dependency sandbox, runtime network monitor, CSP verifier, or proof that all transitive dependencies are inert.
 
 ## Release Checklist Before Public Distribution
 
 - Re-run source scans for network clients, telemetry SDKs, and logging of raw values.
 - Run `scripts/security-check.sh` and review any false-positive adjustment.
-- Re-check path-scope behavior around write commands after any command-surface change.
+- Re-check path-scope, symlink, idempotency, and no-clobber behavior around write commands after any command-surface change.
 - Re-review CSP after any asset, protocol, iframe, style, or network-surface change.
 - Verify raw values are absent from structured logs and error paths.
 - Verify macOS signing/notarization choices with explicit user approval.

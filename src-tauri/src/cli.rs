@@ -1,7 +1,8 @@
 use crate::{
-    append_env_key_result, atomic_write_preserving_permissions, compare_env_files, parse_env_file,
-    redact_env_file_values_only, redact_snapshot_values_only, withhold_all_env_file_payloads,
-    withhold_all_snapshot_payloads, EnvComparison, EnvFile, ProjectSnapshot,
+    append_env_key_result, atomic_write_preserving_permissions, compare_env_files,
+    ensure_project_env_file, parse_env_file, redact_env_file_values_only,
+    redact_snapshot_values_only, withhold_all_env_file_payloads, withhold_all_snapshot_payloads,
+    EnvComparison, EnvFile, EnvFileCreationDisposition, ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
@@ -12,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
 
-const CLI_COMMANDS: &[&str] = &["check", "inspect", "format", "add", "help", "-h", "--help"];
+const CLI_COMMANDS: &[&str] = &[
+    "check", "inspect", "format", "add", "create", "help", "-h", "--help",
+];
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -37,6 +40,10 @@ enum Command {
         value: AddValue,
         output: OutputFormat,
         values: ValueOutput,
+    },
+    Create {
+        file: PathBuf,
+        output: OutputFormat,
     },
     Help(HelpTopic),
 }
@@ -68,6 +75,7 @@ enum HelpTopic {
     Check,
     Inspect,
     Add,
+    Create,
     Format,
 }
 
@@ -158,6 +166,7 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             let value = read_add_value(&key, value)?;
             run_add(&file, &key, &value, output, values)
         }
+        Command::Create { file, output } => run_create(&file, output),
         Command::Help(_) => Ok(false),
     }
 }
@@ -333,6 +342,45 @@ fn run_add(
     Ok(false)
 }
 
+fn run_create(file: &Path, output: OutputFormat) -> Result<bool, Box<dyn std::error::Error>> {
+    let raw_path = file.to_string_lossy();
+    let terminal_component = raw_path.rsplit(['/', '\\']).next().unwrap_or_default();
+    if terminal_component.is_empty() || matches!(terminal_component, "." | "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "create requires a file path ending in an env filename",
+        )
+        .into());
+    }
+
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "create requires an env file path with a UTF-8 filename",
+            )
+        })?;
+    let parent = file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let outcome = ensure_project_env_file(parent, name)?;
+
+    if output.wants_json() {
+        print_json(&outcome, output)?;
+    } else {
+        let action = match outcome.disposition {
+            EnvFileCreationDisposition::Created => "created",
+            EnvFileCreationDisposition::AlreadyExists => "already exists",
+        };
+        stdout_line(format_args!("{action} {}", outcome.path))?;
+    }
+
+    Ok(false)
+}
+
 fn project_snapshot_for_output(
     snapshot: ProjectSnapshot,
     value_output: ValueOutput,
@@ -456,6 +504,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, ParseEr
         "inspect" => parse_inspect_args(args),
         "format" => parse_format_args(args),
         "add" => parse_add_args(args),
+        "create" => parse_create_args(args),
         _ => Err(ParseError::new(
             HelpTopic::General,
             format!("unknown command `{command}`"),
@@ -653,6 +702,39 @@ fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, ParseEr
     })
 }
 
+fn parse_create_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
+    let mut file = None;
+    let mut output = OutputFormat::Auto;
+
+    for arg in args {
+        match arg.as_str() {
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Create)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Create)?,
+            "--pretty" => {
+                set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Create)?
+            }
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Create)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Create,
+                    format!("unknown create option `{arg}`"),
+                ));
+            }
+            _ if file.is_none() => file = Some(PathBuf::from(arg)),
+            _ => {
+                return Err(ParseError::new(
+                    HelpTopic::Create,
+                    format!("unexpected create argument `{arg}`"),
+                ));
+            }
+        }
+    }
+
+    let file =
+        file.ok_or_else(|| ParseError::new(HelpTopic::Create, "create requires an env file path"))?;
+    Ok(Command::Create { file, output })
+}
+
 fn set_output_format(
     target: &mut OutputFormat,
     value: OutputFormat,
@@ -697,7 +779,7 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n"
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n"
         }
         HelpTopic::Check => {
             "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
@@ -707,6 +789,9 @@ fn usage_text(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::Add => {
             "vne add - append one non-duplicate env key while preserving file formatting\n\nUSAGE:\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --value <VALUE>  Read the new value from a flag\n  --stdin          Read the new value from stdin\n  --prompt         Read the new value from an interactive hidden prompt\n  --text           Force human text output\n  --json           Emit compact one-line JSON; payloads are withheld by default\n  --pretty         Emit formatted JSON; payloads are withheld by default\n  --values         Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne add .env FEATURE_FLAG=true --json\n  printf '%s' 'sk-local' | vne add .env OPENAI_API_KEY --stdin --json\n  vne add .env OPENAI_API_KEY --prompt\n"
+        }
+        HelpTopic::Create => {
+            "vne create - ensure one empty env file exists without overwriting it\n\nUSAGE:\n  vne create <file> [--text|--json|--pretty]\n\nBEHAVIOR:\n  The parent directory must already exist.\n  The filename must look like .env, .env.local, .envrc, .flaskenv, or worker.env.\n  A new file is empty and private to its owner on Unix.\n  An existing regular file is left unchanged and reported as alreadyExists.\n  Symlinks, directories, missing parent directories, and overwrite flags are rejected.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit a compact disposition and absolute path\n  --pretty  Emit a formatted disposition and absolute path\n\nEXAMPLES:\n  vne create .env\n  vne create config.env --json\n  vne create /path/to/project/.env.local --pretty\n"
         }
         HelpTopic::Format => {
             "vne format - print the parsed env file without rewriting it\n\nWARNING:\n  This command emits raw env content. It does not apply JSON payload withholding or classified redaction.\n\nUSAGE:\n  vne format <file> --dry-run\n\nOPTIONS:\n  --dry-run  Required; print the current raw file content instead of writing\n\nEXAMPLE:\n  vne format .env --dry-run\n"
@@ -745,6 +830,10 @@ mod tests {
     #[test]
     fn identifies_cli_invocations_by_explicit_command() {
         assert!(is_cli_invocation(&["add".to_string(), ".env".to_string()]));
+        assert!(is_cli_invocation(&[
+            "create".to_string(),
+            ".env".to_string()
+        ]));
         assert!(is_cli_invocation(&["--help".to_string()]));
         assert!(!is_cli_invocation(&[".".to_string()]));
         assert!(!is_cli_invocation(&["fixtures/demo".to_string()]));
@@ -785,6 +874,39 @@ mod tests {
                 values: ValueOutput::Hidden,
             })
         );
+    }
+
+    #[test]
+    fn parses_create_with_stable_output_modes() {
+        assert_eq!(
+            parse(&["create", ".env"]),
+            Ok(Command::Create {
+                file: PathBuf::from(".env"),
+                output: OutputFormat::Auto,
+            })
+        );
+        assert_eq!(
+            parse(&["create", "project/.env.local", "--json"]),
+            Ok(Command::Create {
+                file: PathBuf::from("project/.env.local"),
+                output: OutputFormat::Json,
+            })
+        );
+        assert_eq!(
+            parse(&["create", "worker.env", "--pretty"]),
+            Ok(Command::Create {
+                file: PathBuf::from("worker.env"),
+                output: OutputFormat::PrettyJson,
+            })
+        );
+    }
+
+    #[test]
+    fn create_parser_rejects_missing_extra_and_conflicting_arguments() {
+        assert!(parse(&["create"]).is_err());
+        assert!(parse(&["create", ".env", ".env.local"]).is_err());
+        assert!(parse(&["create", ".env", "--force"]).is_err());
+        assert!(parse(&["create", ".env", "--json", "--text"]).is_err());
     }
 
     #[test]
@@ -879,6 +1001,10 @@ mod tests {
     fn parses_command_specific_help() {
         assert_eq!(parse(&["add", "--help"]), Ok(Command::Help(HelpTopic::Add)));
         assert_eq!(
+            parse(&["create", "--help"]),
+            Ok(Command::Help(HelpTopic::Create))
+        );
+        assert_eq!(
             parse(&["check", "--help"]),
             Ok(Command::Help(HelpTopic::Check))
         );
@@ -896,6 +1022,10 @@ mod tests {
         assert!(general.contains("JSON withholds all env values"));
         assert!(general.contains("comments and raw content stay withheld"));
         assert!(usage_text(HelpTopic::Format).contains("emits raw env content"));
+        let create = usage_text(HelpTopic::Create);
+        assert!(create.contains("without overwriting"));
+        assert!(create.contains("existing regular file is left unchanged"));
+        assert!(create.contains("Symlinks"));
     }
 
     #[test]

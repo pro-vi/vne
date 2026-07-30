@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { sampleProject } from './sample';
 import {
   canApplyTargetedOperation,
+  createEnvFileDraftIssue,
   createEditDraft,
   createEntryRef,
   createPendingOperation,
@@ -15,6 +16,7 @@ import {
   resolveFindingTarget,
   sameEntryRef,
   setDuplicateSaveConfirmation,
+  suggestedRootEnvFileName,
   updateEditDraft
 } from './workbench-state';
 
@@ -127,5 +129,52 @@ describe('workbench state', () => {
 
     expect(fileHasProtectedEntries(snapshot.files[0])).toBe(true);
     expect(fileHasProtectedEntries(snapshot.files[3])).toBe(false);
+  });
+
+  it('validates one conventional root env filename against the current snapshot', () => {
+    const snapshot = sampleProject();
+    const files = snapshot.files;
+
+    expect(createEnvFileDraftIssue('.env.personal', snapshot.root, files)).toBeNull();
+    expect(createEnvFileDraftIssue('custom.env', snapshot.root, files)).toBeNull();
+    expect(createEnvFileDraftIssue('', snapshot.root, files)).toBe('Enter a filename.');
+    expect(createEnvFileDraftIssue(' ../.env', snapshot.root, files)).toBe('Remove leading or trailing spaces.');
+    expect(createEnvFileDraftIssue('../.env', snapshot.root, files)).toBe('Enter one filename, not a path.');
+    expect(createEnvFileDraftIssue('C:.env', snapshot.root, files)).toBe('Enter one filename, not a path.');
+    expect(createEnvFileDraftIssue('.env.x:y', snapshot.root, files)).toBe('Enter one filename, not a path.');
+    expect(createEnvFileDraftIssue('CON.env', snapshot.root, files)).toContain('portable filename');
+    expect(createEnvFileDraftIssue('CON .env', snapshot.root, files)).toContain('portable filename');
+    expect(createEnvFileDraftIssue('COM¹.env', snapshot.root, files)).toContain('portable filename');
+    expect(createEnvFileDraftIssue('.env.local.', snapshot.root, files)).toContain('portable filename');
+    expect(createEnvFileDraftIssue('.env?local', snapshot.root, files)).toBe('Enter one filename, not a path.');
+    expect(createEnvFileDraftIssue('COM10.env', snapshot.root, files)).toBeNull();
+    expect(createEnvFileDraftIssue('LPT0.env', snapshot.root, files)).toBeNull();
+    expect(createEnvFileDraftIssue('CONNECTION.env', snapshot.root, files)).toBeNull();
+    expect(createEnvFileDraftIssue('.env.CON', snapshot.root, files)).toBeNull();
+    expect(createEnvFileDraftIssue('notes.txt', snapshot.root, files)).toContain('Use .env');
+    expect(createEnvFileDraftIssue('.env', snapshot.root, files)).toBe('.env already exists in this project.');
+  });
+
+  it('suggests the first unused conventional root filename', () => {
+    const snapshot = sampleProject();
+    const files = snapshot.files;
+    expect(suggestedRootEnvFileName(snapshot.root, [])).toBe('.env');
+    expect(suggestedRootEnvFileName(snapshot.root, files)).toBe('.env.development');
+    expect(
+      suggestedRootEnvFileName(snapshot.root, [
+        ...files,
+        { ...files[0], path: `${snapshot.root}/.env.development`, name: '.env.development' },
+        { ...files[0], path: `${snapshot.root}/.env.test`, name: '.env.test' },
+        { ...files[0], path: `${snapshot.root}/.env.production`, name: '.env.production' }
+      ])
+    ).toBe('.env.local-2');
+  });
+
+  it('does not confuse a referenced nested basename with a root file', () => {
+    const snapshot = sampleProject();
+    const nested = { ...snapshot.files[0], path: `${snapshot.root}/config/.env`, name: '.env' };
+
+    expect(createEnvFileDraftIssue('.env', snapshot.root, [nested])).toBeNull();
+    expect(suggestedRootEnvFileName(snapshot.root, [nested])).toBe('.env');
   });
 });

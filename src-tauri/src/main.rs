@@ -35,6 +35,7 @@ fn print_desktop_usage_error(error: &str) -> io::Result<()> {
     stderr_line(format_args!(""))?;
     stderr_line(format_args!("USAGE:"))?;
     stderr_line(format_args!("  vne [project-dir]"))?;
+    stderr_line(format_args!("  vne create <file> [--text|--json|--pretty]"))?;
     stderr_line(format_args!(
         "  vne add <file> <KEY> --prompt [--json] [--values]"
     ))?;
