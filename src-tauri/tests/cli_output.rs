@@ -12,6 +12,8 @@ const EXAMPLE_SENTINEL: &str = "ExampleD4W";
 const LOCAL_SENTINEL: &str = "LocalE5V";
 const ADD_SENTINEL: &str = "AddF6U";
 const MALFORMED_SENTINEL: &str = "MalformedG7T";
+const COPY_SENTINEL: &str = "CopyH8S";
+const DESTINATION_SENTINEL: &str = "DestinationI9R";
 
 fn run_vne<I, S>(args: I) -> Output
 where
@@ -437,6 +439,264 @@ fn add_json_is_payload_free_without_changing_written_bytes() {
     assert_eq!(
         fs::read(&hidden_file).unwrap(),
         fs::read(&values_file).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_json_is_payload_free_exact_and_preserves_destination_bytes_and_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.env");
+    let destination = dir.path().join("destination.env");
+    let source_content = format!("DATABASE_URL=\"postgres://user:{COPY_SENTINEL}@host/db\"\n");
+    let destination_content = "\u{feff}# keep\r\nPORT=1420\r\n";
+    write(&source, &source_content);
+    write(&destination, destination_content);
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vne"));
+    let empty_path = dir.path().join("no-executables");
+    fs::create_dir(&empty_path).unwrap();
+    let output = command
+        .args([
+            "copy",
+            source.to_str().unwrap(),
+            "DATABASE_URL",
+            destination.to_str().unwrap(),
+            "--json",
+        ])
+        .env("PATH", &empty_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let json = assert_payload_absent(&output, &[COPY_SENTINEL]);
+    assert_eq!(json["disposition"], "added");
+    assert_eq!(json["key"], "DATABASE_URL");
+    assert_eq!(json.as_object().unwrap().len(), 4);
+    assert_eq!(
+        json["sourcePath"],
+        source.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(
+        json["destinationPath"],
+        destination.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(fs::read_to_string(&source).unwrap(), source_content);
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        format!(
+            "{destination_content}DATABASE_URL=\"postgres://user:{COPY_SENTINEL}@host/db\"\r\n"
+        )
+    );
+    assert_eq!(
+        fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+}
+
+#[test]
+fn copy_errors_are_payload_free_and_leave_destination_unchanged() {
+    let dir = tempdir().unwrap();
+    let destination = dir.path().join("destination.env");
+    let initial_destination = format!("TOKEN={DESTINATION_SENTINEL}\n");
+    write(&destination, &initial_destination);
+
+    let cases = [
+        ("missing.env", "PORT=1\n".to_string(), false),
+        (
+            "duplicate.env",
+            format!("TOKEN={COPY_SENTINEL}\nTOKEN={COPY_SENTINEL}-two\n"),
+            false,
+        ),
+        ("malformed.env", format!("TOKEN=\"{COPY_SENTINEL}\n"), false),
+        ("conflict.env", format!("TOKEN={COPY_SENTINEL}\n"), false),
+    ];
+
+    for (name, source_content, overwrite) in cases {
+        let source = dir.path().join(name);
+        write(&source, &source_content);
+        let mut args = vec![
+            "copy".to_string(),
+            source.display().to_string(),
+            "TOKEN".to_string(),
+            destination.display().to_string(),
+            "--json".to_string(),
+        ];
+        if overwrite {
+            args.push("--overwrite".to_string());
+        }
+
+        let output = run_vne(args);
+
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains(COPY_SENTINEL), "{name}: {stderr}");
+        assert!(!stderr.contains(DESTINATION_SENTINEL), "{name}: {stderr}");
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            initial_destination,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn copy_overwrite_is_explicit_and_identical_retry_is_a_no_write_success() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.env");
+    let destination = dir.path().join("destination.env");
+    write(&source, &format!("TOKEN='source-{COPY_SENTINEL}'\n"));
+    write(
+        &destination,
+        &format!("# keep\nTOKEN=destination-{DESTINATION_SENTINEL} # local\n"),
+    );
+
+    let refused = run_vne([
+        "copy",
+        source.to_str().unwrap(),
+        "TOKEN",
+        destination.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(refused.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&refused.stderr).contains(COPY_SENTINEL));
+    assert!(!String::from_utf8_lossy(&refused.stderr).contains(DESTINATION_SENTINEL));
+
+    let overwritten = run_vne([
+        "copy",
+        source.to_str().unwrap(),
+        "TOKEN",
+        destination.to_str().unwrap(),
+        "--overwrite",
+        "--json",
+    ]);
+    assert_eq!(overwritten.status.code(), Some(0));
+    let overwritten_json =
+        assert_payload_absent(&overwritten, &[COPY_SENTINEL, DESTINATION_SENTINEL]);
+    assert_eq!(overwritten_json["disposition"], "overwritten");
+    let expected = format!("# keep\nTOKEN='source-{COPY_SENTINEL}' # local\n");
+    assert_eq!(fs::read_to_string(&destination).unwrap(), expected);
+
+    let metadata_before = fs::metadata(&destination).unwrap();
+    let retried = run_vne([
+        "copy",
+        source.to_str().unwrap(),
+        "TOKEN",
+        destination.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(retried.status.code(), Some(0));
+    let retried_json = assert_payload_absent(&retried, &[COPY_SENTINEL]);
+    assert_eq!(retried_json["disposition"], "alreadyPresent");
+    assert_eq!(fs::read_to_string(&destination).unwrap(), expected);
+    let metadata_after = fs::metadata(&destination).unwrap();
+    assert_eq!(
+        metadata_before.modified().unwrap(),
+        metadata_after.modified().unwrap()
+    );
+}
+
+#[test]
+fn copy_text_receipt_contains_metadata_only() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.env");
+    let destination = dir.path().join("destination.env");
+    write(&source, &format!("TOKEN={COPY_SENTINEL}\n"));
+    write(&destination, "PORT=1420\n");
+
+    let output = run_vne([
+        "copy",
+        source.to_str().unwrap(),
+        "TOKEN",
+        destination.to_str().unwrap(),
+        "--text",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout,
+        format!(
+            "added `TOKEN` from {} to {}\n",
+            source.canonicalize().unwrap().display(),
+            destination.canonicalize().unwrap().display()
+        )
+    );
+    assert!(!stdout.contains(COPY_SENTINEL));
+}
+
+#[test]
+fn copy_refuses_duplicate_destination_even_with_overwrite_without_exposing_payloads() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.env");
+    let destination = dir.path().join("destination.env");
+    write(&source, &format!("TOKEN={COPY_SENTINEL}\n"));
+    let destination_content =
+        format!("TOKEN={DESTINATION_SENTINEL}-one\nTOKEN={DESTINATION_SENTINEL}-two\n");
+    write(&destination, &destination_content);
+
+    let output = run_vne([
+        "copy",
+        source.to_str().unwrap(),
+        "TOKEN",
+        destination.to_str().unwrap(),
+        "--overwrite",
+        "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("lines 1, 2"));
+    assert!(!stderr.contains(COPY_SENTINEL));
+    assert!(!stderr.contains(DESTINATION_SENTINEL));
+    assert_eq!(
+        fs::read_to_string(destination).unwrap(),
+        destination_content
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_retry_converges_after_post_write_output_failure() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.env");
+    let destination = dir.path().join("destination.env");
+    write(&source, &format!("TOKEN={COPY_SENTINEL}\n"));
+    write(&destination, "PORT=1420\n");
+
+    let args = [
+        "copy",
+        source.to_str().unwrap(),
+        "TOKEN",
+        destination.to_str().unwrap(),
+        "--json",
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vne"))
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let failed_output = child.wait_with_output().unwrap();
+    assert_eq!(failed_output.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&failed_output.stderr).contains(COPY_SENTINEL));
+
+    let retry = run_vne(args);
+    assert_eq!(retry.status.code(), Some(0));
+    let retry_json = assert_payload_absent(&retry, &[COPY_SENTINEL]);
+    assert_eq!(retry_json["disposition"], "alreadyPresent");
+    assert_eq!(
+        fs::read_to_string(destination).unwrap(),
+        format!("PORT=1420\nTOKEN={COPY_SENTINEL}\n")
     );
 }
 

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(unix)]
@@ -35,6 +35,23 @@ pub enum EnvFileCreationDisposition {
 pub struct EnsureEnvFileOutcome {
     pub disposition: EnvFileCreationDisposition,
     pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnvKeyCopyDisposition {
+    Added,
+    Overwritten,
+    AlreadyPresent,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvKeyCopyOutcome {
+    pub disposition: EnvKeyCopyDisposition,
+    pub source_path: String,
+    pub destination_path: String,
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -211,6 +228,100 @@ impl fmt::Display for AppendEnvKeyError {
 }
 
 impl std::error::Error for AppendEnvKeyError {}
+
+#[derive(Debug)]
+pub enum EnvKeyCopyError {
+    InvalidKey,
+    SameFile,
+    SourceMissing,
+    SourceDuplicate {
+        line_numbers: Vec<usize>,
+    },
+    SourceMalformed {
+        line_number: usize,
+    },
+    DestinationDuplicate {
+        line_numbers: Vec<usize>,
+    },
+    DestinationMalformed {
+        line_number: usize,
+    },
+    DestinationConflict {
+        line_number: usize,
+    },
+    NonRegularFile {
+        role: &'static str,
+        path: PathBuf,
+    },
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl EnvKeyCopyError {
+    pub fn message(&self, key: &str) -> String {
+        match self {
+            Self::InvalidKey => format!("`{key}` is not a valid env key"),
+            Self::SameFile => "source and destination resolve to the same file".to_string(),
+            Self::SourceMissing => format!("source key `{key}` was not found"),
+            Self::SourceDuplicate { line_numbers } => format!(
+                "source key `{key}` is ambiguous at {}; remove duplicates before copying",
+                line_number_label(line_numbers)
+            ),
+            Self::SourceMalformed { line_number } => format!(
+                "source key `{key}` has a malformed value at line {line_number}"
+            ),
+            Self::DestinationDuplicate { line_numbers } => format!(
+                "destination key `{key}` is ambiguous at {}; remove duplicates before copying",
+                line_number_label(line_numbers)
+            ),
+            Self::DestinationMalformed { line_number } => format!(
+                "destination key `{key}` has a malformed value at line {line_number}"
+            ),
+            Self::DestinationConflict { line_number } => format!(
+                "destination key `{key}` already has a different value at line {line_number}; pass --overwrite to replace it"
+            ),
+            Self::NonRegularFile { role, path } => {
+                format!("{role} env file {} is not a regular file", path.display())
+            }
+            Self::Io {
+                action,
+                path,
+                source,
+            } => format!("could not {action} env file {}: {source}", path.display()),
+        }
+    }
+}
+
+impl fmt::Display for EnvKeyCopyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("env key copy failed")
+    }
+}
+
+impl std::error::Error for EnvKeyCopyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn line_number_label(line_numbers: &[usize]) -> String {
+    let lines = line_numbers
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if line_numbers.len() == 1 {
+        format!("line {lines}")
+    } else {
+        format!("lines {lines}")
+    }
+}
 
 const RAW_PREVIEW_WITHHELD: &str =
     "[raw preview withheld because this file contains redacted or secret-like text]";
@@ -785,6 +896,203 @@ pub fn append_env_key_result(
     output.push('\n');
 
     Ok(output)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnvValueToken<'a> {
+    text: &'a str,
+}
+
+pub fn copy_env_key(
+    source_path: &Path,
+    key: &str,
+    destination_path: &Path,
+    overwrite: bool,
+) -> Result<EnvKeyCopyOutcome, EnvKeyCopyError> {
+    if !is_valid_env_key(key) {
+        return Err(EnvKeyCopyError::InvalidKey);
+    }
+
+    let source_path = canonical_regular_file(source_path, "source")?;
+    let destination_path = canonical_regular_file(destination_path, "destination")?;
+    if source_path == destination_path {
+        return Err(EnvKeyCopyError::SameFile);
+    }
+
+    let source_content = read_env_file_for_copy(&source_path)?;
+    let destination_content = read_env_file_for_copy(&destination_path)?;
+    let (updated, disposition) =
+        copy_env_key_content(&source_content, &destination_content, key, overwrite)?;
+
+    if disposition != EnvKeyCopyDisposition::AlreadyPresent {
+        atomic_write_preserving_permissions(&destination_path, &updated).map_err(|source| {
+            EnvKeyCopyError::Io {
+                action: "write",
+                path: destination_path.clone(),
+                source,
+            }
+        })?;
+    }
+
+    Ok(EnvKeyCopyOutcome {
+        disposition,
+        source_path: source_path.to_string_lossy().to_string(),
+        destination_path: destination_path.to_string_lossy().to_string(),
+        key: key.to_string(),
+    })
+}
+
+fn canonical_regular_file(path: &Path, role: &'static str) -> Result<PathBuf, EnvKeyCopyError> {
+    let canonical = fs::canonicalize(path).map_err(|source| EnvKeyCopyError::Io {
+        action: "resolve",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = fs::metadata(&canonical).map_err(|source| EnvKeyCopyError::Io {
+        action: "inspect",
+        path: canonical.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(EnvKeyCopyError::NonRegularFile {
+            role,
+            path: canonical,
+        });
+    }
+    Ok(canonical)
+}
+
+fn read_env_file_for_copy(path: &Path) -> Result<String, EnvKeyCopyError> {
+    fs::read_to_string(path).map_err(|source| EnvKeyCopyError::Io {
+        action: "read",
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn copy_env_key_content(
+    source_content: &str,
+    destination_content: &str,
+    key: &str,
+    overwrite: bool,
+) -> Result<(String, EnvKeyCopyDisposition), EnvKeyCopyError> {
+    if !is_valid_env_key(key) {
+        return Err(EnvKeyCopyError::InvalidKey);
+    }
+
+    let source_entries = parse_env_entries(source_content)
+        .into_iter()
+        .filter(|entry| entry.key == key)
+        .collect::<Vec<_>>();
+    let source = match source_entries.as_slice() {
+        [] => return Err(EnvKeyCopyError::SourceMissing),
+        [source] => source,
+        sources => {
+            return Err(EnvKeyCopyError::SourceDuplicate {
+                line_numbers: sources.iter().map(|entry| entry.line_number).collect(),
+            })
+        }
+    };
+    if source.diagnostic.is_some() {
+        return Err(EnvKeyCopyError::SourceMalformed {
+            line_number: source.line_number,
+        });
+    }
+    let source_token = env_value_token(source_content, source);
+
+    let destination_entries = parse_env_entries(destination_content)
+        .into_iter()
+        .filter(|entry| entry.key == key)
+        .collect::<Vec<_>>();
+    let Some(destination) = destination_entries.first() else {
+        return Ok((
+            append_env_key_token(destination_content, key, source_token),
+            EnvKeyCopyDisposition::Added,
+        ));
+    };
+    if destination_entries.len() > 1 {
+        return Err(EnvKeyCopyError::DestinationDuplicate {
+            line_numbers: destination_entries
+                .iter()
+                .map(|entry| entry.line_number)
+                .collect(),
+        });
+    }
+    if destination.diagnostic.is_some() {
+        return Err(EnvKeyCopyError::DestinationMalformed {
+            line_number: destination.line_number,
+        });
+    }
+
+    let destination_token = env_value_token(destination_content, destination);
+    if source_token == destination_token {
+        return Ok((
+            destination_content.to_string(),
+            EnvKeyCopyDisposition::AlreadyPresent,
+        ));
+    }
+    if !overwrite {
+        return Err(EnvKeyCopyError::DestinationConflict {
+            line_number: destination.line_number,
+        });
+    }
+
+    Ok((
+        replace_env_value_token(destination_content, destination, source_token),
+        EnvKeyCopyDisposition::Overwritten,
+    ))
+}
+
+fn env_value_token<'a>(content: &'a str, entry: &ParsedLine) -> EnvValueToken<'a> {
+    let (start, end) = env_value_token_bounds(entry);
+    EnvValueToken {
+        text: &content[start..end],
+    }
+}
+
+fn env_value_token_bounds(entry: &ParsedLine) -> (usize, usize) {
+    if entry.quote.is_some() {
+        (entry.value_start - 1, entry.value_end + 1)
+    } else {
+        (entry.value_start, entry.value_end)
+    }
+}
+
+fn append_env_key_token(content: &str, key: &str, token: EnvValueToken<'_>) -> String {
+    let line_ending = preferred_line_ending(content);
+    let mut output = String::with_capacity(content.len() + key.len() + token.text.len() + 4);
+    output.push_str(content);
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push_str(line_ending);
+    }
+    output.push_str(key);
+    output.push('=');
+    output.push_str(token.text);
+    output.push_str(line_ending);
+    output
+}
+
+fn replace_env_value_token(
+    content: &str,
+    destination: &ParsedLine,
+    source_token: EnvValueToken<'_>,
+) -> String {
+    let destination_token = env_value_token(content, destination);
+    let (token_start, token_end) = env_value_token_bounds(destination);
+    let mut output = String::with_capacity(
+        content.len() - destination_token.text.len() + source_token.text.len(),
+    );
+    output.push_str(&content[..token_start]);
+    output.push_str(source_token.text);
+    output.push_str(&content[token_end..]);
+    output
+}
+
+fn preferred_line_ending(content: &str) -> &'static str {
+    match content.find('\n') {
+        Some(index) if index > 0 && content.as_bytes()[index - 1] == b'\r' => "\r\n",
+        _ => "\n",
+    }
 }
 
 pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
@@ -2141,20 +2449,26 @@ fn env_file_sort_key(name: &str) -> (u8, String) {
 }
 
 pub fn atomic_write_preserving_permissions(path: &Path, content: &str) -> io::Result<()> {
-    let permissions = fs::metadata(path)
-        .map(|metadata| metadata.permissions())
-        .ok();
+    let permissions = fs::metadata(path)?.permissions();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("env");
-    let tmp_path = path.with_file_name(format!(".{file_name}.vne.tmp"));
-
-    fs::write(&tmp_path, content)?;
-    if let Some(permissions) = permissions {
-        fs::set_permissions(&tmp_path, permissions)?;
-    }
-    fs::rename(&tmp_path, path)?;
+    let temporary_prefix = format!(".{file_name}.vne-");
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix(&temporary_prefix)
+        .permissions(permissions.clone());
+    let mut temporary = builder.tempfile_in(parent)?;
+    temporary.write_all(content.as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.as_file().set_permissions(permissions)?;
+    temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -2717,6 +3031,122 @@ mod tests {
             error.message("PORT"),
             "`PORT` already exists at lines 1, 2; edit the existing occurrence instead"
         );
+    }
+
+    #[test]
+    fn copy_preserves_exact_value_tokens_and_destination_structure() {
+        let source = "SECRET=\"alpha\\\"beta\\\\path\nline two\"\n";
+        let destination = "\u{feff}# keep\r\nPORT=1420\r\n";
+
+        let (updated, disposition) =
+            copy_env_key_content(source, destination, "SECRET", false).unwrap();
+
+        assert_eq!(disposition, EnvKeyCopyDisposition::Added);
+        assert_eq!(
+            updated,
+            "\u{feff}# keep\r\nPORT=1420\r\nSECRET=\"alpha\\\"beta\\\\path\nline two\"\r\n"
+        );
+        assert!(updated.starts_with("\u{feff}# keep\r\nPORT=1420\r\n"));
+    }
+
+    #[test]
+    fn copy_accepts_empty_source_value() {
+        let (updated, disposition) =
+            copy_env_key_content("EMPTY=\n", "PORT=1420\n", "EMPTY", false).unwrap();
+
+        assert_eq!(disposition, EnvKeyCopyDisposition::Added);
+        assert_eq!(updated, "PORT=1420\nEMPTY=\n");
+    }
+
+    #[test]
+    fn copy_destination_policy_is_explicit_and_retry_safe() {
+        let source = "TOKEN='same'\n";
+
+        let (unchanged, disposition) =
+            copy_env_key_content(source, "TOKEN='same' # keep\n", "TOKEN", false).unwrap();
+        assert_eq!(disposition, EnvKeyCopyDisposition::AlreadyPresent);
+        assert_eq!(unchanged, "TOKEN='same' # keep\n");
+
+        assert!(matches!(
+            copy_env_key_content(source, "TOKEN=other\n", "TOKEN", false),
+            Err(EnvKeyCopyError::DestinationConflict { line_number: 1 })
+        ));
+
+        let (updated, disposition) =
+            copy_env_key_content(source, "TOKEN=other # keep\n", "TOKEN", true).unwrap();
+        assert_eq!(disposition, EnvKeyCopyDisposition::Overwritten);
+        assert_eq!(updated, "TOKEN='same' # keep\n");
+    }
+
+    #[test]
+    fn copy_refuses_missing_duplicate_and_malformed_occurrences() {
+        assert!(matches!(
+            copy_env_key_content("PORT=1\n", "", "TOKEN", false),
+            Err(EnvKeyCopyError::SourceMissing)
+        ));
+        assert!(matches!(
+            copy_env_key_content("TOKEN=one\nTOKEN=two\n", "", "TOKEN", false),
+            Err(EnvKeyCopyError::SourceDuplicate { .. })
+        ));
+        assert!(matches!(
+            copy_env_key_content("TOKEN=\"not closed\n", "", "TOKEN", false),
+            Err(EnvKeyCopyError::SourceMalformed { line_number: 1 })
+        ));
+        assert!(matches!(
+            copy_env_key_content("TOKEN=one\n", "TOKEN=a\nTOKEN=b\n", "TOKEN", true),
+            Err(EnvKeyCopyError::DestinationDuplicate { .. })
+        ));
+        assert!(matches!(
+            copy_env_key_content("TOKEN=one\n", "TOKEN=\"not closed\n", "TOKEN", true),
+            Err(EnvKeyCopyError::DestinationMalformed { line_number: 1 })
+        ));
+    }
+
+    #[test]
+    fn copy_rejects_paths_that_resolve_to_the_same_file() {
+        let dir = tempdir().unwrap();
+        let env_file = dir.path().join("shared.env");
+        fs::write(&env_file, "TOKEN=one\n").unwrap();
+        let alias = dir.path().join(".").join("shared.env");
+
+        let error = copy_env_key(&env_file, "TOKEN", &alias, false).unwrap_err();
+
+        assert!(matches!(error, EnvKeyCopyError::SameFile));
+        assert_eq!(fs::read_to_string(env_file).unwrap(), "TOKEN=one\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_mode_and_ignores_predictable_stale_temp_path() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempdir().unwrap();
+        let destination = dir.path().join("secret.env");
+        let outside = dir.path().join("outside.env");
+        fs::write(&destination, "TOKEN=old\n").unwrap();
+        fs::write(&outside, "OUTSIDE=keep\n").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&outside, dir.path().join(".secret.env.vne.tmp")).unwrap();
+
+        atomic_write_preserving_permissions(&destination, "TOKEN=new\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "TOKEN=new\n");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "OUTSIDE=keep\n");
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let temporary_entries = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".secret.env.vne-")
+            })
+            .count();
+        assert_eq!(temporary_entries, 0);
     }
 
     #[test]

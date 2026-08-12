@@ -13,7 +13,7 @@
 - Rust parser and writer: trusted local code that reads and writes files selected by the user.
 - Svelte UI: trusted local code that renders parsed values and sends explicit commands to the Tauri backend. Default snapshots do not include raw secret-like values in parsed entries; Reveal fetches only one selected key occurrence into the local webview.
 - Tauri command boundary: only local UI invokes project scan, root-level env-file creation, value save, and value-required missing-key insertion.
-- CLI stdout and stderr: output may be retained by shells, CI, pipes, or agent transcripts. Structured JSON withholds env payloads by default; `--values` explicitly opts into classifier-approved entry values while comments and raw content remain withheld. `create` emits only a disposition and absolute path.
+- CLI stdout and stderr: output may be retained by shells, CI, pipes, or agent transcripts. Structured JSON withholds env payloads by default; `--values` explicitly opts into classifier-approved entry values while comments and raw content remain withheld. `create` emits only a disposition and absolute path. `copy` emits only a disposition, normalized source and destination paths, and a key.
 - Native dialog: used only to pick a local directory.
 - Network: not part of the product path for env contents.
 
@@ -34,6 +34,8 @@
 - Missing-key insertion requires an explicit non-empty value; it refuses duplicate, invalid, or empty keys and returns a fresh project snapshot.
 - Env-file creation accepts one validated root-level filename in the desktop app. The shared Rust primitive canonicalizes the root, derives the target itself, and uses exclusive creation. It creates exactly zero bytes, uses owner-private permissions on Unix, never follows a final-component symlink, never truncates an existing regular file, and reports retries as `alreadyExists`.
 - Creation and project refresh are separate operations. A refresh failure after successful creation is reported as “created, refresh failed” so retrying cannot accidentally overwrite or obscure the durable outcome.
+- Env-key copy resolves two distinct existing regular-file targets, selects one diagnostic-free source occurrence, and transfers its exact value token without returning it to the CLI layer. It refuses missing, malformed, and duplicate source keys; refuses duplicate destination keys; and requires `--overwrite` for one different destination value. An identical token returns `alreadyPresent` without writing, so retry after an output failure converges.
+- Atomic rewrites use an exclusively created same-directory temporary file with destination permissions, complete and sync its bytes before rename, and clean it up on pre-persist failure. This prevents partial destination bytes and predictable-temp symlink attacks; it does not lock out non-cooperating concurrent writers or sync the containing directory.
 - Missing/new-key form protection derives from Rust-produced key-shape metadata. Unknown or conflicting keys default to password input until the local user explicitly chooses Show; the Svelte UI does not maintain a second secret-name registry.
 - Write commands resolve the active project root and reject file paths outside that root, with regression tests for direct symlink escapes and nested symlink directory escapes.
 - Env files referenced by Docker Compose are canonicalized and ignored when they resolve outside the active project root.
@@ -54,6 +56,7 @@
 
 - Reveal intentionally serializes one selected raw value into the trusted local webview and shows it to the local user.
 - Parsed raw values are present inside the trusted Rust process during scans, writes, and per-entry reveal. A selected raw value enters the Svelte process only after the explicit Reveal command; this is still a local trust boundary, not OS-level secret isolation.
+- `copy` intentionally holds the selected source value token inside the trusted Rust process. Its atomic rewrite preserves `std::fs::Permissions`, but does not promise inode identity, ownership changes, ACLs, extended attributes, or protection from a concurrent external writer.
 - Desktop snapshots and CLI `--values` entry values remain classifier-driven. An unknown sensitive value with no recognized provider, name, URL, or value signature can still be treated as ordinary; CLI comments and raw previews remain withheld, and default CLI JSON remains payload-free despite such a miss.
 - `format --dry-run` intentionally writes the complete raw file to stdout and warns when piped. It is for explicit local inspection, not agent or transcript-safe diagnostics.
 - Raw preview remains disabled whenever the selected file has classified redacted entries, independent of whether one entry was explicitly revealed. Secret-like comments and malformed lines are withheld by heuristic; unknown sensitive text without recognizable markers can still appear in desktop raw preview for files with no classified sensitive entry.
@@ -69,5 +72,6 @@
 - Re-check path-scope, symlink, idempotency, and no-clobber behavior around write commands after any command-surface change.
 - Re-review CSP after any asset, protocol, iframe, style, or network-surface change.
 - Verify raw values are absent from structured logs and error paths.
+- Verify `copy` sentinel values are absent from stdout, stderr, errors, and child-process arguments on every success and failure path.
 - Verify macOS signing/notarization choices with explicit user approval.
 - Capture screenshots using a local browser-control surface.

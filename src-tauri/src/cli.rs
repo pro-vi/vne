@@ -1,8 +1,9 @@
 use crate::{
-    append_env_key_result, atomic_write_preserving_permissions, compare_env_files,
+    append_env_key_result, atomic_write_preserving_permissions, compare_env_files, copy_env_key,
     ensure_project_env_file, parse_env_file, redact_env_file_values_only,
     redact_snapshot_values_only, withhold_all_env_file_payloads, withhold_all_snapshot_payloads,
-    EnsureEnvFileOutcome, EnvComparison, EnvFile, EnvFileCreationDisposition, ProjectSnapshot,
+    EnsureEnvFileOutcome, EnvComparison, EnvFile, EnvFileCreationDisposition,
+    EnvKeyCopyDisposition, ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
@@ -14,7 +15,7 @@ use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
 
 const CLI_COMMANDS: &[&str] = &[
-    "check", "inspect", "format", "add", "create", "help", "-h", "--help",
+    "check", "inspect", "format", "add", "copy", "create", "help", "-h", "--help",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,6 +41,13 @@ enum Command {
         value: AddValue,
         output: OutputFormat,
         values: ValueOutput,
+    },
+    Copy {
+        source_file: PathBuf,
+        key: String,
+        destination_file: PathBuf,
+        overwrite: bool,
+        output: OutputFormat,
     },
     Create {
         file: PathBuf,
@@ -75,6 +83,7 @@ enum HelpTopic {
     Check,
     Inspect,
     Add,
+    Copy,
     Create,
     Format,
 }
@@ -166,6 +175,13 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             let value = read_add_value(&file, &key, value)?;
             run_add(&file, &key, &value, output, values)
         }
+        Command::Copy {
+            source_file,
+            key,
+            destination_file,
+            overwrite,
+            output,
+        } => run_copy(&source_file, &key, &destination_file, overwrite, output),
         Command::Create { file, output } => run_create(&file, output),
         Command::Help(_) => Ok(false),
     }
@@ -437,6 +453,33 @@ fn run_create(file: &Path, output: OutputFormat) -> Result<bool, Box<dyn std::er
     Ok(false)
 }
 
+fn run_copy(
+    source_file: &Path,
+    key: &str,
+    destination_file: &Path,
+    overwrite: bool,
+    output: OutputFormat,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let outcome = copy_env_key(source_file, key, destination_file, overwrite)
+        .map_err(|error| error.message(key))?;
+
+    if output.wants_json() {
+        print_json(&outcome, output)?;
+    } else {
+        let state = match outcome.disposition {
+            EnvKeyCopyDisposition::Added => "added",
+            EnvKeyCopyDisposition::Overwritten => "overwritten",
+            EnvKeyCopyDisposition::AlreadyPresent => "already present",
+        };
+        stdout_line(format_args!(
+            "{state} `{}` from {} to {}",
+            outcome.key, outcome.source_path, outcome.destination_path
+        ))?;
+    }
+
+    Ok(false)
+}
+
 fn ensure_env_file_path(file: &Path) -> io::Result<EnsureEnvFileOutcome> {
     let raw_path = file.to_string_lossy();
     let terminal_component = raw_path.rsplit(['/', '\\']).next().unwrap_or_default();
@@ -586,6 +629,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, ParseEr
         "inspect" => parse_inspect_args(args),
         "format" => parse_format_args(args),
         "add" => parse_add_args(args),
+        "copy" => parse_copy_args(args),
         "create" => parse_create_args(args),
         _ => Err(ParseError::new(
             HelpTopic::General,
@@ -817,6 +861,52 @@ fn parse_create_args(args: impl Iterator<Item = String>) -> Result<Command, Pars
     Ok(Command::Create { file, output })
 }
 
+fn parse_copy_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
+    let mut output = OutputFormat::Auto;
+    let mut overwrite = false;
+    let mut positionals = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "--overwrite" => overwrite = true,
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Copy)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Copy)?,
+            "--pretty" => {
+                set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Copy)?
+            }
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Copy)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Copy,
+                    format!("unknown copy option `{arg}`"),
+                ));
+            }
+            _ => positionals.push(arg),
+        }
+    }
+
+    let [source_file, key, destination_file] = positionals.as_slice() else {
+        return Err(ParseError::new(
+            HelpTopic::Copy,
+            "copy requires <source-file> <KEY> <destination-file>",
+        ));
+    };
+    if key.is_empty() {
+        return Err(ParseError::new(
+            HelpTopic::Copy,
+            "copy requires a non-empty key",
+        ));
+    }
+
+    Ok(Command::Copy {
+        source_file: PathBuf::from(source_file),
+        key: key.clone(),
+        destination_file: PathBuf::from(destination_file),
+        overwrite,
+        output,
+    })
+}
+
 fn set_output_format(
     target: &mut OutputFormat,
     value: OutputFormat,
@@ -861,7 +951,7 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n"
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy output contains only its state, normalized paths, and key.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne copy ../other/.env DATABASE_URL .env\n"
         }
         HelpTopic::Check => {
             "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
@@ -874,6 +964,9 @@ fn usage_text(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::Create => {
             "vne create - ensure one empty env file exists without overwriting it\n\nUSAGE:\n  vne create <file> [--text|--json|--pretty]\n\nBEHAVIOR:\n  The parent directory must already exist.\n  The filename must look like .env, .env.local, .envrc, .flaskenv, or worker.env.\n  A new file is empty and private to its owner on Unix.\n  An existing regular file is left unchanged and reported as alreadyExists.\n  Symlinks, directories, missing parent directories, and overwrite flags are rejected.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit a compact disposition and absolute path\n  --pretty  Emit a formatted disposition and absolute path\n\nEXAMPLES:\n  vne create .env\n  vne create config.env --json\n  vne create /path/to/project/.env.local --pretty\n"
+        }
+        HelpTopic::Copy => {
+            "vne copy - copy one env key between existing files without exposing its value\n\nUSAGE:\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Source and destination must be distinct existing regular files.\n  The source key must occur exactly once and be well formed.\n  An absent destination key is added. An identical value reports alreadyPresent without writing.\n  A different destination value requires --overwrite. Duplicate destination keys are refused.\n  The value stays inside vne; output contains only state, normalized paths, and key.\n\nOPTIONS:\n  --overwrite  Replace one different existing destination value\n  --text       Force human text output\n  --json       Emit a compact payload-free copy receipt\n  --pretty     Emit a formatted payload-free copy receipt\n\nEXAMPLE:\n  vne copy ../other/.env DATABASE_URL .env\n  vne copy ../other/.env DATABASE_URL .env --overwrite --json\n"
         }
         HelpTopic::Format => {
             "vne format - print the parsed env file without rewriting it\n\nWARNING:\n  This command emits raw env content. It does not apply JSON payload withholding or classified redaction.\n\nUSAGE:\n  vne format <file> --dry-run\n\nOPTIONS:\n  --dry-run  Required; print the current raw file content instead of writing\n\nEXAMPLE:\n  vne format .env --dry-run\n"
@@ -912,6 +1005,10 @@ mod tests {
     #[test]
     fn identifies_cli_invocations_by_explicit_command() {
         assert!(is_cli_invocation(&["add".to_string(), ".env".to_string()]));
+        assert!(is_cli_invocation(&[
+            "copy".to_string(),
+            "source.env".to_string()
+        ]));
         assert!(is_cli_invocation(&[
             "create".to_string(),
             ".env".to_string()
@@ -981,6 +1078,44 @@ mod tests {
                 output: OutputFormat::PrettyJson,
             })
         );
+    }
+
+    #[test]
+    fn parses_copy_with_explicit_overwrite_and_output() {
+        assert_eq!(
+            parse(&[
+                "copy",
+                "../source/.env",
+                "DATABASE_URL",
+                ".env",
+                "--overwrite",
+                "--json"
+            ]),
+            Ok(Command::Copy {
+                source_file: PathBuf::from("../source/.env"),
+                key: "DATABASE_URL".to_string(),
+                destination_file: PathBuf::from(".env"),
+                overwrite: true,
+                output: OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn copy_parser_rejects_missing_extra_and_value_output_arguments() {
+        assert!(parse(&["copy"]).is_err());
+        assert!(parse(&["copy", "source.env", "TOKEN"]).is_err());
+        assert!(parse(&["copy", "source.env", "TOKEN", "dest.env", "extra"]).is_err());
+        assert!(parse(&["copy", "source.env", "TOKEN", "dest.env", "--values"]).is_err());
+        assert!(parse(&[
+            "copy",
+            "source.env",
+            "TOKEN",
+            "dest.env",
+            "--json",
+            "--text"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1083,6 +1218,10 @@ mod tests {
     fn parses_command_specific_help() {
         assert_eq!(parse(&["add", "--help"]), Ok(Command::Help(HelpTopic::Add)));
         assert_eq!(
+            parse(&["copy", "--help"]),
+            Ok(Command::Help(HelpTopic::Copy))
+        );
+        assert_eq!(
             parse(&["create", "--help"]),
             Ok(Command::Help(HelpTopic::Create))
         );
@@ -1109,6 +1248,11 @@ mod tests {
         assert!(create.contains("existing regular file is left unchanged"));
         assert!(create.contains("Symlinks"));
         assert!(usage_text(HelpTopic::Add).contains("Offer to create a missing env file"));
+        let copy = usage_text(HelpTopic::Copy);
+        assert!(copy.contains("without exposing its value"));
+        assert!(copy.contains("alreadyPresent"));
+        assert!(copy.contains("--overwrite"));
+        assert!(!copy.contains("--values"));
     }
 
     #[test]
