@@ -1,10 +1,10 @@
 use crate::{
     append_env_key_result, atomic_write_preserving_permissions, compare_env_files, copy_env_key,
     ensure_project_env_file, parse_env_file, redact_env_file_values_only,
-    redact_snapshot_values_only, remove_env_key, set_env_key, withhold_all_env_file_payloads,
-    withhold_all_snapshot_payloads, EnsureEnvFileOutcome, EnvComparison, EnvFile,
-    EnvFileCreationDisposition, EnvKeyCopyDisposition, EnvKeyExpectation, EnvKeyRemoveDisposition,
-    EnvKeyRemoveSelector, EnvKeySetDisposition, ProjectSnapshot,
+    redact_snapshot_values_only, remove_env_key, rename_env_key, set_env_key,
+    withhold_all_env_file_payloads, withhold_all_snapshot_payloads, EnsureEnvFileOutcome,
+    EnvComparison, EnvFile, EnvFileCreationDisposition, EnvKeyCopyDisposition, EnvKeyExpectation,
+    EnvKeyRemoveDisposition, EnvKeyRemoveSelector, EnvKeySetDisposition, ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
@@ -46,6 +46,10 @@ const CLI_COMMANDS: &[CliCommand] = &[
     CliCommand {
         name: "rm",
         parse: parse_rm_args,
+    },
+    CliCommand {
+        name: "rename",
+        parse: parse_rename_args,
     },
     CliCommand {
         name: "copy",
@@ -100,6 +104,12 @@ enum Command {
         expectation: Option<EnvKeyExpectation>,
         output: OutputFormat,
     },
+    Rename {
+        file: PathBuf,
+        from: String,
+        to: String,
+        output: OutputFormat,
+    },
     Copy {
         source_file: PathBuf,
         key: String,
@@ -143,6 +153,7 @@ enum HelpTopic {
     Add,
     Set,
     Remove,
+    Rename,
     Copy,
     Create,
     Format,
@@ -253,6 +264,12 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             expectation,
             output,
         } => run_rm(&file, &key, selector, expectation, output),
+        Command::Rename {
+            file,
+            from,
+            to,
+            output,
+        } => run_rename(&file, &from, &to, output),
         Command::Copy {
             source_file,
             key,
@@ -597,6 +614,26 @@ fn line_label(line_numbers: &[usize]) -> String {
     } else {
         format!("lines {lines}")
     }
+}
+
+fn run_rename(
+    file: &Path,
+    from: &str,
+    to: &str,
+    output: OutputFormat,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let outcome = rename_env_key(file, from, to).map_err(|error| error.message(from, to))?;
+
+    if output.wants_json() {
+        print_json(&outcome, output)?;
+    } else {
+        stdout_line(format_args!(
+            "renamed `{}` to `{}` in {}",
+            outcome.keys.from, outcome.keys.to, outcome.path
+        ))?;
+    }
+
+    Ok(false)
 }
 
 fn run_create(file: &Path, output: OutputFormat) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1142,6 +1179,49 @@ fn set_remove_selector(
     Ok(())
 }
 
+fn parse_rename_args(args: ArgIter) -> Result<Command, ParseError> {
+    let mut output = OutputFormat::Auto;
+    let mut positionals = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Rename)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Rename)?,
+            "--pretty" => {
+                set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Rename)?
+            }
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Rename)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Rename,
+                    format!("unknown rename option `{arg}`"),
+                ));
+            }
+            _ => positionals.push(arg),
+        }
+    }
+
+    let [file, from, to] = positionals.as_slice() else {
+        return Err(ParseError::new(
+            HelpTopic::Rename,
+            "rename requires <file> <OLD_KEY> <NEW_KEY>",
+        ));
+    };
+    if from.is_empty() || to.is_empty() {
+        return Err(ParseError::new(
+            HelpTopic::Rename,
+            "rename requires two non-empty keys",
+        ));
+    }
+
+    Ok(Command::Rename {
+        file: PathBuf::from(file),
+        from: from.clone(),
+        to: to.clone(),
+        output,
+    })
+}
+
 fn parse_create_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut file = None;
     let mut output = OutputFormat::Auto;
@@ -1282,7 +1362,7 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, and rm output contains only its state, normalized paths, key, and lines.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne copy ../other/.env DATABASE_URL .env\n"
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, rm, and rename output contains only state, normalized paths, keys, and lines.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne copy ../other/.env DATABASE_URL .env\n"
         }
         HelpTopic::Check => {
             "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
@@ -1301,6 +1381,9 @@ fn usage_text(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::Remove => {
             "vne rm - delete one env key without reading its value\n\nUSAGE:\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n\nBEHAVIOR:\n  A unique occurrence is removed and its whole line spliced out.\n  A duplicated key is refused with its line numbers unless --line or --all selects one.\n  --line <N> is a one-shot selector: if line N does not hold KEY it fails and never\n  hunts for another occurrence, so a stale line number cannot delete the wrong entry.\n  An absent key reports alreadyAbsent without writing, so a retry converges.\n  --expect states the key state you believe in and turns a wrong belief into exit 2.\n\nOPTIONS:\n  --all             Remove every occurrence in one write\n  --line <N>        Remove exactly the occurrence at line N\n  --expect present  Fail instead of reporting alreadyAbsent\n  --expect absent   Fail instead of removing anything\n  --text            Force human text output\n  --json            Emit a compact payload-free removal receipt\n  --pretty          Emit a formatted payload-free removal receipt\n\nEXAMPLES:\n  vne rm .env STALE_FLAG\n  vne rm .env DUPLICATED --line 12 --json\n  vne rm .env OPENAI_API_KEY --expect present\n"
+        }
+        HelpTopic::Rename => {
+            "vne rename - rename one env key while leaving its value untouched\n\nUSAGE:\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n\nBEHAVIOR:\n  Only the key token changes. The value bytes, quoting, inline comment, export\n  prefix, spacing, and line position stay byte-identical.\n  The old key must occur exactly once and be well formed.\n  An existing new key is refused; vne never merges two keys.\n  When the old key is absent and the new key is present, vne refuses instead of\n  reporting success: file state cannot prove that this rename is what happened.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit a compact payload-free rename receipt\n  --pretty  Emit a formatted payload-free rename receipt\n\nEXAMPLES:\n  vne rename .env OLD_NAME NEW_NAME\n  vne rename .env OPENAI_KEY OPENAI_API_KEY --json\n"
         }
         HelpTopic::Copy => {
             "vne copy - copy one env key between existing files without exposing its value\n\nUSAGE:\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Source and destination must be distinct existing regular files.\n  The source key must occur exactly once and be well formed.\n  An absent destination key is added. An identical value reports alreadyPresent without writing.\n  A different destination value requires --overwrite. Duplicate destination keys are refused.\n  The value stays inside vne; output contains only state, normalized paths, and key.\n\nOPTIONS:\n  --overwrite  Replace one different existing destination value\n  --text       Force human text output\n  --json       Emit a compact payload-free copy receipt\n  --pretty     Emit a formatted payload-free copy receipt\n\nEXAMPLE:\n  vne copy ../other/.env DATABASE_URL .env\n  vne copy ../other/.env DATABASE_URL .env --overwrite --json\n"
@@ -1841,6 +1924,45 @@ mod tests {
         assert!(help.contains("hunts for another occurrence"));
         assert!(help.contains("alreadyAbsent"));
         assert!(help.contains("--expect"));
+    }
+
+    #[test]
+    fn parses_rename_with_two_keys() {
+        assert_eq!(
+            parse(&["rename", ".env", "OPENAI_KEY", "OPENAI_API_KEY", "--json"]),
+            Ok(Command::Rename {
+                file: PathBuf::from(".env"),
+                from: "OPENAI_KEY".to_string(),
+                to: "OPENAI_API_KEY".to_string(),
+                output: OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn rename_parser_rejects_missing_extra_and_unknown_arguments() {
+        for arguments in [
+            vec!["rename"],
+            vec!["rename", ".env"],
+            vec!["rename", ".env", "OLD_KEY"],
+            vec!["rename", ".env", "OLD_KEY", "NEW_KEY", "extra"],
+            vec!["rename", ".env", "OLD_KEY", "NEW_KEY", "--values"],
+            vec!["rename", ".env", "OLD_KEY", "NEW_KEY", "--json", "--text"],
+        ] {
+            assert!(
+                parse(&arguments).is_err(),
+                "{arguments:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_help_documents_what_it_preserves_and_what_it_refuses() {
+        let help = usage_text(HelpTopic::Rename);
+        assert!(help.contains("byte-identical"));
+        assert!(help.contains("inline comment"));
+        assert!(help.contains("never merges"));
+        assert!(help.contains("cannot prove"));
     }
 
     #[test]

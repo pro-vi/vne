@@ -97,6 +97,27 @@ pub enum EnvKeyRemoveSelector {
     All,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnvKeyRenameDisposition {
+    Renamed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvKeyRenamePair {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvKeyRenameOutcome {
+    pub disposition: EnvKeyRenameDisposition,
+    pub path: String,
+    pub keys: EnvKeyRenamePair,
+}
+
 /// The caller's belief about the key before the removal runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvKeyExpectation {
@@ -228,6 +249,9 @@ struct ParsedLine {
     /// Byte offset where this entry's line begins, after any leading byte-order
     /// mark. Paired with `next_start` it spans the whole line for removal.
     line_start: usize,
+    /// Byte offsets of the key token itself, for renaming it in place.
+    key_start: usize,
+    key_end: usize,
     value_start: usize,
     value_end: usize,
     next_start: usize,
@@ -407,6 +431,77 @@ impl From<EnvFileAccessError> for EnvKeyCopyError {
                 source,
             },
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum EnvKeyRenameError {
+    InvalidSourceKey,
+    InvalidTargetKey,
+    SameKey,
+    SourceMissing,
+    SourceDuplicate {
+        line_numbers: Vec<usize>,
+    },
+    SourceMalformed {
+        line_number: usize,
+    },
+    TargetExists {
+        line_numbers: Vec<usize>,
+    },
+    /// The source is gone and the target is present. A rename cannot be
+    /// confirmed from file state alone, so vne refuses to claim one happened.
+    Indeterminate {
+        line_numbers: Vec<usize>,
+    },
+    Access(EnvFileAccessError),
+}
+
+impl EnvKeyRenameError {
+    pub fn message(&self, from: &str, to: &str) -> String {
+        match self {
+            Self::InvalidSourceKey => format!("`{from}` is not a valid env key"),
+            Self::InvalidTargetKey => format!("`{to}` is not a valid env key"),
+            Self::SameKey => format!("`{from}` and `{to}` are the same key"),
+            Self::SourceMissing => format!("`{from}` was not found"),
+            Self::SourceDuplicate { line_numbers } => format!(
+                "`{from}` is ambiguous at {}; remove duplicates before renaming it",
+                line_number_label(line_numbers)
+            ),
+            Self::SourceMalformed { line_number } => {
+                format!("`{from}` has a malformed value at line {line_number}")
+            }
+            Self::TargetExists { line_numbers } => format!(
+                "`{to}` already exists at {}; remove it before renaming `{from}` onto it",
+                line_number_label(line_numbers)
+            ),
+            Self::Indeterminate { line_numbers } => format!(
+                "`{from}` is absent and `{to}` is present at {}; vne cannot confirm from file state that this rename already happened",
+                line_number_label(line_numbers)
+            ),
+            Self::Access(error) => error.message(),
+        }
+    }
+}
+
+impl fmt::Display for EnvKeyRenameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("env key rename failed")
+    }
+}
+
+impl std::error::Error for EnvKeyRenameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Access(EnvFileAccessError::Io { source, .. }) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<EnvFileAccessError> for EnvKeyRenameError {
+    fn from(error: EnvFileAccessError) -> Self {
+        Self::Access(error)
     }
 }
 
@@ -1456,6 +1551,102 @@ fn remove_env_key_content(
     })
 }
 
+pub fn rename_env_key(
+    path: &Path,
+    from: &str,
+    to: &str,
+) -> Result<EnvKeyRenameOutcome, EnvKeyRenameError> {
+    let path = canonical_regular_file(path, "target")?;
+    let content = read_env_file_at(&path)?;
+    let updated = rename_env_key_content(&content, from, to)?;
+
+    atomic_write_preserving_permissions(&path, &updated).map_err(|source| {
+        EnvFileAccessError::Io {
+            action: "write",
+            path: path.clone(),
+            source,
+        }
+    })?;
+
+    Ok(EnvKeyRenameOutcome {
+        disposition: EnvKeyRenameDisposition::Renamed,
+        path: path.to_string_lossy().to_string(),
+        keys: EnvKeyRenamePair {
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+    })
+}
+
+/// Renames the key token in place. The value token, inline comment, `export`
+/// prefix, quoting, spacing, and line position are all left byte-identical, so
+/// the only change to the file is the key name itself.
+fn rename_env_key_content(
+    content: &str,
+    from: &str,
+    to: &str,
+) -> Result<String, EnvKeyRenameError> {
+    if !is_valid_env_key(from) {
+        return Err(EnvKeyRenameError::InvalidSourceKey);
+    }
+    if !is_valid_env_key(to) {
+        return Err(EnvKeyRenameError::InvalidTargetKey);
+    }
+    if from == to {
+        return Err(EnvKeyRenameError::SameKey);
+    }
+
+    let entries = parse_env_entries(content);
+    let source_lines = entries
+        .iter()
+        .filter(|entry| entry.key == from)
+        .map(|entry| entry.line_number)
+        .collect::<Vec<_>>();
+    let target_lines = entries
+        .iter()
+        .filter(|entry| entry.key == to)
+        .map(|entry| entry.line_number)
+        .collect::<Vec<_>>();
+
+    if !target_lines.is_empty() {
+        return Err(if source_lines.is_empty() {
+            EnvKeyRenameError::Indeterminate {
+                line_numbers: target_lines,
+            }
+        } else {
+            EnvKeyRenameError::TargetExists {
+                line_numbers: target_lines,
+            }
+        });
+    }
+
+    let source = match entries
+        .iter()
+        .filter(|entry| entry.key == from)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [] => return Err(EnvKeyRenameError::SourceMissing),
+        [source] => *source,
+        _ => {
+            return Err(EnvKeyRenameError::SourceDuplicate {
+                line_numbers: source_lines,
+            })
+        }
+    };
+    if source.diagnostic.is_some() {
+        return Err(EnvKeyRenameError::SourceMalformed {
+            line_number: source.line_number,
+        });
+    }
+
+    let mut updated = String::with_capacity(content.len() + to.len());
+    updated.push_str(&content[..source.key_start]);
+    updated.push_str(to);
+    updated.push_str(&content[source.key_end..]);
+    Ok(updated)
+}
+
 fn env_value_token<'a>(content: &'a str, entry: &ParsedLine) -> EnvValueToken<'a> {
     let (start, end) = env_value_token_bounds(entry);
     EnvValueToken {
@@ -1879,6 +2070,8 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
         quote,
         comment,
         line_start: entry_start,
+        key_start: line_start + key_start,
+        key_end: line_start + key_end,
         value_start,
         value_end,
         next_start,
@@ -3854,6 +4047,116 @@ mod tests {
             fs::read_to_string(&env_file).unwrap(),
             "PORT=1420\nDEBUG=true\n"
         );
+    }
+
+    #[test]
+    fn rename_changes_only_the_key_token() {
+        let content = "\u{feff}# keep\r\nexport TOKEN = \"alpha\\\"beta\" # local\r\nPORT=1420\r\n";
+
+        let updated = rename_env_key_content(content, "TOKEN", "API_TOKEN").unwrap();
+
+        assert_eq!(
+            updated,
+            "\u{feff}# keep\r\nexport API_TOKEN = \"alpha\\\"beta\" # local\r\nPORT=1420\r\n"
+        );
+    }
+
+    #[test]
+    fn rename_preserves_a_multiline_value_and_a_final_line_without_a_newline() {
+        let multiline = rename_env_key_content(
+            "A=1\nPRIVATE_KEY=\"line one\nline two\"\nB=2\n",
+            "PRIVATE_KEY",
+            "SIGNING_KEY",
+        )
+        .unwrap();
+        assert_eq!(multiline, "A=1\nSIGNING_KEY=\"line one\nline two\"\nB=2\n");
+
+        let trailing = rename_env_key_content("A=1\nTOKEN=one", "TOKEN", "API_TOKEN").unwrap();
+        assert_eq!(trailing, "A=1\nAPI_TOKEN=one");
+    }
+
+    #[test]
+    fn rename_refuses_an_existing_target_and_never_merges_two_keys() {
+        assert!(matches!(
+            rename_env_key_content("TOKEN=one\nAPI_TOKEN=two\n", "TOKEN", "API_TOKEN"),
+            Err(EnvKeyRenameError::TargetExists { ref line_numbers }) if line_numbers == &[2]
+        ));
+    }
+
+    #[test]
+    fn rename_refuses_to_claim_a_rename_it_cannot_prove() {
+        assert!(matches!(
+            rename_env_key_content("API_TOKEN=two\n", "TOKEN", "API_TOKEN"),
+            Err(EnvKeyRenameError::Indeterminate { ref line_numbers }) if line_numbers == &[1]
+        ));
+    }
+
+    #[test]
+    fn rename_refuses_missing_duplicate_malformed_invalid_and_identical_keys() {
+        assert!(matches!(
+            rename_env_key_content("PORT=1420\n", "TOKEN", "API_TOKEN"),
+            Err(EnvKeyRenameError::SourceMissing)
+        ));
+        assert!(matches!(
+            rename_env_key_content("TOKEN=one\nTOKEN=two\n", "TOKEN", "API_TOKEN"),
+            Err(EnvKeyRenameError::SourceDuplicate { ref line_numbers }) if line_numbers == &[1, 2]
+        ));
+        assert!(matches!(
+            rename_env_key_content("TOKEN=\"not closed\n", "TOKEN", "API_TOKEN"),
+            Err(EnvKeyRenameError::SourceMalformed { line_number: 1 })
+        ));
+        assert!(matches!(
+            rename_env_key_content("TOKEN=one\n", "not a key", "API_TOKEN"),
+            Err(EnvKeyRenameError::InvalidSourceKey)
+        ));
+        assert!(matches!(
+            rename_env_key_content("TOKEN=one\n", "TOKEN", "not a key"),
+            Err(EnvKeyRenameError::InvalidTargetKey)
+        ));
+        assert!(matches!(
+            rename_env_key_content("TOKEN=one\n", "TOKEN", "TOKEN"),
+            Err(EnvKeyRenameError::SameKey)
+        ));
+    }
+
+    #[test]
+    fn rename_error_messages_name_keys_and_lines_without_values() {
+        assert_eq!(
+            EnvKeyRenameError::TargetExists {
+                line_numbers: vec![4]
+            }
+            .message("TOKEN", "API_TOKEN"),
+            "`API_TOKEN` already exists at line 4; remove it before renaming `TOKEN` onto it"
+        );
+        assert_eq!(
+            EnvKeyRenameError::Indeterminate {
+                line_numbers: vec![4]
+            }
+            .message("TOKEN", "API_TOKEN"),
+            "`TOKEN` is absent and `API_TOKEN` is present at line 4; vne cannot confirm from file state that this rename already happened"
+        );
+        assert_eq!(
+            EnvKeyRenameError::SourceMissing.message("TOKEN", "API_TOKEN"),
+            "`TOKEN` was not found"
+        );
+    }
+
+    #[test]
+    fn rename_is_not_retry_safe_and_says_so_instead_of_writing_again() {
+        let dir = tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        fs::write(&env_file, "PORT=1420\nTOKEN=one # keep\n").unwrap();
+
+        let outcome = rename_env_key(&env_file, "TOKEN", "API_TOKEN").unwrap();
+        assert_eq!(outcome.disposition, EnvKeyRenameDisposition::Renamed);
+        assert_eq!(outcome.keys.from, "TOKEN");
+        assert_eq!(outcome.keys.to, "API_TOKEN");
+        let renamed = "PORT=1420\nAPI_TOKEN=one # keep\n";
+        assert_eq!(fs::read_to_string(&env_file).unwrap(), renamed);
+
+        let retried = rename_env_key(&env_file, "TOKEN", "API_TOKEN").unwrap_err();
+        assert!(matches!(retried, EnvKeyRenameError::Indeterminate { .. }));
+        assert_eq!(fs::read_to_string(&env_file).unwrap(), renamed);
     }
 
     #[test]

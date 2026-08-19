@@ -1308,3 +1308,106 @@ fn rm_text_receipt_contains_metadata_only() {
     );
     assert_eq!(fs::read_to_string(&env_file).unwrap(), "PORT=1420\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn rename_json_is_payload_free_and_touches_only_the_key_token() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let initial = format!(
+        "\u{feff}# keep\r\nexport OPENAI_KEY = \"sk-{STORED_SENTINEL}\" # local\r\nPORT=1420\r\n"
+    );
+    write(&env_file, &initial);
+    fs::set_permissions(&env_file, fs::Permissions::from_mode(0o640)).unwrap();
+
+    let args = [
+        "rename".to_string(),
+        env_file.display().to_string(),
+        "OPENAI_KEY".to_string(),
+        "OPENAI_API_KEY".to_string(),
+        "--json".to_string(),
+    ];
+
+    let renamed = run_vne(args.clone());
+
+    assert_eq!(renamed.status.code(), Some(0));
+    assert!(renamed.stderr.is_empty());
+    let renamed_json = assert_payload_absent(&renamed, &[STORED_SENTINEL]);
+    assert_eq!(renamed_json["disposition"], "renamed");
+    assert_eq!(renamed_json["keys"]["from"], "OPENAI_KEY");
+    assert_eq!(renamed_json["keys"]["to"], "OPENAI_API_KEY");
+    assert_eq!(
+        renamed_json["path"],
+        env_file.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(renamed_json.as_object().unwrap().len(), 3);
+    assert_eq!(
+        fs::read_to_string(&env_file).unwrap(),
+        initial.replace("OPENAI_KEY", "OPENAI_API_KEY")
+    );
+    assert_eq!(
+        fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+
+    // A repeat run cannot prove the earlier rename happened, so it refuses.
+    let retried = run_vne(args);
+
+    assert_eq!(retried.status.code(), Some(2));
+    assert!(retried.stdout.is_empty());
+    let stderr = String::from_utf8(retried.stderr).unwrap();
+    assert!(stderr.contains("cannot confirm"), "{stderr}");
+    assert!(!stderr.contains(STORED_SENTINEL), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&env_file).unwrap(),
+        initial.replace("OPENAI_KEY", "OPENAI_API_KEY")
+    );
+}
+
+#[test]
+fn rename_refusals_are_payload_free_and_leave_the_file_unchanged() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let initial = format!(
+        "TOKEN={STORED_SENTINEL}\nAPI_TOKEN={KEEP_SENTINEL}\nDUPLICATED=one\nDUPLICATED=two\n"
+    );
+    write(&env_file, &initial);
+
+    let path = env_file.display().to_string();
+    let cases = [
+        (
+            "target exists",
+            vec!["rename", &path, "TOKEN", "API_TOKEN", "--json"],
+            "already exists at line 2",
+        ),
+        (
+            "source missing",
+            vec!["rename", &path, "ABSENT_KEY", "BRAND_NEW", "--json"],
+            "was not found",
+        ),
+        (
+            "source duplicated",
+            vec!["rename", &path, "DUPLICATED", "BRAND_NEW", "--json"],
+            "ambiguous at lines 3, 4",
+        ),
+        (
+            "identical keys",
+            vec!["rename", &path, "TOKEN", "TOKEN", "--json"],
+            "are the same key",
+        ),
+    ];
+
+    for (name, arguments, fragment) in cases {
+        let output = run_vne(arguments);
+
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(fragment), "{name}: {stderr}");
+        assert!(!stderr.contains(STORED_SENTINEL), "{name}: {stderr}");
+        assert!(!stderr.contains(KEEP_SENTINEL), "{name}: {stderr}");
+        assert_eq!(fs::read_to_string(&env_file).unwrap(), initial, "{name}");
+    }
+}
