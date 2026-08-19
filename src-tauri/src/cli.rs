@@ -3,8 +3,9 @@ use crate::{
     ensure_project_env_file, infer_key_shape, parse_env_file, redact_env_file_values_only,
     redact_snapshot_values_only, remove_env_key, rename_env_key, set_env_key,
     withhold_all_env_file_payloads, withhold_all_snapshot_payloads, EnsureEnvFileOutcome,
-    EnvComparison, EnvFile, EnvFileCreationDisposition, EnvKeyCopyDisposition, EnvKeyExpectation,
-    EnvKeyRemoveDisposition, EnvKeyRemoveSelector, EnvKeySetDisposition, ProjectSnapshot,
+    EnvComparison, EnvFile, EnvFileCreationDisposition, EnvFileGitStatus, EnvKeyCopyDisposition,
+    EnvKeyExpectation, EnvKeyRemoveDisposition, EnvKeyRemoveSelector, EnvKeySetDisposition,
+    ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
@@ -551,6 +552,7 @@ fn run_add(
         append_env_key_result(&content, key, value).map_err(|error| error.message(key))?;
 
     atomic_write_preserving_permissions(file, &updated)?;
+    warn_when_tracked_by_git(file)?;
 
     if output.wants_json() {
         let file = project_env_file_for_output(load_env_file(file)?, value_output);
@@ -569,6 +571,9 @@ fn run_set(
     output: OutputFormat,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let outcome = set_env_key(file, key, value).map_err(|error| error.message(key))?;
+    if outcome.disposition == EnvKeySetDisposition::Updated {
+        warn_when_tracked_by_git(Path::new(&outcome.path))?;
+    }
 
     if output.wants_json() {
         print_json(&outcome, output)?;
@@ -595,6 +600,9 @@ fn run_rm(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let outcome =
         remove_env_key(file, key, selector, expectation).map_err(|error| error.message(key))?;
+    if outcome.disposition != EnvKeyRemoveDisposition::AlreadyAbsent {
+        warn_when_tracked_by_git(Path::new(&outcome.path))?;
+    }
 
     if output.wants_json() {
         print_json(&outcome, output)?;
@@ -640,6 +648,7 @@ fn run_rename(
     output: OutputFormat,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let outcome = rename_env_key(file, from, to).map_err(|error| error.message(from, to))?;
+    warn_when_tracked_by_git(Path::new(&outcome.path))?;
 
     if output.wants_json() {
         print_json(&outcome, output)?;
@@ -678,6 +687,9 @@ fn run_copy(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let outcome = copy_env_key(source_file, key, destination_file, overwrite)
         .map_err(|error| error.message(key))?;
+    if outcome.disposition != EnvKeyCopyDisposition::AlreadyPresent {
+        warn_when_tracked_by_git(Path::new(&outcome.destination_path))?;
+    }
 
     if output.wants_json() {
         print_json(&outcome, output)?;
@@ -742,7 +754,22 @@ fn project_env_file_for_output(file: EnvFile, value_output: ValueOutput) -> EnvF
 fn load_env_file(path: &Path) -> Result<EnvFile, Box<dyn std::error::Error>> {
     let content = read_to_string_with_path(path)?;
     let display_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    Ok(parse_env_file(&display_path, content))
+    let mut file = parse_env_file(&display_path, content);
+    file.git_status = crate::git::env_file_git_status(&display_path);
+    Ok(file)
+}
+
+/// One stderr line when a mutation just landed in a file git already tracks.
+/// It never blocks the write and never names a value.
+fn warn_when_tracked_by_git(path: &Path) -> io::Result<()> {
+    if crate::git::env_file_git_status(path) != EnvFileGitStatus::Tracked {
+        return Ok(());
+    }
+
+    stderr_line(format_args!(
+        "warning: {} is tracked by git; committing an env file can publish its secrets",
+        path.display()
+    ))
 }
 
 fn read_to_string_with_path(path: &Path) -> io::Result<String> {
@@ -784,11 +811,12 @@ fn print_file_summary(file: &EnvFile) -> io::Result<()> {
         .filter(|entry| entry.shape.redacted_by_default)
         .count();
     stdout_line(format_args!(
-        "{}: {} keys, {} diagnostics, {} redacted",
+        "{}: {} keys, {} diagnostics, {} redacted, {}",
         file.path,
         file.entries.len(),
         file.diagnostics.len(),
-        redacted
+        redacted,
+        file.git_status.label()
     ))?;
 
     for diagnostic in &file.diagnostics {

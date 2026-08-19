@@ -15,6 +15,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         discoveryReasons: ['direct env filename `.env`'],
         diagnostics: ['Duplicate key `FEATURE_ENABLED`'],
         duplicateKeys: ['FEATURE_ENABLED'],
+        gitStatus: 'untrackedIgnored',
         content:
           '# local development\nDATABASE_URL="postgres://localhost/vne"\nREDIS_URL=redis://localhost:6379\nOPENAI_API_KEY=sk-local-redacted\nPRIVATE_KEY="-----BEGIN KEY-----\nabc123\n-----END KEY-----"\nNEXT_PUBLIC_SITE_URL=http://localhost:1420\nNEXT_PUBLIC_API_KEY=sk-browser-leak\nPORT=1420 # dev server\nFEATURE_ENABLED=true\nFEATURE_ENABLED=false\n',
         entries: [
@@ -48,6 +49,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         discoveryReasons: ['direct env filename `.env.example`'],
         diagnostics: [],
         duplicateKeys: [],
+        gitStatus: 'tracked',
         content: 'DATABASE_URL=\nREDIS_URL=\nSTRIPE_SECRET_KEY=\nNEXT_PUBLIC_SITE_URL=\nPORT=1420\n',
         entries: [
           entry('DATABASE_URL', '', 'Credential URL / DSN', 'credential-url', true, 1, [
@@ -69,6 +71,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         discoveryReasons: ['direct env filename `.env.local`'],
         diagnostics: [],
         duplicateKeys: [],
+        gitStatus: 'untrackedIgnored',
         content: 'DATABASE_URL="postgres://localhost/vne_local"\nOPENAI_API_KEY=sk-local-override\n',
         entries: [
           entry('DATABASE_URL', 'postgres://localhost/vne_local', 'Credential URL / DSN', 'credential-url', true, 1, [
@@ -87,6 +90,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         discoveryReasons: ['package.json script `worker`'],
         diagnostics: [],
         duplicateKeys: [],
+        gitStatus: 'untrackedNotIgnored',
         content: 'QUEUE_URL=redis://localhost:6379\nWORKER_CONCURRENCY=4\n',
         entries: [
           entry('QUEUE_URL', 'redis://localhost:6379', 'URL / DSN', 'url', false, 1, ['URL-like name or value']),

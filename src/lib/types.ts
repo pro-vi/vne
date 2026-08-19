@@ -14,6 +14,13 @@ export interface EnsureEnvFileOutcome {
   path: string;
 }
 
+export type EnvFileGitStatus =
+  | 'tracked'
+  | 'untrackedIgnored'
+  | 'untrackedNotIgnored'
+  | 'outsideRepository'
+  | 'unknown';
+
 export interface EnvFile {
   path: string;
   name: string;
@@ -21,6 +28,7 @@ export interface EnvFile {
   entries: EnvEntry[];
   diagnostics: string[];
   duplicateKeys: string[];
+  gitStatus: EnvFileGitStatus;
   content: string;
 }
 

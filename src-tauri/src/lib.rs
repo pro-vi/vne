@@ -11,6 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::os::unix::fs::OpenOptionsExt;
 
 pub mod cli;
+pub mod git;
+
+pub use git::EnvFileGitStatus;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -134,6 +137,9 @@ pub struct EnvFile {
     pub entries: Vec<EnvEntry>,
     pub diagnostics: Vec<String>,
     pub duplicate_keys: Vec<String>,
+    /// Exposure of this file to git. The pure parser cannot know it and leaves
+    /// `Unknown`; the filesystem-aware loaders fill it in.
+    pub git_status: EnvFileGitStatus,
     pub content: String,
 }
 
@@ -806,7 +812,10 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
         .into_iter()
         .filter_map(|(path, reasons)| {
             fs::read_to_string(&path).ok().map(|content| {
-                parse_env_file_with_reasons(&path, content, reasons.into_iter().collect())
+                let mut file =
+                    parse_env_file_with_reasons(&path, content, reasons.into_iter().collect());
+                file.git_status = git::env_file_git_status(&path);
+                file
             })
         })
         .collect::<Vec<_>>();
@@ -895,6 +904,7 @@ pub fn redact_env_file_values_only(file: EnvFile) -> EnvFile {
         entries,
         diagnostics,
         duplicate_keys,
+        git_status,
         content: _,
     } = redact_env_file(file);
 
@@ -908,6 +918,7 @@ pub fn redact_env_file_values_only(file: EnvFile) -> EnvFile {
             .collect(),
         diagnostics,
         duplicate_keys,
+        git_status,
         content: ALL_CONTENT_WITHHELD.to_string(),
     }
 }
@@ -920,6 +931,7 @@ pub fn withhold_all_env_file_payloads(file: EnvFile) -> EnvFile {
         entries,
         diagnostics,
         duplicate_keys,
+        git_status,
         content: _,
     } = file;
 
@@ -933,6 +945,7 @@ pub fn withhold_all_env_file_payloads(file: EnvFile) -> EnvFile {
             .collect(),
         diagnostics,
         duplicate_keys,
+        git_status,
         content: ALL_CONTENT_WITHHELD.to_string(),
     }
 }
@@ -1114,6 +1127,7 @@ fn parse_env_file_with_reasons(
         entries,
         diagnostics,
         duplicate_keys: duplicate_keys.into_iter().collect(),
+        git_status: EnvFileGitStatus::Unknown,
         content,
     }
 }

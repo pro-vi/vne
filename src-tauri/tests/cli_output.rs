@@ -1481,3 +1481,150 @@ fn add_warns_only_when_a_secret_like_value_arrives_as_a_command_argument() {
         fs::read_to_string(&argument_file).unwrap()
     );
 }
+
+fn git_in(directory: &Path, arguments: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("git should run in tests");
+    assert!(status.success(), "git {arguments:?} failed");
+}
+
+#[test]
+fn inspect_reports_git_exposure_for_every_discovered_env_file() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    git_in(root, &["init", "--quiet"]);
+    git_in(root, &["config", "user.email", "test@example.invalid"]);
+    git_in(root, &["config", "user.name", "vne test"]);
+
+    write(&root.join(".gitignore"), ".env.local\n");
+    write(&root.join(".env"), &format!("TOKEN={STORED_SENTINEL}\n"));
+    write(
+        &root.join(".env.local"),
+        &format!("TOKEN={KEEP_SENTINEL}\n"),
+    );
+    write(&root.join(".env.production"), "PORT=1420\n");
+    git_in(root, &["add", ".gitignore", ".env"]);
+    git_in(root, &["commit", "--quiet", "-m", "add env"]);
+
+    let output = run_vne([
+        "inspect".to_string(),
+        root.display().to_string(),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let json = assert_payload_absent(&output, &[STORED_SENTINEL, KEEP_SENTINEL]);
+    let states = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["name"].as_str().unwrap().to_string(),
+                file["gitStatus"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        states.contains(&(".env".to_string(), "tracked".to_string())),
+        "{states:?}"
+    );
+    assert!(
+        states.contains(&(".env.local".to_string(), "untrackedIgnored".to_string())),
+        "{states:?}"
+    );
+    assert!(
+        states.contains(&(
+            ".env.production".to_string(),
+            "untrackedNotIgnored".to_string()
+        )),
+        "{states:?}"
+    );
+
+    let text = run_vne([
+        "check".to_string(),
+        root.join(".env").display().to_string(),
+        "--text".to_string(),
+    ]);
+    assert_eq!(text.status.code(), Some(0));
+    let summary = String::from_utf8(text.stdout).unwrap();
+    assert!(summary.contains("git tracked"), "{summary}");
+}
+
+#[test]
+fn mutating_a_tracked_file_warns_on_stderr_without_blocking_the_write() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    git_in(root, &["init", "--quiet"]);
+    git_in(root, &["config", "user.email", "test@example.invalid"]);
+    git_in(root, &["config", "user.name", "vne test"]);
+
+    let tracked = root.join(".env");
+    write(&tracked, "PORT=1420\n");
+    git_in(root, &["add", ".env"]);
+    git_in(root, &["commit", "--quiet", "-m", "add env"]);
+    let ignored = root.join(".env.local");
+    write(&ignored, "PORT=1421\n");
+    write(&root.join(".gitignore"), ".env.local\n");
+
+    let warned = run_vne([
+        "add".to_string(),
+        tracked.display().to_string(),
+        "FEATURE_FLAG=true".to_string(),
+        "--json".to_string(),
+    ]);
+    assert_eq!(warned.status.code(), Some(0));
+    let stderr = String::from_utf8(warned.stderr).unwrap();
+    assert!(stderr.contains("is tracked by git"), "{stderr}");
+    assert!(stderr.contains("can publish its secrets"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&tracked).unwrap(),
+        "PORT=1420\nFEATURE_FLAG=true\n"
+    );
+
+    let quiet = run_vne([
+        "add".to_string(),
+        ignored.display().to_string(),
+        "FEATURE_FLAG=true".to_string(),
+        "--json".to_string(),
+    ]);
+    assert_eq!(quiet.status.code(), Some(0));
+    assert!(
+        quiet.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+
+    // A convergent no-op writes nothing, so it must not warn either.
+    let removed = run_vne([
+        "rm".to_string(),
+        tracked.display().to_string(),
+        "ABSENT_KEY".to_string(),
+        "--json".to_string(),
+    ]);
+    assert_eq!(removed.status.code(), Some(0));
+    assert!(
+        removed.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+
+    let renamed = run_vne([
+        "rename".to_string(),
+        tracked.display().to_string(),
+        "FEATURE_FLAG".to_string(),
+        "FEATURE_ENABLED".to_string(),
+        "--json".to_string(),
+    ]);
+    assert_eq!(renamed.status.code(), Some(0));
+    assert!(String::from_utf8(renamed.stderr)
+        .unwrap()
+        .contains("is tracked by git"));
+}
