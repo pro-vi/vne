@@ -13,7 +13,7 @@
 - Rust parser and writer: trusted local code that reads and writes files selected by the user.
 - Svelte UI: trusted local code that renders parsed values and sends explicit commands to the Tauri backend. Default snapshots do not include raw secret-like values in parsed entries; Reveal fetches only one selected key occurrence into the local webview.
 - Tauri command boundary: only local UI invokes project scan, root-level env-file creation, value save, and value-required missing-key insertion.
-- CLI stdout and stderr: output may be retained by shells, CI, pipes, or agent transcripts. Structured JSON withholds env payloads by default; `--values` explicitly opts into classifier-approved entry values while comments and raw content remain withheld. `create` emits only a disposition and absolute path. `copy` emits only a disposition, normalized source and destination paths, and a key.
+- CLI stdout and stderr: output may be retained by shells, CI, pipes, or agent transcripts. Structured JSON withholds env payloads by default; `--values` explicitly opts into classifier-approved entry values while comments and raw content remain withheld. `create` emits only a disposition and absolute path. `copy` emits only a disposition, normalized source and destination paths, and a key. `set`, `rm`, `rename`, and `example` emit only a disposition, normalized paths, key names, and line numbers.
 - Native dialog: used only to pick a local directory.
 - Network: not part of the product path for env contents.
 
@@ -34,6 +34,12 @@
 - Missing-key insertion requires an explicit non-empty value; it refuses duplicate, invalid, or empty keys and returns a fresh project snapshot.
 - Env-file creation accepts one validated root-level filename in the desktop app. The shared Rust primitive canonicalizes the root, derives the target itself, and uses exclusive creation. It creates exactly zero bytes, uses owner-private permissions on Unix, never follows a final-component symlink, never truncates an existing regular file, and reports retries as `alreadyExists`.
 - Creation and project refresh are separate operations. A refresh failure after successful creation is reported as “created, refresh failed” so retrying cannot accidentally overwrite or obscure the durable outcome.
+- Env-key set is update-only and refuses every argument value form: the new value arrives from stdin or a hidden prompt, never from argv, where shell history and process lists would retain it. It refuses missing, duplicate, and malformed keys, and an identical parsed value reports `alreadyPresent` without writing.
+- Env-key removal splices whole lines from one read snapshot in a single atomic write. `--line <N>` is a one-shot selector: when line N does not hold the named key it fails with the key it actually found and writes nothing, so a stale line number cannot delete whichever entry shifted into that line. `--expect present|absent` converts a wrong belief about the key's state into exit 2 before any write.
+- Env-key rename changes only the key token; the value bytes, quoting, inline comment, `export` prefix, and line position stay identical. When the old key is absent and the new key is present it refuses rather than reporting a convergent success, because file state cannot prove that a rename produced that arrangement.
+- Example sync is additive only. It appends the missing key names as valueless placeholders, never copies a value, never rewrites or deletes an existing example line, and drops an inline comment that itself trips the secret scan.
+- `add` warns on stderr when a secret-looking value arrives as a command argument, naming the key only, and steers to `--stdin` or `--prompt`.
+- Every env file carries a git exposure state (`tracked`, `untrackedIgnored`, `untrackedNotIgnored`, `outsideRepository`, `unknown`) derived by read-only `git` plumbing commands that never read the file's contents. Mutating commands warn on stderr when a write landed in a tracked file. The warning never blocks the write.
 - Env-key copy resolves two distinct existing regular-file targets, selects one diagnostic-free source occurrence, and transfers its exact value token without returning it to the CLI layer. It refuses missing, malformed, and duplicate source keys; refuses duplicate destination keys; and requires `--overwrite` for one different destination value. An identical token returns `alreadyPresent` without writing, so retry after an output failure converges.
 - Atomic rewrites use an exclusively created same-directory temporary file with destination permissions, complete and sync its bytes before rename, and clean it up on pre-persist failure. This prevents partial destination bytes and predictable-temp symlink attacks; it does not lock out non-cooperating concurrent writers or sync the containing directory.
 - Missing/new-key form protection derives from Rust-produced key-shape metadata. Unknown or conflicting keys default to password input until the local user explicitly chooses Show; the Svelte UI does not maintain a second secret-name registry.
@@ -54,6 +60,12 @@
 
 ## Known Residual Risks
 
+- Dispositions disclose value equality. `alreadyPresent` on `set` or `copy` tells the caller that the value it supplied equals the stored one, and exit codes carry the same fact. vne's guarantee is that values never appear in its output, not that no value-derived fact is inferable; any local process with file access can read env files directly.
+- `rm --line <N>` protects against a stale line number that now holds a different entry, but not against two occurrences of the same key on adjacent lines: after the first is removed the second moves into line N, and an identical retry deletes it. File state cannot distinguish that retry from a fresh intent, which is the same limit that makes `rename` refuse to claim `alreadyRenamed`.
+- Example sync never prunes. A key retired from the real env file stays in the example file until someone removes it by hand; `vne example` will not report it.
+- Git exposure is a point-in-time read of git's index and ignore rules through a child process. It can be stale by the time a write happens, reports `unknown` when git is absent or a git invocation fails, and `tracked` means git holds the file now, not that a commit has already published it. A hung `git` would hang the command; there is no timeout.
+- All mutating commands remain one read, one transform, one atomic write. Concurrent external editors are still last-write-wins: vne does not lock a file against a non-cooperating writer.
+
 - Reveal intentionally serializes one selected raw value into the trusted local webview and shows it to the local user.
 - Parsed raw values are present inside the trusted Rust process during scans, writes, and per-entry reveal. A selected raw value enters the Svelte process only after the explicit Reveal command; this is still a local trust boundary, not OS-level secret isolation.
 - `copy` intentionally holds the selected source value token inside the trusted Rust process. Its atomic rewrite preserves `std::fs::Permissions`, but does not promise inode identity, ownership changes, ACLs, extended attributes, or protection from a concurrent external writer.
@@ -72,6 +84,6 @@
 - Re-check path-scope, symlink, idempotency, and no-clobber behavior around write commands after any command-surface change.
 - Re-review CSP after any asset, protocol, iframe, style, or network-surface change.
 - Verify raw values are absent from structured logs and error paths.
-- Verify `copy` sentinel values are absent from stdout, stderr, errors, and child-process arguments on every success and failure path.
+- Verify `copy`, `set`, `rm`, `rename`, and `example` sentinel values are absent from stdout, stderr, errors, and child-process arguments on every success and failure path.
 - Verify macOS signing/notarization choices with explicit user approval.
 - Capture screenshots using a local browser-control surface.

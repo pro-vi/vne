@@ -35,14 +35,10 @@ fn print_desktop_usage_error(error: &str) -> io::Result<()> {
     stderr_line(format_args!(""))?;
     stderr_line(format_args!("USAGE:"))?;
     stderr_line(format_args!("  vne [project-dir]"))?;
-    stderr_line(format_args!("  vne create <file> [--text|--json|--pretty]"))?;
-    stderr_line(format_args!(
-        "  vne add <file> <KEY> --prompt [--json] [--values]"
-    ))?;
-    stderr_line(format_args!(
-        "  vne inspect <dir> [--text|--json|--pretty] [--values]"
-    ))?;
-    stderr_line(format_args!("  vne help"))
+    stderr_line(format_args!(""))?;
+    // The command surface lives in one place, `cli::usage_text`. Repeating a
+    // subset of it here is how this message went stale before.
+    stderr_line(format_args!("Run `vne help` for the command surface."))
 }
 
 fn stderr_line(args: fmt::Arguments<'_>) -> io::Result<()> {
