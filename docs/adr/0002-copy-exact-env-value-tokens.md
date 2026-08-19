@@ -60,7 +60,7 @@ Negative:
 
 ## Revisit Triggers
 
-- A destination-key rename use case is demonstrated.
+- A destination-key rename use case is demonstrated. *(Fired 2026-08-19; answered by ADR 0003, which renames the key token in place instead of transferring a value token.)*
 - The parser gains a specified, tested decoded dotenv value representation.
 - Concurrent external writers become part of the supported contract.
 - Permission preservation must include ACLs or extended attributes.
