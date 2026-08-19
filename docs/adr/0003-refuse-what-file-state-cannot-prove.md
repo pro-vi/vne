@@ -43,7 +43,17 @@ end of file. `--expect present|absent` lets a caller turn a convergent no-op
 into exit 2 when convergence would hide a wrong belief.
 
 `set` accepts its value only from stdin or a hidden prompt. No argument form
-exists, and `add` warns when a secret-looking value arrives through one.
+exists, and `add` warns when a secret-looking value arrives through one. `set`
+also refuses an empty or whitespace value unless `--allow-empty` says so: a
+pipeline that produced nothing is indistinguishable from a deliberate clear, and
+the difference is somebody's stored secret.
+
+No message echoes the value half of an argument. A caller who pastes
+`KEY=secret` where a key name belongs gets `KEY=…` and a sentence naming the
+mistake; `rm` and `rename` refuse such an argument at parse time, as `set`
+already did. This holds for rejected keys, unknown options, the secret-like
+argument warning, and the hidden prompt's label, because stderr is what shell
+history, CI logs, and agent transcripts keep.
 
 Receipts keep their convergence states, and the README, `vne help`, and
 `docs/THREAT_MODEL.md` state the resulting claim scope: values never appear in
@@ -102,6 +112,8 @@ Negative:
 ## Revisit Triggers
 
 - A caller needs to remove a malformed entry and has no editor available.
+- Storing an empty value becomes common enough that `--allow-empty` is friction
+  rather than a guard.
 - The desktop app needs delete or rename, which would move these cores behind
   Tauri commands.
 - An occurrence count on the `rm` receipt is wanted so a surviving duplicate is

@@ -100,6 +100,7 @@ enum Command {
         file: PathBuf,
         key: String,
         value: ValueSource,
+        allow_empty: bool,
         output: OutputFormat,
     },
     Remove {
@@ -254,23 +255,25 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             output,
             values,
         } => {
-            prepare_add_target(&file, matches!(&value, ValueSource::Prompt))?;
-            let from_argument = matches!(&value, ValueSource::Inline(_));
-            let value = resolve_value_source(&key, value)?;
-            if from_argument {
-                warn_on_secret_like_argument(&key, &value)?;
+            // Warn first: the value is already in the process list and the
+            // shell history, so a later failure does not un-expose it.
+            if let ValueSource::Inline(value) = &value {
+                warn_on_secret_like_argument(&key, value)?;
             }
+            prepare_add_target(&file, matches!(&value, ValueSource::Prompt))?;
+            let value = resolve_value_source(&key, value)?;
             run_add(&file, &key, &value, output, values)
         }
         Command::Set {
             file,
             key,
             value,
+            allow_empty,
             output,
         } => {
             prepare_set_target(&file)?;
             let value = resolve_value_source(&key, value)?;
-            run_set(&file, &key, &value, output)
+            run_set(&file, &key, &value, allow_empty, output)
         }
         Command::Remove {
             file,
@@ -321,8 +324,11 @@ fn warn_on_secret_like_argument(key: &str, value: &str) -> io::Result<()> {
         return Ok(());
     }
 
+    // The key is caller-supplied and may itself be a `KEY=VALUE` assignment, so
+    // it goes through the same elision as any other echoed argument.
     stderr_line(format_args!(
-        "warning: `{key}` looks secret-like and its value came from a command argument, which shell history and process lists can retain; use --stdin or --prompt instead"
+        "warning: `{}` looks secret-like and its value came from a command argument, which shell history and process lists can retain; use --stdin or --prompt instead",
+        argument_label(key)
     ))
 }
 
@@ -424,7 +430,7 @@ fn read_prompted_value(key: &str) -> Result<String, Box<dyn std::error::Error>> 
     }
 
     let read_result = (|| -> io::Result<String> {
-        stderr(format_args!("value for {key}: "))?;
+        stderr(format_args!("value for {}: ", argument_label(key)))?;
         let mut value = String::new();
         io::stdin().read_line(&mut value)?;
         Ok(value)
@@ -583,9 +589,10 @@ fn run_set(
     file: &Path,
     key: &str,
     value: &str,
+    allow_empty: bool,
     output: OutputFormat,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let outcome = set_env_key(file, key, value).map_err(|error| error.message(key))?;
+    let outcome = set_env_key(file, key, value, allow_empty).map_err(|error| error.message(key))?;
     if outcome.disposition == EnvKeySetDisposition::Updated {
         warn_when_tracked_by_git(Path::new(&outcome.path))?;
     }
@@ -944,14 +951,14 @@ fn parse_check_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Check,
-                    format!("unknown check option `{arg}`"),
+                    format!("unknown check option `{}`", argument_label(&arg)),
                 ));
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Check,
-                    format!("unexpected check argument `{arg}`"),
+                    format!("unexpected check argument `{}`", argument_label(&arg)),
                 ));
             }
         }
@@ -984,14 +991,14 @@ fn parse_inspect_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Inspect,
-                    format!("unknown inspect option `{arg}`"),
+                    format!("unknown inspect option `{}`", argument_label(&arg)),
                 ));
             }
             _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Inspect,
-                    format!("unexpected inspect argument `{arg}`"),
+                    format!("unexpected inspect argument `{}`", argument_label(&arg)),
                 ));
             }
         }
@@ -1018,14 +1025,14 @@ fn parse_format_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Format,
-                    format!("unknown format option `{arg}`"),
+                    format!("unknown format option `{}`", argument_label(&arg)),
                 ));
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Format,
-                    format!("unexpected format argument `{arg}`"),
+                    format!("unexpected format argument `{}`", argument_label(&arg)),
                 ));
             }
         }
@@ -1113,10 +1120,12 @@ fn parse_add_args(args: ArgIter) -> Result<Command, ParseError> {
 fn parse_set_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut output = OutputFormat::Auto;
     let mut value = None;
+    let mut allow_empty = false;
     let mut positionals = Vec::new();
 
     for arg in args {
         match arg.as_str() {
+            "--allow-empty" => allow_empty = true,
             "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Set)?,
             "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Set)?,
             "--pretty" => set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Set)?,
@@ -1126,7 +1135,10 @@ fn parse_set_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Set,
-                    format!("unknown set option `{arg}`; {SET_VALUE_SOURCE_RULE}"),
+                    format!(
+                        "unknown set option `{}`; {SET_VALUE_SOURCE_RULE}",
+                        argument_label(&arg)
+                    ),
                 ));
             }
             _ => positionals.push(arg),
@@ -1153,6 +1165,7 @@ fn parse_set_args(args: ArgIter) -> Result<Command, ParseError> {
         file: PathBuf::from(file),
         key: key.clone(),
         value,
+        allow_empty,
         output,
     })
 }
@@ -1216,7 +1229,7 @@ fn parse_rm_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Remove,
-                    format!("unknown rm option `{arg}`"),
+                    format!("unknown rm option `{}`", argument_label(&arg)),
                 ));
             }
             _ => positionals.push(arg),
@@ -1234,6 +1247,9 @@ fn parse_rm_args(args: ArgIter) -> Result<Command, ParseError> {
             HelpTopic::Remove,
             "rm requires a non-empty key",
         ));
+    }
+    if key.contains('=') {
+        return Err(assignment_in_key_slot(HelpTopic::Remove, "rm"));
     }
 
     Ok(Command::Remove {
@@ -1274,7 +1290,7 @@ fn parse_rename_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Rename,
-                    format!("unknown rename option `{arg}`"),
+                    format!("unknown rename option `{}`", argument_label(&arg)),
                 ));
             }
             _ => positionals.push(arg),
@@ -1292,6 +1308,9 @@ fn parse_rename_args(args: ArgIter) -> Result<Command, ParseError> {
             HelpTopic::Rename,
             "rename requires two non-empty keys",
         ));
+    }
+    if from.contains('=') || to.contains('=') {
+        return Err(assignment_in_key_slot(HelpTopic::Rename, "rename"));
     }
 
     Ok(Command::Rename {
@@ -1334,14 +1353,14 @@ fn parse_example_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Example,
-                    format!("unknown example option `{arg}`"),
+                    format!("unknown example option `{}`", argument_label(&arg)),
                 ));
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Example,
-                    format!("unexpected example argument `{arg}`"),
+                    format!("unexpected example argument `{}`", argument_label(&arg)),
                 ));
             }
         }
@@ -1371,14 +1390,14 @@ fn parse_create_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Create,
-                    format!("unknown create option `{arg}`"),
+                    format!("unknown create option `{}`", argument_label(&arg)),
                 ));
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Create,
-                    format!("unexpected create argument `{arg}`"),
+                    format!("unexpected create argument `{}`", argument_label(&arg)),
                 ));
             }
         }
@@ -1406,7 +1425,7 @@ fn parse_copy_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Copy,
-                    format!("unknown copy option `{arg}`"),
+                    format!("unknown copy option `{}`", argument_label(&arg)),
                 ));
             }
             _ => positionals.push(arg),
@@ -1433,6 +1452,16 @@ fn parse_copy_args(args: ArgIter) -> Result<Command, ParseError> {
         overwrite,
         output,
     })
+}
+
+/// Renders an argument for an error message without echoing an `=` value.
+/// `--value=sk-live-…` becomes `--value=…`, so a mistyped flag cannot copy a
+/// secret into stderr.
+fn argument_label(argument: &str) -> String {
+    match argument.split_once('=') {
+        Some((name, _)) => format!("{name}=…"),
+        None => argument.to_string(),
+    }
 }
 
 fn set_output_format(
@@ -1469,6 +1498,17 @@ fn set_value_source(
     Ok(())
 }
 
+/// Refuses a `KEY=VALUE` argument where a key name belongs, without repeating
+/// the argument back — the value half is exactly what must not reach stderr.
+fn assignment_in_key_slot(topic: HelpTopic, verb: &'static str) -> ParseError {
+    ParseError::new(
+        topic,
+        format!(
+            "{verb} takes a key name, not a KEY=VALUE assignment; pass the key alone (the value is not echoed)"
+        ),
+    )
+}
+
 fn set_usage_error() -> ParseError {
     ParseError::new(
         HelpTopic::Set,
@@ -1496,7 +1536,7 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, rm, rename, and example output contains only state, paths, keys, and lines.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n  A disposition can reveal whether a value you supplied equals the stored one;\n  vne keeps values out of its output, not every fact derived from them.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne example .env\n  vne copy ../other/.env DATABASE_URL .env\n"
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--allow-empty] [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--allow-empty] [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, rm, rename, and example output contains only state, paths, keys, and lines.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n  A disposition can reveal whether a value you supplied equals the stored one;\n  vne keeps values out of its output, not every fact derived from them.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne example .env\n  vne copy ../other/.env DATABASE_URL .env\n"
         }
         HelpTopic::Check => {
             "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
@@ -1511,7 +1551,7 @@ fn usage_text(topic: HelpTopic) -> &'static str {
             "vne create - ensure one empty env file exists without overwriting it\n\nUSAGE:\n  vne create <file> [--text|--json|--pretty]\n\nBEHAVIOR:\n  The parent directory must already exist.\n  The filename must look like .env, .env.local, .envrc, .flaskenv, or worker.env.\n  A new file is empty and private to its owner on Unix.\n  An existing regular file is left unchanged and reported as alreadyExists.\n  Symlinks, directories, missing parent directories, and overwrite flags are rejected.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit a compact disposition and absolute path\n  --pretty  Emit a formatted disposition and absolute path\n\nEXAMPLES:\n  vne create .env\n  vne create config.env --json\n  vne create /path/to/project/.env.local --pretty\n"
         }
         HelpTopic::Set => {
-            "vne set - replace one existing env key value without exposing it\n\nUSAGE:\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n\nBEHAVIOR:\n  The target must be an existing regular file holding exactly one occurrence of KEY.\n  The new value is read from stdin or a hidden prompt; argument value forms are refused.\n  An identical stored value reports alreadyPresent without writing.\n  That disposition tells the caller the value it supplied is already stored.\n  Missing, duplicate, and malformed keys are refused with line numbers only.\n  An empty value clears the stored value; use `vne add` to create a new key.\n\nOPTIONS:\n  --stdin   Read the new value from stdin\n  --prompt  Read the new value from a hidden terminal prompt\n  --text    Force human text output\n  --json    Emit a compact payload-free set receipt\n  --pretty  Emit a formatted payload-free set receipt\n\nEXAMPLES:\n  vne set .env OPENAI_API_KEY --prompt\n  printf '%s' '1421' | vne set .env PORT --stdin --json\n"
+            "vne set - replace one existing env key value without exposing it\n\nUSAGE:\n  vne set <file> <KEY> --stdin [--allow-empty] [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--allow-empty] [--text|--json|--pretty]\n\nBEHAVIOR:\n  The target must be an existing regular file holding exactly one occurrence of KEY.\n  The new value is read from stdin or a hidden prompt; argument value forms are refused.\n  An identical stored value reports alreadyPresent without writing.\n  That disposition tells the caller the value it supplied is already stored.\n  Missing, duplicate, and malformed keys are refused with line numbers only.\n  An empty value is refused unless --allow-empty; use `vne rm` to remove a key.\n\nOPTIONS:\n  --stdin        Read the new value from stdin\n  --prompt       Read the new value from a hidden terminal prompt\n  --allow-empty  Store an empty value instead of refusing one\n  --text    Force human text output\n  --json    Emit a compact payload-free set receipt\n  --pretty  Emit a formatted payload-free set receipt\n\nEXAMPLES:\n  vne set .env OPENAI_API_KEY --prompt\n  printf '%s' '1421' | vne set .env PORT --stdin --json\n"
         }
         HelpTopic::Remove => {
             "vne rm - delete one env key without reading its value\n\nUSAGE:\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n\nBEHAVIOR:\n  A unique occurrence is removed and its whole line spliced out.\n  A duplicated key is refused with its line numbers unless --line or --all selects one.\n  --line <N> is a one-shot selector: if line N does not hold KEY it fails and never\n  hunts for another occurrence, so a stale line number cannot delete the wrong entry.\n  An absent key reports alreadyAbsent without writing, so a retry converges.\n  --expect states the key state you believe in and turns a wrong belief into exit 2.\n\nOPTIONS:\n  --all             Remove every occurrence in one write\n  --line <N>        Remove exactly the occurrence at line N\n  --expect present  Fail instead of reporting alreadyAbsent\n  --expect absent   Fail instead of removing anything\n  --text            Force human text output\n  --json            Emit a compact payload-free removal receipt\n  --pretty          Emit a formatted payload-free removal receipt\n\nEXAMPLES:\n  vne rm .env STALE_FLAG\n  vne rm .env DUPLICATED --line 12 --json\n  vne rm .env OPENAI_API_KEY --expect present\n"
@@ -1937,6 +1977,7 @@ mod tests {
                 file: PathBuf::from(".env"),
                 key: "OPENAI_API_KEY".to_string(),
                 value: ValueSource::Stdin,
+                allow_empty: false,
                 output: OutputFormat::Json,
             })
         );
@@ -1946,6 +1987,7 @@ mod tests {
                 file: PathBuf::from(".env"),
                 key: "OPENAI_API_KEY".to_string(),
                 value: ValueSource::Prompt,
+                allow_empty: false,
                 output: OutputFormat::Auto,
             })
         );

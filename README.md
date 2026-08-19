@@ -72,7 +72,8 @@ from, and it warns when a secret-looking value arrives as a command argument ins
 different existing value. Missing, malformed, and duplicate keys are refused.
 
 `set` replaces one existing key's value and reads that value only from `--stdin` or `--prompt`; no argument form is
-accepted. An identical value reports `alreadyPresent` and leaves the bytes alone. `rm` deletes a key, refuses a
+accepted. An identical value reports `alreadyPresent` and leaves the bytes alone, and an
+empty value is refused unless `--allow-empty` says otherwise. `rm` deletes a key, refuses a
 duplicated one unless `--line <N>` or `--all` picks one, and reports `alreadyAbsent` instead of failing when the key
 is already gone; `--line <N>` is a one-shot selector that fails when that line holds something else rather than
 hunting for another occurrence, and `--expect present|absent` turns a wrong belief about the key into exit 2.

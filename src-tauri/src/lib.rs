@@ -298,7 +298,7 @@ pub enum AppendEnvKeyError {
 impl AppendEnvKeyError {
     pub fn message(&self, key: &str) -> String {
         match self {
-            Self::InvalidKey => format!("`{key}` is not a valid env key"),
+            Self::InvalidKey => invalid_key_message(key),
             Self::EmptyValue => format!("`{key}` needs a value before it can be added"),
             Self::Duplicate { line_numbers } => {
                 let lines = line_numbers
@@ -363,7 +363,7 @@ pub enum EnvKeyCopyError {
 impl EnvKeyCopyError {
     pub fn message(&self, key: &str) -> String {
         match self {
-            Self::InvalidKey => format!("`{key}` is not a valid env key"),
+            Self::InvalidKey => invalid_key_message(key),
             Self::SameFile => "source and destination resolve to the same file".to_string(),
             Self::SourceMissing => format!("source key `{key}` was not found"),
             Self::SourceDuplicate { line_numbers } => format!(
@@ -538,8 +538,8 @@ pub enum EnvKeyRenameError {
 impl EnvKeyRenameError {
     pub fn message(&self, from: &str, to: &str) -> String {
         match self {
-            Self::InvalidSourceKey => format!("`{from}` is not a valid env key"),
-            Self::InvalidTargetKey => format!("`{to}` is not a valid env key"),
+            Self::InvalidSourceKey => invalid_key_message(from),
+            Self::InvalidTargetKey => invalid_key_message(to),
             Self::SameKey => format!("`{from}` and `{to}` are the same key"),
             Self::SourceMissing => format!("`{from}` was not found"),
             Self::SourceDuplicate { line_numbers } => format!(
@@ -608,7 +608,7 @@ pub enum EnvKeyRemoveError {
 impl EnvKeyRemoveError {
     pub fn message(&self, key: &str) -> String {
         match self {
-            Self::InvalidKey => format!("`{key}` is not a valid env key"),
+            Self::InvalidKey => invalid_key_message(key),
             Self::Duplicate { line_numbers } => format!(
                 "`{key}` is ambiguous at {}; pass --line <N> or --all",
                 line_number_label(line_numbers)
@@ -664,16 +664,26 @@ impl From<EnvFileAccessError> for EnvKeyRemoveError {
 #[derive(Debug)]
 pub enum EnvKeySetError {
     InvalidKey,
+    /// The new value is empty or whitespace, which a failed pipeline produces
+    /// as readily as a deliberate clear.
+    EmptyValue,
     Missing,
-    Duplicate { line_numbers: Vec<usize> },
-    Malformed { line_number: usize },
+    Duplicate {
+        line_numbers: Vec<usize>,
+    },
+    Malformed {
+        line_number: usize,
+    },
     Access(EnvFileAccessError),
 }
 
 impl EnvKeySetError {
     pub fn message(&self, key: &str) -> String {
         match self {
-            Self::InvalidKey => format!("`{key}` is not a valid env key"),
+            Self::InvalidKey => invalid_key_message(key),
+            Self::EmptyValue => format!(
+                "`{key}` was given an empty value; pass --allow-empty to store one, or use `vne rm` to remove the key"
+            ),
             Self::Missing => {
                 format!("`{key}` was not found; use `vne add` to create it")
             }
@@ -707,6 +717,20 @@ impl std::error::Error for EnvKeySetError {
 impl From<EnvFileAccessError> for EnvKeySetError {
     fn from(error: EnvFileAccessError) -> Self {
         Self::Access(error)
+    }
+}
+
+/// Renders a rejected key for an error message without echoing a value.
+///
+/// A caller who pastes `KEY=secret` where a key name belongs must not have that
+/// secret copied into stderr, where shells, CI logs, and agent transcripts keep
+/// it. Everything after the first `=` is elided.
+pub(crate) fn invalid_key_message(key: &str) -> String {
+    match key.split_once('=') {
+        Some((name, _)) => format!(
+            "`{name}=…` looks like a KEY=VALUE assignment; pass the key name alone (the value is not echoed)"
+        ),
+        None => format!("`{key}` is not a valid env key"),
     }
 }
 
@@ -1455,9 +1479,15 @@ pub fn set_env_key(
     path: &Path,
     key: &str,
     value: &str,
+    allow_empty: bool,
 ) -> Result<EnvKeySetOutcome, EnvKeySetError> {
     if !is_valid_env_key(key) {
         return Err(EnvKeySetError::InvalidKey);
+    }
+    // A pipeline that produced nothing looks exactly like a deliberate clear,
+    // and the difference is somebody's stored secret.
+    if !allow_empty && value.trim().is_empty() {
+        return Err(EnvKeySetError::EmptyValue);
     }
 
     let path = canonical_regular_file(path, "target")?;
@@ -1754,22 +1784,28 @@ pub fn sync_example_file(
     source_path: &Path,
     example_path: Option<&Path>,
 ) -> Result<ExampleSyncOutcome, ExampleSyncError> {
+    // Read the source before touching the example file. Creating first would
+    // leave an empty example behind when the source turns out to be unreadable.
     let source_path = canonical_regular_file(source_path, "source")?;
+    let source_content = read_env_file_at(&source_path)?;
+
     let example_path = match example_path {
         Some(path) => path.to_path_buf(),
         None => default_example_path(&source_path)?,
     };
+    // `created` comes from what the creation primitive actually did, not from an
+    // existence check taken before it ran.
+    let created = if example_path.exists() {
+        false
+    } else {
+        create_example_file(&example_path)? == EnvFileCreationDisposition::Created
+    };
 
-    let created = !example_path.exists();
-    if created {
-        create_example_file(&example_path)?;
-    }
     let example_path = canonical_regular_file(&example_path, "example")?;
     if source_path == example_path {
         return Err(ExampleSyncError::SameFile);
     }
 
-    let source_content = read_env_file_at(&source_path)?;
     let example_content = read_env_file_at(&example_path)?;
     let (updated, added_keys) = append_missing_example_keys(&source_content, &example_content);
 
@@ -1804,7 +1840,7 @@ fn default_example_path(source_path: &Path) -> Result<PathBuf, ExampleSyncError>
     Ok(parent.join(".env.example"))
 }
 
-fn create_example_file(path: &Path) -> Result<(), ExampleSyncError> {
+fn create_example_file(path: &Path) -> Result<EnvFileCreationDisposition, ExampleSyncError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1815,7 +1851,7 @@ fn create_example_file(path: &Path) -> Result<(), ExampleSyncError> {
         .ok_or(ExampleSyncError::UnusableExamplePath)?;
 
     ensure_project_env_file(parent, name)
-        .map(|_| ())
+        .map(|outcome| outcome.disposition)
         .map_err(|source| ExampleSyncError::Io {
             action: "create",
             path: path.to_path_buf(),
@@ -3964,11 +4000,29 @@ mod tests {
     }
 
     #[test]
-    fn set_accepts_an_empty_value_as_a_clearing_update() {
-        let (updated, disposition) = set_env_key_content("TOKEN=old\n", "TOKEN", "").unwrap();
+    fn set_refuses_an_empty_value_unless_the_caller_asks_for_one() {
+        let dir = tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        fs::write(&env_file, "TOKEN=old\n").unwrap();
 
-        assert_eq!(disposition, EnvKeySetDisposition::Updated);
-        assert_eq!(updated, "TOKEN=\"\"\n");
+        for blank in ["", "   ", "\t"] {
+            let error = set_env_key(&env_file, "TOKEN", blank, false).unwrap_err();
+            assert!(matches!(error, EnvKeySetError::EmptyValue), "{blank:?}");
+            assert_eq!(fs::read_to_string(&env_file).unwrap(), "TOKEN=old\n");
+        }
+
+        let outcome = set_env_key(&env_file, "TOKEN", "", true).unwrap();
+
+        assert_eq!(outcome.disposition, EnvKeySetDisposition::Updated);
+        assert_eq!(fs::read_to_string(&env_file).unwrap(), "TOKEN=\"\"\n");
+    }
+
+    #[test]
+    fn set_empty_value_message_names_both_ways_out() {
+        assert_eq!(
+            EnvKeySetError::EmptyValue.message("TOKEN"),
+            "`TOKEN` was given an empty value; pass --allow-empty to store one, or use `vne rm` to remove the key"
+        );
     }
 
     #[test]
@@ -4014,7 +4068,7 @@ mod tests {
     fn set_refuses_a_target_that_is_not_a_regular_file() {
         let dir = tempdir().unwrap();
 
-        let error = set_env_key(dir.path(), "TOKEN", "new").unwrap_err();
+        let error = set_env_key(dir.path(), "TOKEN", "new", false).unwrap_err();
 
         assert!(matches!(
             error,
@@ -4029,7 +4083,7 @@ mod tests {
         let env_file = dir.path().join(".env");
         fs::write(&env_file, "TOKEN=old\n").unwrap();
 
-        let outcome = set_env_key(&env_file, "TOKEN", "new").unwrap();
+        let outcome = set_env_key(&env_file, "TOKEN", "new", false).unwrap();
 
         assert_eq!(outcome.disposition, EnvKeySetDisposition::Updated);
         assert_eq!(outcome.key, "TOKEN");

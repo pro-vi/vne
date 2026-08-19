@@ -48,17 +48,17 @@ pub fn env_file_git_status(path: &Path) -> EnvFileGitStatus {
     };
 
     match run_git(directory, &["rev-parse", "--is-inside-work-tree"]) {
-        GitInvocation::Missing => return EnvFileGitStatus::Unknown,
-        GitInvocation::Status(code) if code != Some(0) => {
-            return EnvFileGitStatus::OutsideRepository
-        }
-        GitInvocation::Status(_) => {}
+        // A signal-killed git answered nothing, which is not the same answer as
+        // "there is no repository here".
+        GitInvocation::Missing | GitInvocation::Status(None) => return EnvFileGitStatus::Unknown,
+        GitInvocation::Status(Some(0)) => {}
+        GitInvocation::Status(Some(_)) => return EnvFileGitStatus::OutsideRepository,
     }
 
     match run_git(directory, &["ls-files", "--error-unmatch", "--", name]) {
-        GitInvocation::Missing => return EnvFileGitStatus::Unknown,
+        GitInvocation::Missing | GitInvocation::Status(None) => return EnvFileGitStatus::Unknown,
         GitInvocation::Status(Some(0)) => return EnvFileGitStatus::Tracked,
-        GitInvocation::Status(_) => {}
+        GitInvocation::Status(Some(_)) => {}
     }
 
     match run_git(directory, &["check-ignore", "-q", "--", name]) {

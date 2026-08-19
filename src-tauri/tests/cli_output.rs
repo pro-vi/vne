@@ -1627,6 +1627,46 @@ fn mutating_a_tracked_file_warns_on_stderr_without_blocking_the_write() {
     assert!(String::from_utf8(renamed.stderr)
         .unwrap()
         .contains("is tracked by git"));
+
+    let updated = run_vne_with_stdin(
+        [
+            "set".to_string(),
+            tracked.display().to_string(),
+            "FEATURE_ENABLED".to_string(),
+            "--stdin".to_string(),
+            "--json".to_string(),
+        ],
+        "false",
+    );
+    assert_eq!(updated.status.code(), Some(0));
+    assert!(String::from_utf8(updated.stderr)
+        .unwrap()
+        .contains("is tracked by git"));
+
+    let source = root.join("source.env");
+    write(&source, "SHARED_SETTING=copied\n");
+    let copied = run_vne([
+        "copy".to_string(),
+        source.display().to_string(),
+        "SHARED_SETTING".to_string(),
+        tracked.display().to_string(),
+        "--json".to_string(),
+    ]);
+    assert_eq!(copied.status.code(), Some(0));
+    assert!(String::from_utf8(copied.stderr)
+        .unwrap()
+        .contains("is tracked by git"));
+
+    let removed_key = run_vne([
+        "rm".to_string(),
+        tracked.display().to_string(),
+        "FEATURE_ENABLED".to_string(),
+        "--json".to_string(),
+    ]);
+    assert_eq!(removed_key.status.code(), Some(0));
+    assert!(String::from_utf8(removed_key.stderr)
+        .unwrap()
+        .contains("is tracked by git"));
 }
 
 #[test]
@@ -1766,4 +1806,242 @@ fn git_exposure_is_unknown_when_git_cannot_be_run() {
     assert_eq!(output.status.code(), Some(0));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["file"]["gitStatus"], "unknown");
+}
+
+/// The value half of a `KEY=VALUE` argument must never reach stderr, whichever
+/// verb rejects it. stderr is what shell history, CI logs, and agent
+/// transcripts keep.
+#[test]
+fn a_rejected_argument_never_echoes_the_value_half_to_stderr() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let other = dir.path().join("other.env");
+    write(&env_file, "TOKEN=stored\n");
+    write(&other, "TOKEN=stored\n");
+
+    let path = env_file.display().to_string();
+    let other_path = other.display().to_string();
+    let assignment = format!("TOKEN=sk-{SET_SENTINEL}");
+    let flag = format!("--value=sk-{SET_SENTINEL}");
+    let option = format!("--reveal=sk-{SET_SENTINEL}");
+
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "rm key slot",
+            vec!["rm".into(), path.clone(), assignment.clone()],
+        ),
+        (
+            "rename source slot",
+            vec![
+                "rename".into(),
+                path.clone(),
+                assignment.clone(),
+                "NEW_KEY".into(),
+            ],
+        ),
+        (
+            "rename target slot",
+            vec![
+                "rename".into(),
+                path.clone(),
+                "TOKEN".into(),
+                assignment.clone(),
+            ],
+        ),
+        (
+            "copy key slot",
+            vec![
+                "copy".into(),
+                other_path.clone(),
+                assignment.clone(),
+                path.clone(),
+            ],
+        ),
+        (
+            "add key slot with an explicit value flag",
+            vec![
+                "add".into(),
+                path.clone(),
+                assignment.clone(),
+                "--value".into(),
+                "ordinary".into(),
+            ],
+        ),
+        (
+            "set value flag",
+            vec!["set".into(), path.clone(), "TOKEN".into(), flag.clone()],
+        ),
+        (
+            "unknown option carrying a value",
+            vec!["check".into(), path.clone(), option.clone()],
+        ),
+    ];
+
+    for (name, arguments) in cases {
+        let output = run_vne(arguments);
+
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            !stderr.contains(SET_SENTINEL),
+            "{name} echoed the value: {stderr}"
+        );
+    }
+
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), "TOKEN=stored\n");
+}
+
+#[test]
+fn invalid_and_malformed_key_errors_are_payload_free_on_every_verb() {
+    let dir = tempdir().unwrap();
+    let malformed = dir.path().join("malformed.env");
+    write(&malformed, &format!("TOKEN=\"{STORED_SENTINEL}\n"));
+    let ordinary = dir.path().join("ordinary.env");
+    write(&ordinary, &format!("TOKEN={STORED_SENTINEL}\n"));
+
+    let malformed_path = malformed.display().to_string();
+    let ordinary_path = ordinary.display().to_string();
+    let cases: Vec<(&str, Vec<String>, &str)> = vec![
+        (
+            "set malformed",
+            vec![
+                "set".into(),
+                malformed_path.clone(),
+                "TOKEN".into(),
+                "--stdin".into(),
+            ],
+            "malformed value at line 1",
+        ),
+        (
+            "rename malformed source",
+            vec![
+                "rename".into(),
+                malformed_path.clone(),
+                "TOKEN".into(),
+                "NEW_KEY".into(),
+            ],
+            "malformed value at line 1",
+        ),
+        (
+            "rm invalid key",
+            vec!["rm".into(), ordinary_path.clone(), "not a key".into()],
+            "not a valid env key",
+        ),
+        (
+            "set invalid key",
+            vec![
+                "set".into(),
+                ordinary_path.clone(),
+                "not a key".into(),
+                "--stdin".into(),
+            ],
+            "not a valid env key",
+        ),
+        (
+            "rename invalid target",
+            vec![
+                "rename".into(),
+                ordinary_path.clone(),
+                "TOKEN".into(),
+                "not a key".into(),
+            ],
+            "not a valid env key",
+        ),
+    ];
+
+    for (name, arguments, fragment) in cases {
+        let output = run_vne_with_stdin(arguments, "ordinary-value");
+
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(fragment), "{name}: {stderr}");
+        assert!(!stderr.contains(STORED_SENTINEL), "{name}: {stderr}");
+    }
+}
+
+#[test]
+fn set_refuses_an_empty_value_and_leaves_the_stored_one_alone() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let initial = format!("TOKEN=sk-{STORED_SENTINEL}\n");
+    write(&env_file, &initial);
+
+    let refused = run_vne_with_stdin(
+        [
+            "set".to_string(),
+            env_file.display().to_string(),
+            "TOKEN".to_string(),
+            "--stdin".to_string(),
+            "--json".to_string(),
+        ],
+        "",
+    );
+
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(refused.stdout.is_empty());
+    let stderr = String::from_utf8(refused.stderr).unwrap();
+    assert!(stderr.contains("--allow-empty"), "{stderr}");
+    assert!(stderr.contains("vne rm"), "{stderr}");
+    assert!(!stderr.contains(STORED_SENTINEL), "{stderr}");
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), initial);
+
+    let allowed = run_vne_with_stdin(
+        [
+            "set".to_string(),
+            env_file.display().to_string(),
+            "TOKEN".to_string(),
+            "--stdin".to_string(),
+            "--allow-empty".to_string(),
+            "--json".to_string(),
+        ],
+        "",
+    );
+
+    assert_eq!(allowed.status.code(), Some(0));
+    let json = assert_payload_absent(&allowed, &[STORED_SENTINEL]);
+    assert_eq!(json["disposition"], "updated");
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), "TOKEN=\"\"\n");
+}
+
+#[test]
+fn example_sync_leaves_no_file_behind_when_the_source_cannot_be_read() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join(".env");
+    fs::create_dir(&source).unwrap();
+
+    let output = run_vne([
+        "example".to_string(),
+        source.display().to_string(),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        !dir.path().join(".env.example").exists(),
+        "a failed sync orphaned an example file"
+    );
+}
+
+#[test]
+fn add_warns_about_an_argv_value_even_when_the_target_is_missing() {
+    let dir = tempdir().unwrap();
+    let absent = dir.path().join(".env");
+
+    let output = run_vne([
+        "add".to_string(),
+        absent.display().to_string(),
+        "OPENAI_API_KEY".to_string(),
+        format!("sk-{SET_SENTINEL}"),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("looks secret-like"), "{stderr}");
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(!stderr.contains(SET_SENTINEL), "{stderr}");
+    assert!(!absent.exists());
 }
