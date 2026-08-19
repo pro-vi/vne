@@ -16,6 +16,7 @@ const COPY_SENTINEL: &str = "CopyH8S";
 const DESTINATION_SENTINEL: &str = "DestinationI9R";
 const STORED_SENTINEL: &str = "StoredJ1Q";
 const SET_SENTINEL: &str = "SetK2P";
+const KEEP_SENTINEL: &str = "KeepL3O";
 
 fn run_vne<I, S>(args: I) -> Output
 where
@@ -1134,4 +1135,176 @@ fn set_errors_are_payload_free_and_leave_the_env_file_unchanged() {
     assert_eq!(fs::read_to_string(&duplicated).unwrap(), initial_duplicated);
     assert_eq!(fs::read_to_string(&single).unwrap(), initial_single);
     assert!(!absent.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn rm_json_is_payload_free_and_an_absent_retry_never_rewrites() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, SystemTime};
+
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let initial =
+        format!("PORT=1420\nOPENAI_API_KEY='sk-{STORED_SENTINEL}'\nKEEP_ME={KEEP_SENTINEL}\n");
+    write(&env_file, &initial);
+    fs::set_permissions(&env_file, fs::Permissions::from_mode(0o640)).unwrap();
+
+    let args = [
+        "rm".to_string(),
+        env_file.display().to_string(),
+        "OPENAI_API_KEY".to_string(),
+        "--json".to_string(),
+    ];
+
+    let removed = run_vne(args.clone());
+
+    assert_eq!(removed.status.code(), Some(0));
+    assert!(removed.stderr.is_empty());
+    let removed_json = assert_payload_absent(&removed, &[STORED_SENTINEL, KEEP_SENTINEL]);
+    assert_eq!(removed_json["disposition"], "removed");
+    assert_eq!(removed_json["key"], "OPENAI_API_KEY");
+    assert_eq!(
+        removed_json["path"],
+        env_file.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(removed_json["removedLines"], serde_json::json!([2]));
+    assert_eq!(removed_json.as_object().unwrap().len(), 4);
+    let expected = format!("PORT=1420\nKEEP_ME={KEEP_SENTINEL}\n");
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), expected);
+    assert_eq!(
+        fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+
+    let frozen = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let handle = fs::OpenOptions::new().write(true).open(&env_file).unwrap();
+    handle
+        .set_times(fs::FileTimes::new().set_modified(frozen))
+        .unwrap();
+    drop(handle);
+
+    let retried = run_vne(args);
+
+    assert_eq!(retried.status.code(), Some(0));
+    assert!(retried.stderr.is_empty());
+    let retried_json = assert_payload_absent(&retried, &[STORED_SENTINEL, KEEP_SENTINEL]);
+    assert_eq!(retried_json["disposition"], "alreadyAbsent");
+    assert_eq!(retried_json["removedLines"], serde_json::json!([]));
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), expected);
+    assert_eq!(fs::metadata(&env_file).unwrap().modified().unwrap(), frozen);
+}
+
+#[test]
+fn rm_stale_line_selector_never_deletes_the_entry_that_shifted_into_the_line() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    write(
+        &env_file,
+        &format!(
+            "PORT=1420\nTOKEN={STORED_SENTINEL}\nDEBUG=true\nTOKEN={STORED_SENTINEL}-two\nKEEP_ME={KEEP_SENTINEL}\n"
+        ),
+    );
+
+    let args = [
+        "rm".to_string(),
+        env_file.display().to_string(),
+        "TOKEN".to_string(),
+        "--line".to_string(),
+        "4".to_string(),
+        "--json".to_string(),
+    ];
+
+    let removed = run_vne(args.clone());
+    assert_eq!(removed.status.code(), Some(0));
+    let removed_json = assert_payload_absent(&removed, &[STORED_SENTINEL, KEEP_SENTINEL]);
+    assert_eq!(removed_json["disposition"], "removed");
+    assert_eq!(removed_json["removedLines"], serde_json::json!([4]));
+    let shifted =
+        format!("PORT=1420\nTOKEN={STORED_SENTINEL}\nDEBUG=true\nKEEP_ME={KEEP_SENTINEL}\n");
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), shifted);
+
+    // `KEEP_ME` now sits on line 4. Re-running the same command must refuse it
+    // rather than deleting whichever entry moved into the selected line.
+    let stale = run_vne(args);
+
+    assert_eq!(stale.status.code(), Some(2));
+    assert!(stale.stdout.is_empty());
+    let stderr = String::from_utf8(stale.stderr).unwrap();
+    assert!(stderr.contains("line 4 holds `KEEP_ME`"), "{stderr}");
+    assert!(!stderr.contains(STORED_SENTINEL), "{stderr}");
+    assert!(!stderr.contains(KEEP_SENTINEL), "{stderr}");
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), shifted);
+}
+
+#[test]
+fn rm_expectations_and_duplicate_refusals_leave_the_file_unchanged() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let initial = format!("PORT=1420\nTOKEN={STORED_SENTINEL}\nTOKEN={STORED_SENTINEL}-two\n");
+    write(&env_file, &initial);
+
+    let path = env_file.display().to_string();
+    let cases = [
+        (
+            "duplicate without a selector",
+            vec!["rm", &path, "TOKEN", "--json"],
+            "lines 2, 3",
+        ),
+        (
+            "expect present on an absent key",
+            vec!["rm", &path, "ABSENT_KEY", "--expect", "present", "--json"],
+            "--expect present was requested",
+        ),
+        (
+            "expect absent on a present key",
+            vec![
+                "rm", &path, "TOKEN", "--all", "--expect", "absent", "--json",
+            ],
+            "--expect absent was requested",
+        ),
+    ];
+
+    for (name, arguments, fragment) in cases {
+        let output = run_vne(arguments);
+
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(fragment), "{name}: {stderr}");
+        assert!(!stderr.contains(STORED_SENTINEL), "{name}: {stderr}");
+        assert_eq!(fs::read_to_string(&env_file).unwrap(), initial, "{name}");
+    }
+
+    let removed_all = run_vne(["rm", &path, "TOKEN", "--all", "--json"]);
+    assert_eq!(removed_all.status.code(), Some(0));
+    let removed_json = assert_payload_absent(&removed_all, &[STORED_SENTINEL]);
+    assert_eq!(removed_json["disposition"], "removedAll");
+    assert_eq!(removed_json["removedLines"], serde_json::json!([2, 3]));
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), "PORT=1420\n");
+}
+
+#[test]
+fn rm_text_receipt_contains_metadata_only() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    write(&env_file, &format!("PORT=1420\nTOKEN={STORED_SENTINEL}\n"));
+
+    let output = run_vne([
+        "rm".to_string(),
+        env_file.display().to_string(),
+        "TOKEN".to_string(),
+        "--text".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "removed `TOKEN` from {} at line 2\n",
+            env_file.canonicalize().unwrap().display()
+        )
+    );
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), "PORT=1420\n");
 }

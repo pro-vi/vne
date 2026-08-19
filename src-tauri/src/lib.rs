@@ -69,6 +69,41 @@ pub struct EnvKeySetOutcome {
     pub key: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnvKeyRemoveDisposition {
+    Removed,
+    RemovedAll,
+    AlreadyAbsent,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvKeyRemoveOutcome {
+    pub disposition: EnvKeyRemoveDisposition,
+    pub path: String,
+    pub key: String,
+    pub removed_lines: Vec<usize>,
+}
+
+/// Which occurrences of a key `vne rm` may delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvKeyRemoveSelector {
+    /// The one occurrence; a duplicated key is refused.
+    Only,
+    /// Exactly the occurrence at this line; a line holding anything else fails.
+    Line(usize),
+    /// Every occurrence, in one pass.
+    All,
+}
+
+/// The caller's belief about the key before the removal runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvKeyExpectation {
+    Present,
+    Absent,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvFile {
@@ -190,6 +225,9 @@ struct ParsedLine {
     exported: bool,
     quote: Option<char>,
     comment: Option<String>,
+    /// Byte offset where this entry's line begins, after any leading byte-order
+    /// mark. Paired with `next_start` it spans the whole line for removal.
+    line_start: usize,
     value_start: usize,
     value_end: usize,
     next_start: usize,
@@ -369,6 +407,76 @@ impl From<EnvFileAccessError> for EnvKeyCopyError {
                 source,
             },
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum EnvKeyRemoveError {
+    InvalidKey,
+    Duplicate {
+        line_numbers: Vec<usize>,
+    },
+    StaleSelector {
+        line_number: usize,
+        found_key: Option<String>,
+    },
+    ExpectedPresent,
+    ExpectedAbsent {
+        line_numbers: Vec<usize>,
+    },
+    Access(EnvFileAccessError),
+}
+
+impl EnvKeyRemoveError {
+    pub fn message(&self, key: &str) -> String {
+        match self {
+            Self::InvalidKey => format!("`{key}` is not a valid env key"),
+            Self::Duplicate { line_numbers } => format!(
+                "`{key}` is ambiguous at {}; pass --line <N> or --all",
+                line_number_label(line_numbers)
+            ),
+            Self::StaleSelector {
+                line_number,
+                found_key: Some(found_key),
+            } => format!(
+                "line {line_number} holds `{found_key}`, not `{key}`; re-read the file before selecting a line"
+            ),
+            Self::StaleSelector {
+                line_number,
+                found_key: None,
+            } => format!(
+                "line {line_number} holds no env assignment; re-read the file before selecting a line"
+            ),
+            Self::ExpectedPresent => {
+                format!("`{key}` is absent but --expect present was requested")
+            }
+            Self::ExpectedAbsent { line_numbers } => format!(
+                "`{key}` is present at {} but --expect absent was requested",
+                line_number_label(line_numbers)
+            ),
+            Self::Access(error) => error.message(),
+        }
+    }
+}
+
+impl fmt::Display for EnvKeyRemoveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("env key removal failed")
+    }
+}
+
+impl std::error::Error for EnvKeyRemoveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Access(EnvFileAccessError::Io { source, .. }) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<EnvFileAccessError> for EnvKeyRemoveError {
+    fn from(error: EnvFileAccessError) -> Self {
+        Self::Access(error)
     }
 }
 
@@ -1220,6 +1328,134 @@ fn set_env_key_content(
     Ok((updated, EnvKeySetDisposition::Updated))
 }
 
+pub fn remove_env_key(
+    path: &Path,
+    key: &str,
+    selector: EnvKeyRemoveSelector,
+    expectation: Option<EnvKeyExpectation>,
+) -> Result<EnvKeyRemoveOutcome, EnvKeyRemoveError> {
+    if !is_valid_env_key(key) {
+        return Err(EnvKeyRemoveError::InvalidKey);
+    }
+
+    let path = canonical_regular_file(path, "target")?;
+    let content = read_env_file_at(&path)?;
+    let removal = remove_env_key_content(&content, key, selector, expectation)?;
+
+    if let Some(updated) = &removal.content {
+        atomic_write_preserving_permissions(&path, updated).map_err(|source| {
+            EnvFileAccessError::Io {
+                action: "write",
+                path: path.clone(),
+                source,
+            }
+        })?;
+    }
+
+    Ok(EnvKeyRemoveOutcome {
+        disposition: removal.disposition,
+        path: path.to_string_lossy().to_string(),
+        key: key.to_string(),
+        removed_lines: removal.removed_lines,
+    })
+}
+
+struct EnvKeyRemoval {
+    /// `Some` only when bytes actually change; a convergent no-op never writes.
+    content: Option<String>,
+    disposition: EnvKeyRemoveDisposition,
+    removed_lines: Vec<usize>,
+}
+
+fn remove_env_key_content(
+    content: &str,
+    key: &str,
+    selector: EnvKeyRemoveSelector,
+    expectation: Option<EnvKeyExpectation>,
+) -> Result<EnvKeyRemoval, EnvKeyRemoveError> {
+    if !is_valid_env_key(key) {
+        return Err(EnvKeyRemoveError::InvalidKey);
+    }
+
+    let entries = parse_env_entries(content);
+    let occurrences = entries
+        .iter()
+        .filter(|entry| entry.key == key)
+        .collect::<Vec<_>>();
+    let occurrence_lines = occurrences
+        .iter()
+        .map(|entry| entry.line_number)
+        .collect::<Vec<_>>();
+
+    match expectation {
+        Some(EnvKeyExpectation::Present) if occurrences.is_empty() => {
+            return Err(EnvKeyRemoveError::ExpectedPresent)
+        }
+        Some(EnvKeyExpectation::Absent) if !occurrences.is_empty() => {
+            return Err(EnvKeyRemoveError::ExpectedAbsent {
+                line_numbers: occurrence_lines,
+            })
+        }
+        _ => {}
+    }
+
+    let doomed = match selector {
+        EnvKeyRemoveSelector::Line(line_number) => {
+            let selected = entries
+                .iter()
+                .find(|entry| entry.line_number == line_number)
+                .filter(|entry| entry.key == key)
+                .ok_or_else(|| EnvKeyRemoveError::StaleSelector {
+                    line_number,
+                    found_key: entries
+                        .iter()
+                        .find(|entry| entry.line_number == line_number)
+                        .map(|entry| entry.key.clone()),
+                })?;
+            vec![selected]
+        }
+        EnvKeyRemoveSelector::All => occurrences,
+        EnvKeyRemoveSelector::Only => match occurrences.as_slice() {
+            [] => Vec::new(),
+            [entry] => vec![*entry],
+            _ => {
+                return Err(EnvKeyRemoveError::Duplicate {
+                    line_numbers: occurrence_lines,
+                })
+            }
+        },
+    };
+
+    if doomed.is_empty() {
+        return Ok(EnvKeyRemoval {
+            content: None,
+            disposition: EnvKeyRemoveDisposition::AlreadyAbsent,
+            removed_lines: Vec::new(),
+        });
+    }
+
+    let disposition = if doomed.len() > 1 {
+        EnvKeyRemoveDisposition::RemovedAll
+    } else {
+        EnvKeyRemoveDisposition::Removed
+    };
+    let removed_lines = doomed.iter().map(|entry| entry.line_number).collect();
+
+    let mut updated = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for entry in doomed {
+        updated.push_str(&content[cursor..entry.line_start]);
+        cursor = entry.next_start;
+    }
+    updated.push_str(&content[cursor..]);
+
+    Ok(EnvKeyRemoval {
+        content: Some(updated),
+        disposition,
+        removed_lines,
+    })
+}
+
 fn env_value_token<'a>(content: &'a str, entry: &ParsedLine) -> EnvValueToken<'a> {
     let (start, end) = env_value_token_bounds(entry);
     EnvValueToken {
@@ -1523,9 +1759,11 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
     let line_body = &content[line_start..line_end];
     let bytes = line_body.as_bytes();
     let mut index = 0;
+    let mut entry_start = line_start;
 
     if line_start == 0 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         index = 3;
+        entry_start = line_start + 3;
     }
 
     skip_spaces(bytes, &mut index);
@@ -1640,6 +1878,7 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
         exported,
         quote,
         comment,
+        line_start: entry_start,
         value_start,
         value_end,
         next_start,
@@ -3386,6 +3625,235 @@ mod tests {
             env_file.canonicalize().unwrap().to_string_lossy()
         );
         assert_eq!(fs::read_to_string(&env_file).unwrap(), "TOKEN=new\n");
+    }
+
+    fn removal(
+        content: &str,
+        key: &str,
+        selector: EnvKeyRemoveSelector,
+    ) -> Result<EnvKeyRemoval, EnvKeyRemoveError> {
+        remove_env_key_content(content, key, selector, None)
+    }
+
+    const THREE_KEYS: &str = "PORT=1420\nTOKEN=one\nDEBUG=true\n";
+    const DUPLICATED: &str = "PORT=1420\nTOKEN=one\nDEBUG=true\nTOKEN=two\n";
+
+    #[test]
+    fn rm_removes_a_unique_occurrence_and_leaves_the_other_lines_byte_identical() {
+        let removed = removal(THREE_KEYS, "TOKEN", EnvKeyRemoveSelector::Only).unwrap();
+
+        assert_eq!(removed.disposition, EnvKeyRemoveDisposition::Removed);
+        assert_eq!(removed.removed_lines, vec![2]);
+        assert_eq!(removed.content.unwrap(), "PORT=1420\nDEBUG=true\n");
+    }
+
+    #[test]
+    fn rm_reports_an_absent_key_without_writing_under_every_unselected_form() {
+        for selector in [EnvKeyRemoveSelector::Only, EnvKeyRemoveSelector::All] {
+            let removed = removal(THREE_KEYS, "ABSENT", selector).unwrap();
+
+            assert_eq!(
+                removed.disposition,
+                EnvKeyRemoveDisposition::AlreadyAbsent,
+                "{selector:?}"
+            );
+            assert!(removed.content.is_none(), "{selector:?}");
+            assert!(removed.removed_lines.is_empty(), "{selector:?}");
+        }
+    }
+
+    #[test]
+    fn rm_refuses_a_duplicated_key_without_a_selector() {
+        assert!(matches!(
+            removal(DUPLICATED, "TOKEN", EnvKeyRemoveSelector::Only),
+            Err(EnvKeyRemoveError::Duplicate { ref line_numbers }) if line_numbers == &[2, 4]
+        ));
+    }
+
+    #[test]
+    fn rm_line_selector_removes_only_the_named_duplicate() {
+        let removed = removal(DUPLICATED, "TOKEN", EnvKeyRemoveSelector::Line(4)).unwrap();
+
+        assert_eq!(removed.disposition, EnvKeyRemoveDisposition::Removed);
+        assert_eq!(removed.removed_lines, vec![4]);
+        assert_eq!(
+            removed.content.unwrap(),
+            "PORT=1420\nTOKEN=one\nDEBUG=true\n"
+        );
+    }
+
+    #[test]
+    fn rm_line_selector_fails_closed_and_never_hunts_for_another_occurrence() {
+        assert!(matches!(
+            removal(THREE_KEYS, "TOKEN", EnvKeyRemoveSelector::Line(1)),
+            Err(EnvKeyRemoveError::StaleSelector {
+                line_number: 1,
+                found_key: Some(ref found),
+            }) if found == "PORT"
+        ));
+        assert!(matches!(
+            removal(THREE_KEYS, "TOKEN", EnvKeyRemoveSelector::Line(9)),
+            Err(EnvKeyRemoveError::StaleSelector {
+                line_number: 9,
+                found_key: None,
+            })
+        ));
+        assert!(matches!(
+            removal(THREE_KEYS, "ABSENT", EnvKeyRemoveSelector::Line(2)),
+            Err(EnvKeyRemoveError::StaleSelector {
+                line_number: 2,
+                found_key: Some(ref found),
+            }) if found == "TOKEN"
+        ));
+    }
+
+    #[test]
+    fn rm_all_splices_every_occurrence_in_one_pass() {
+        let removed = removal(DUPLICATED, "TOKEN", EnvKeyRemoveSelector::All).unwrap();
+
+        assert_eq!(removed.disposition, EnvKeyRemoveDisposition::RemovedAll);
+        assert_eq!(removed.removed_lines, vec![2, 4]);
+        assert_eq!(removed.content.unwrap(), "PORT=1420\nDEBUG=true\n");
+    }
+
+    #[test]
+    fn rm_all_of_a_unique_key_reports_a_single_removal() {
+        let removed = removal(THREE_KEYS, "TOKEN", EnvKeyRemoveSelector::All).unwrap();
+
+        assert_eq!(removed.disposition, EnvKeyRemoveDisposition::Removed);
+        assert_eq!(removed.removed_lines, vec![2]);
+    }
+
+    #[test]
+    fn rm_expectations_gate_the_convergent_no_op_and_the_removal() {
+        assert!(matches!(
+            remove_env_key_content(
+                THREE_KEYS,
+                "ABSENT",
+                EnvKeyRemoveSelector::Only,
+                Some(EnvKeyExpectation::Present)
+            ),
+            Err(EnvKeyRemoveError::ExpectedPresent)
+        ));
+        assert!(matches!(
+            remove_env_key_content(
+                DUPLICATED,
+                "TOKEN",
+                EnvKeyRemoveSelector::All,
+                Some(EnvKeyExpectation::Absent)
+            ),
+            Err(EnvKeyRemoveError::ExpectedAbsent { ref line_numbers }) if line_numbers == &[2, 4]
+        ));
+
+        let absent = remove_env_key_content(
+            THREE_KEYS,
+            "ABSENT",
+            EnvKeyRemoveSelector::Only,
+            Some(EnvKeyExpectation::Absent),
+        )
+        .unwrap();
+        assert_eq!(absent.disposition, EnvKeyRemoveDisposition::AlreadyAbsent);
+
+        let present = remove_env_key_content(
+            THREE_KEYS,
+            "TOKEN",
+            EnvKeyRemoveSelector::Only,
+            Some(EnvKeyExpectation::Present),
+        )
+        .unwrap();
+        assert_eq!(present.disposition, EnvKeyRemoveDisposition::Removed);
+    }
+
+    #[test]
+    fn rm_preserves_a_leading_byte_order_mark_and_crlf_endings() {
+        let removed = removal(
+            "\u{feff}TOKEN=one\r\nPORT=1420\r\n",
+            "TOKEN",
+            EnvKeyRemoveSelector::Only,
+        )
+        .unwrap();
+
+        assert_eq!(removed.content.unwrap(), "\u{feff}PORT=1420\r\n");
+    }
+
+    #[test]
+    fn rm_splices_a_multiline_quoted_entry_completely() {
+        let removed = removal(
+            "A=1\nPRIVATE_KEY=\"line one\nline two\"\nB=2\n",
+            "PRIVATE_KEY",
+            EnvKeyRemoveSelector::Only,
+        )
+        .unwrap();
+
+        assert_eq!(removed.content.unwrap(), "A=1\nB=2\n");
+    }
+
+    #[test]
+    fn rm_removes_a_final_entry_without_a_trailing_newline() {
+        let removed = removal("A=1\nTOKEN=one", "TOKEN", EnvKeyRemoveSelector::Only).unwrap();
+
+        assert_eq!(removed.content.unwrap(), "A=1\n");
+    }
+
+    #[test]
+    fn rm_error_messages_name_keys_and_lines_without_values() {
+        assert_eq!(
+            EnvKeyRemoveError::Duplicate {
+                line_numbers: vec![2, 4]
+            }
+            .message("TOKEN"),
+            "`TOKEN` is ambiguous at lines 2, 4; pass --line <N> or --all"
+        );
+        assert_eq!(
+            EnvKeyRemoveError::StaleSelector {
+                line_number: 8,
+                found_key: Some("PORT".to_string()),
+            }
+            .message("TOKEN"),
+            "line 8 holds `PORT`, not `TOKEN`; re-read the file before selecting a line"
+        );
+        assert_eq!(
+            EnvKeyRemoveError::StaleSelector {
+                line_number: 8,
+                found_key: None,
+            }
+            .message("TOKEN"),
+            "line 8 holds no env assignment; re-read the file before selecting a line"
+        );
+        assert_eq!(
+            EnvKeyRemoveError::ExpectedPresent.message("TOKEN"),
+            "`TOKEN` is absent but --expect present was requested"
+        );
+        assert_eq!(
+            EnvKeyRemoveError::ExpectedAbsent {
+                line_numbers: vec![3]
+            }
+            .message("TOKEN"),
+            "`TOKEN` is present at line 3 but --expect absent was requested"
+        );
+    }
+
+    #[test]
+    fn rm_writes_through_the_shared_atomic_writer_and_converges_on_retry() {
+        let dir = tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        fs::write(&env_file, THREE_KEYS).unwrap();
+
+        let removed = remove_env_key(&env_file, "TOKEN", EnvKeyRemoveSelector::Only, None).unwrap();
+        assert_eq!(removed.disposition, EnvKeyRemoveDisposition::Removed);
+        assert_eq!(removed.removed_lines, vec![2]);
+        assert_eq!(
+            fs::read_to_string(&env_file).unwrap(),
+            "PORT=1420\nDEBUG=true\n"
+        );
+
+        let retried = remove_env_key(&env_file, "TOKEN", EnvKeyRemoveSelector::Only, None).unwrap();
+        assert_eq!(retried.disposition, EnvKeyRemoveDisposition::AlreadyAbsent);
+        assert!(retried.removed_lines.is_empty());
+        assert_eq!(
+            fs::read_to_string(&env_file).unwrap(),
+            "PORT=1420\nDEBUG=true\n"
+        );
     }
 
     #[test]

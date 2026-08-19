@@ -1,9 +1,10 @@
 use crate::{
     append_env_key_result, atomic_write_preserving_permissions, compare_env_files, copy_env_key,
     ensure_project_env_file, parse_env_file, redact_env_file_values_only,
-    redact_snapshot_values_only, set_env_key, withhold_all_env_file_payloads,
+    redact_snapshot_values_only, remove_env_key, set_env_key, withhold_all_env_file_payloads,
     withhold_all_snapshot_payloads, EnsureEnvFileOutcome, EnvComparison, EnvFile,
-    EnvFileCreationDisposition, EnvKeyCopyDisposition, EnvKeySetDisposition, ProjectSnapshot,
+    EnvFileCreationDisposition, EnvKeyCopyDisposition, EnvKeyExpectation, EnvKeyRemoveDisposition,
+    EnvKeyRemoveSelector, EnvKeySetDisposition, ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
@@ -41,6 +42,10 @@ const CLI_COMMANDS: &[CliCommand] = &[
     CliCommand {
         name: "set",
         parse: parse_set_args,
+    },
+    CliCommand {
+        name: "rm",
+        parse: parse_rm_args,
     },
     CliCommand {
         name: "copy",
@@ -88,6 +93,13 @@ enum Command {
         value: ValueSource,
         output: OutputFormat,
     },
+    Remove {
+        file: PathBuf,
+        key: String,
+        selector: EnvKeyRemoveSelector,
+        expectation: Option<EnvKeyExpectation>,
+        output: OutputFormat,
+    },
     Copy {
         source_file: PathBuf,
         key: String,
@@ -130,6 +142,7 @@ enum HelpTopic {
     Inspect,
     Add,
     Set,
+    Remove,
     Copy,
     Create,
     Format,
@@ -233,6 +246,13 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             let value = resolve_value_source(&key, value)?;
             run_set(&file, &key, &value, output)
         }
+        Command::Remove {
+            file,
+            key,
+            selector,
+            expectation,
+            output,
+        } => run_rm(&file, &key, selector, expectation, output),
         Command::Copy {
             source_file,
             key,
@@ -530,6 +550,53 @@ fn run_set(
     }
 
     Ok(false)
+}
+
+fn run_rm(
+    file: &Path,
+    key: &str,
+    selector: EnvKeyRemoveSelector,
+    expectation: Option<EnvKeyExpectation>,
+    output: OutputFormat,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let outcome =
+        remove_env_key(file, key, selector, expectation).map_err(|error| error.message(key))?;
+
+    if output.wants_json() {
+        print_json(&outcome, output)?;
+    } else {
+        match outcome.disposition {
+            EnvKeyRemoveDisposition::Removed | EnvKeyRemoveDisposition::RemovedAll => {
+                stdout_line(format_args!(
+                    "removed `{}` from {} at {}",
+                    outcome.key,
+                    outcome.path,
+                    line_label(&outcome.removed_lines)
+                ))?;
+            }
+            EnvKeyRemoveDisposition::AlreadyAbsent => {
+                stdout_line(format_args!(
+                    "already absent `{}` in {}",
+                    outcome.key, outcome.path
+                ))?;
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn line_label(line_numbers: &[usize]) -> String {
+    let lines = line_numbers
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if line_numbers.len() == 1 {
+        format!("line {lines}")
+    } else {
+        format!("lines {lines}")
+    }
 }
 
 fn run_create(file: &Path, output: OutputFormat) -> Result<bool, Box<dyn std::error::Error>> {
@@ -973,6 +1040,108 @@ fn parse_set_args(args: ArgIter) -> Result<Command, ParseError> {
     })
 }
 
+fn parse_rm_args(args: ArgIter) -> Result<Command, ParseError> {
+    let mut output = OutputFormat::Auto;
+    let mut selector = None;
+    let mut expectation = None;
+    let mut positionals = Vec::new();
+    let mut args = args.peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Remove)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Remove)?,
+            "--pretty" => {
+                set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Remove)?
+            }
+            "--all" => set_remove_selector(&mut selector, EnvKeyRemoveSelector::All)?,
+            "--line" => {
+                let Some(value) = args.next() else {
+                    return Err(ParseError::new(
+                        HelpTopic::Remove,
+                        "--line requires a line number",
+                    ));
+                };
+                let Some(line_number) = value.parse::<usize>().ok().filter(|line| *line > 0) else {
+                    return Err(ParseError::new(
+                        HelpTopic::Remove,
+                        format!("--line requires a positive line number, not `{value}`"),
+                    ));
+                };
+                set_remove_selector(&mut selector, EnvKeyRemoveSelector::Line(line_number))?;
+            }
+            "--expect" => {
+                let Some(value) = args.next() else {
+                    return Err(ParseError::new(
+                        HelpTopic::Remove,
+                        "--expect requires `present` or `absent`",
+                    ));
+                };
+                let parsed = match value.as_str() {
+                    "present" => EnvKeyExpectation::Present,
+                    "absent" => EnvKeyExpectation::Absent,
+                    _ => {
+                        return Err(ParseError::new(
+                            HelpTopic::Remove,
+                            format!("--expect accepts `present` or `absent`, not `{value}`"),
+                        ))
+                    }
+                };
+                if expectation.is_some() {
+                    return Err(ParseError::new(
+                        HelpTopic::Remove,
+                        "rm accepts only one --expect",
+                    ));
+                }
+                expectation = Some(parsed);
+            }
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Remove)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Remove,
+                    format!("unknown rm option `{arg}`"),
+                ));
+            }
+            _ => positionals.push(arg),
+        }
+    }
+
+    let [file, key] = positionals.as_slice() else {
+        return Err(ParseError::new(
+            HelpTopic::Remove,
+            "rm requires <file> <KEY>",
+        ));
+    };
+    if key.is_empty() {
+        return Err(ParseError::new(
+            HelpTopic::Remove,
+            "rm requires a non-empty key",
+        ));
+    }
+
+    Ok(Command::Remove {
+        file: PathBuf::from(file),
+        key: key.clone(),
+        selector: selector.unwrap_or(EnvKeyRemoveSelector::Only),
+        expectation,
+        output,
+    })
+}
+
+fn set_remove_selector(
+    target: &mut Option<EnvKeyRemoveSelector>,
+    selector: EnvKeyRemoveSelector,
+) -> Result<(), ParseError> {
+    if target.is_some() {
+        return Err(ParseError::new(
+            HelpTopic::Remove,
+            "rm accepts only one of --line <N> or --all",
+        ));
+    }
+    *target = Some(selector);
+    Ok(())
+}
+
 fn parse_create_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut file = None;
     let mut output = OutputFormat::Auto;
@@ -1113,7 +1282,7 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy and set output contains only its state, normalized paths, and key.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne copy ../other/.env DATABASE_URL .env\n"
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, and rm output contains only its state, normalized paths, key, and lines.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne copy ../other/.env DATABASE_URL .env\n"
         }
         HelpTopic::Check => {
             "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
@@ -1129,6 +1298,9 @@ fn usage_text(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::Set => {
             "vne set - replace one existing env key value without exposing it\n\nUSAGE:\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n\nBEHAVIOR:\n  The target must be an existing regular file holding exactly one occurrence of KEY.\n  The new value is read from stdin or a hidden prompt; argument value forms are refused.\n  An identical stored value reports alreadyPresent without writing.\n  Missing, duplicate, and malformed keys are refused with line numbers only.\n  An empty value clears the stored value; use `vne add` to create a new key.\n\nOPTIONS:\n  --stdin   Read the new value from stdin\n  --prompt  Read the new value from a hidden terminal prompt\n  --text    Force human text output\n  --json    Emit a compact payload-free set receipt\n  --pretty  Emit a formatted payload-free set receipt\n\nEXAMPLES:\n  vne set .env OPENAI_API_KEY --prompt\n  printf '%s' '1421' | vne set .env PORT --stdin --json\n"
+        }
+        HelpTopic::Remove => {
+            "vne rm - delete one env key without reading its value\n\nUSAGE:\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n\nBEHAVIOR:\n  A unique occurrence is removed and its whole line spliced out.\n  A duplicated key is refused with its line numbers unless --line or --all selects one.\n  --line <N> is a one-shot selector: if line N does not hold KEY it fails and never\n  hunts for another occurrence, so a stale line number cannot delete the wrong entry.\n  An absent key reports alreadyAbsent without writing, so a retry converges.\n  --expect states the key state you believe in and turns a wrong belief into exit 2.\n\nOPTIONS:\n  --all             Remove every occurrence in one write\n  --line <N>        Remove exactly the occurrence at line N\n  --expect present  Fail instead of reporting alreadyAbsent\n  --expect absent   Fail instead of removing anything\n  --text            Force human text output\n  --json            Emit a compact payload-free removal receipt\n  --pretty          Emit a formatted payload-free removal receipt\n\nEXAMPLES:\n  vne rm .env STALE_FLAG\n  vne rm .env DUPLICATED --line 12 --json\n  vne rm .env OPENAI_API_KEY --expect present\n"
         }
         HelpTopic::Copy => {
             "vne copy - copy one env key between existing files without exposing its value\n\nUSAGE:\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Source and destination must be distinct existing regular files.\n  The source key must occur exactly once and be well formed.\n  An absent destination key is added. An identical value reports alreadyPresent without writing.\n  A different destination value requires --overwrite. Duplicate destination keys are refused.\n  The value stays inside vne; output contains only state, normalized paths, and key.\n\nOPTIONS:\n  --overwrite  Replace one different existing destination value\n  --text       Force human text output\n  --json       Emit a compact payload-free copy receipt\n  --pretty     Emit a formatted payload-free copy receipt\n\nEXAMPLE:\n  vne copy ../other/.env DATABASE_URL .env\n  vne copy ../other/.env DATABASE_URL .env --overwrite --json\n"
@@ -1591,6 +1763,84 @@ mod tests {
         assert!(help.contains("alreadyPresent"));
         assert!(help.contains("argument value forms are refused"));
         assert!(!help.contains("--values"));
+    }
+
+    #[test]
+    fn parses_rm_with_selectors_and_expectations() {
+        assert_eq!(
+            parse(&["rm", ".env", "STALE_FLAG"]),
+            Ok(Command::Remove {
+                file: PathBuf::from(".env"),
+                key: "STALE_FLAG".to_string(),
+                selector: EnvKeyRemoveSelector::Only,
+                expectation: None,
+                output: OutputFormat::Auto,
+            })
+        );
+        assert_eq!(
+            parse(&["rm", ".env", "TOKEN", "--line", "12", "--json"]),
+            Ok(Command::Remove {
+                file: PathBuf::from(".env"),
+                key: "TOKEN".to_string(),
+                selector: EnvKeyRemoveSelector::Line(12),
+                expectation: None,
+                output: OutputFormat::Json,
+            })
+        );
+        assert_eq!(
+            parse(&["rm", ".env", "TOKEN", "--all", "--expect", "present"]),
+            Ok(Command::Remove {
+                file: PathBuf::from(".env"),
+                key: "TOKEN".to_string(),
+                selector: EnvKeyRemoveSelector::All,
+                expectation: Some(EnvKeyExpectation::Present),
+                output: OutputFormat::Auto,
+            })
+        );
+        assert_eq!(
+            parse(&["rm", ".env", "TOKEN", "--expect", "absent"]),
+            Ok(Command::Remove {
+                file: PathBuf::from(".env"),
+                key: "TOKEN".to_string(),
+                selector: EnvKeyRemoveSelector::Only,
+                expectation: Some(EnvKeyExpectation::Absent),
+                output: OutputFormat::Auto,
+            })
+        );
+    }
+
+    #[test]
+    fn rm_parser_rejects_conflicting_and_malformed_selectors() {
+        for arguments in [
+            vec!["rm"],
+            vec!["rm", ".env"],
+            vec!["rm", ".env", "TOKEN", "extra"],
+            vec!["rm", ".env", "TOKEN", "--all", "--line", "3"],
+            vec!["rm", ".env", "TOKEN", "--line"],
+            vec!["rm", ".env", "TOKEN", "--line", "0"],
+            vec!["rm", ".env", "TOKEN", "--line", "second"],
+            vec!["rm", ".env", "TOKEN", "--expect"],
+            vec!["rm", ".env", "TOKEN", "--expect", "maybe"],
+            vec![
+                "rm", ".env", "TOKEN", "--expect", "present", "--expect", "absent",
+            ],
+            vec!["rm", ".env", "TOKEN", "--values"],
+        ] {
+            assert!(
+                parse(&arguments).is_err(),
+                "{arguments:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn rm_help_documents_the_one_shot_line_selector() {
+        let help = usage_text(HelpTopic::Remove);
+        assert!(help.contains("--line"));
+        assert!(help.contains("never"));
+        assert!(help.contains("hunts for another occurrence"));
+        assert!(help.contains("alreadyAbsent"));
+        assert!(help.contains("--expect"));
     }
 
     #[test]
