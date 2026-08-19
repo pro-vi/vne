@@ -121,6 +121,23 @@ pub struct EnvKeyRenameOutcome {
     pub keys: EnvKeyRenamePair,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExampleSyncDisposition {
+    Created,
+    Updated,
+    AlreadyCurrent,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExampleSyncOutcome {
+    pub disposition: ExampleSyncDisposition,
+    pub source_path: String,
+    pub example_path: String,
+    pub added_keys: Vec<String>,
+}
+
 /// The caller's belief about the key before the removal runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvKeyExpectation {
@@ -437,6 +454,61 @@ impl From<EnvFileAccessError> for EnvKeyCopyError {
                 source,
             },
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum ExampleSyncError {
+    SameFile,
+    UnusableExamplePath,
+    Access(EnvFileAccessError),
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl ExampleSyncError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::SameFile => "source and example resolve to the same file".to_string(),
+            Self::UnusableExamplePath => {
+                "example path must name a file inside an existing directory".to_string()
+            }
+            Self::Access(error) => error.message(),
+            Self::Io {
+                action,
+                path,
+                source,
+            } => format!(
+                "could not {action} example file {}: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl fmt::Display for ExampleSyncError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("example sync failed")
+    }
+}
+
+impl std::error::Error for ExampleSyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } | Self::Access(EnvFileAccessError::Io { source, .. }) => {
+                Some(source)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl From<EnvFileAccessError> for ExampleSyncError {
+    fn from(error: EnvFileAccessError) -> Self {
+        Self::Access(error)
     }
 }
 
@@ -1659,6 +1731,123 @@ fn rename_env_key_content(
     updated.push_str(to);
     updated.push_str(&content[source.key_end..]);
     Ok(updated)
+}
+
+/// Adds keys the real env file has and the example file lacks, as valueless
+/// placeholders. It never copies a value, never deletes an example entry, and
+/// never rewrites a line that is already there.
+pub fn sync_example_file(
+    source_path: &Path,
+    example_path: Option<&Path>,
+) -> Result<ExampleSyncOutcome, ExampleSyncError> {
+    let source_path = canonical_regular_file(source_path, "source")?;
+    let example_path = match example_path {
+        Some(path) => path.to_path_buf(),
+        None => default_example_path(&source_path)?,
+    };
+
+    let created = !example_path.exists();
+    if created {
+        create_example_file(&example_path)?;
+    }
+    let example_path = canonical_regular_file(&example_path, "example")?;
+    if source_path == example_path {
+        return Err(ExampleSyncError::SameFile);
+    }
+
+    let source_content = read_env_file_at(&source_path)?;
+    let example_content = read_env_file_at(&example_path)?;
+    let (updated, added_keys) = example_additions(&source_content, &example_content);
+
+    if !added_keys.is_empty() {
+        atomic_write_preserving_permissions(&example_path, &updated).map_err(|source| {
+            ExampleSyncError::Io {
+                action: "write",
+                path: example_path.clone(),
+                source,
+            }
+        })?;
+    }
+
+    let disposition = match (created, added_keys.is_empty()) {
+        (true, _) => ExampleSyncDisposition::Created,
+        (false, false) => ExampleSyncDisposition::Updated,
+        (false, true) => ExampleSyncDisposition::AlreadyCurrent,
+    };
+
+    Ok(ExampleSyncOutcome {
+        disposition,
+        source_path: source_path.to_string_lossy().to_string(),
+        example_path: example_path.to_string_lossy().to_string(),
+        added_keys,
+    })
+}
+
+fn default_example_path(source_path: &Path) -> Result<PathBuf, ExampleSyncError> {
+    let parent = source_path
+        .parent()
+        .ok_or(ExampleSyncError::UnusableExamplePath)?;
+    Ok(parent.join(".env.example"))
+}
+
+fn create_example_file(path: &Path) -> Result<(), ExampleSyncError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(ExampleSyncError::UnusableExamplePath)?;
+
+    ensure_project_env_file(parent, name)
+        .map(|_| ())
+        .map_err(|source| ExampleSyncError::Io {
+            action: "create",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Returns the example content with the missing keys appended, plus the key
+/// names in source order. An inline comment travels only when it survives the
+/// same secret scan the parser uses elsewhere.
+fn example_additions(source_content: &str, example_content: &str) -> (String, Vec<String>) {
+    let example_keys = parse_env_entries(example_content)
+        .into_iter()
+        .map(|entry| entry.key)
+        .collect::<BTreeSet<_>>();
+
+    let mut seen = BTreeSet::new();
+    let mut additions = Vec::new();
+    for entry in parse_env_entries(source_content) {
+        if example_keys.contains(&entry.key) || !seen.insert(entry.key.clone()) {
+            continue;
+        }
+        let comment = entry
+            .comment
+            .filter(|comment| !contains_secretish_text(comment));
+        additions.push((entry.key, comment));
+    }
+
+    let line_ending = preferred_line_ending(example_content);
+    let mut updated = String::with_capacity(example_content.len() + additions.len() * 32);
+    updated.push_str(example_content);
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push_str(line_ending);
+    }
+    for (key, comment) in &additions {
+        updated.push_str(key);
+        updated.push('=');
+        if let Some(comment) = comment {
+            updated.push(' ');
+            updated.push_str(comment);
+        }
+        updated.push_str(line_ending);
+    }
+
+    let added_keys = additions.into_iter().map(|(key, _)| key).collect();
+    (updated, added_keys)
 }
 
 fn env_value_token<'a>(content: &'a str, entry: &ParsedLine) -> EnvValueToken<'a> {
@@ -4171,6 +4360,92 @@ mod tests {
         let retried = rename_env_key(&env_file, "TOKEN", "API_TOKEN").unwrap_err();
         assert!(matches!(retried, EnvKeyRenameError::Indeterminate { .. }));
         assert_eq!(fs::read_to_string(&env_file).unwrap(), renamed);
+    }
+
+    #[test]
+    fn example_appends_missing_keys_without_values_and_keeps_existing_lines() {
+        let source =
+            "DATABASE_URL=postgres://localhost/vne\nPORT=1420 # dev server\nTOKEN=secret\n";
+        let example = "# contract\nDATABASE_URL=\n";
+
+        let (updated, added) = example_additions(source, example);
+
+        assert_eq!(added, vec!["PORT".to_string(), "TOKEN".to_string()]);
+        assert_eq!(
+            updated,
+            "# contract\nDATABASE_URL=\nPORT= # dev server\nTOKEN=\n"
+        );
+        assert!(updated.starts_with(example));
+    }
+
+    #[test]
+    fn example_never_copies_a_secret_looking_inline_comment() {
+        let source = "TOKEN=value # OPENAI_API_KEY=sk-live-1234567890abcdef\n";
+
+        let (updated, added) = example_additions(source, "");
+
+        assert_eq!(added, vec!["TOKEN".to_string()]);
+        assert_eq!(updated, "TOKEN=\n");
+    }
+
+    #[test]
+    fn example_reports_nothing_to_add_when_every_key_is_present() {
+        let (updated, added) = example_additions("PORT=1420\n", "PORT=\n");
+
+        assert!(added.is_empty());
+        assert_eq!(updated, "PORT=\n");
+    }
+
+    #[test]
+    fn example_adds_a_duplicated_source_key_once_and_preserves_line_endings() {
+        let (updated, added) = example_additions("PORT=1420\nPORT=1421\n", "DATABASE_URL=\r\n");
+
+        assert_eq!(added, vec!["PORT".to_string()]);
+        assert_eq!(updated, "DATABASE_URL=\r\nPORT=\r\n");
+    }
+
+    #[test]
+    fn example_sync_is_additive_creates_a_missing_file_and_converges() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join(".env");
+        let example = dir.path().join(".env.example");
+        fs::write(&source, "PORT=1420\nTOKEN=secret\n").unwrap();
+
+        let created = sync_example_file(&source, None).unwrap();
+        assert_eq!(created.disposition, ExampleSyncDisposition::Created);
+        assert_eq!(created.added_keys, vec!["PORT", "TOKEN"]);
+        assert_eq!(fs::read_to_string(&example).unwrap(), "PORT=\nTOKEN=\n");
+
+        let converged = sync_example_file(&source, None).unwrap();
+        assert_eq!(
+            converged.disposition,
+            ExampleSyncDisposition::AlreadyCurrent
+        );
+        assert!(converged.added_keys.is_empty());
+
+        // An example-only key is left alone, and a new source key is appended.
+        fs::write(&example, "PORT=\nTOKEN=\nEXAMPLE_ONLY=\n").unwrap();
+        fs::write(&source, "PORT=1420\nTOKEN=secret\nQUEUE_URL=redis://x\n").unwrap();
+
+        let updated = sync_example_file(&source, None).unwrap();
+        assert_eq!(updated.disposition, ExampleSyncDisposition::Updated);
+        assert_eq!(updated.added_keys, vec!["QUEUE_URL"]);
+        assert_eq!(
+            fs::read_to_string(&example).unwrap(),
+            "PORT=\nTOKEN=\nEXAMPLE_ONLY=\nQUEUE_URL=\n"
+        );
+    }
+
+    #[test]
+    fn example_sync_refuses_a_source_that_is_its_own_example() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join(".env");
+        fs::write(&source, "PORT=1420\n").unwrap();
+
+        let error = sync_example_file(&source, Some(&source)).unwrap_err();
+
+        assert!(matches!(error, ExampleSyncError::SameFile));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "PORT=1420\n");
     }
 
     #[test]

@@ -1,11 +1,11 @@
 use crate::{
     append_env_key_result, atomic_write_preserving_permissions, compare_env_files, copy_env_key,
     ensure_project_env_file, infer_key_shape, parse_env_file, redact_env_file_values_only,
-    redact_snapshot_values_only, remove_env_key, rename_env_key, set_env_key,
+    redact_snapshot_values_only, remove_env_key, rename_env_key, set_env_key, sync_example_file,
     withhold_all_env_file_payloads, withhold_all_snapshot_payloads, EnsureEnvFileOutcome,
     EnvComparison, EnvFile, EnvFileCreationDisposition, EnvFileGitStatus, EnvKeyCopyDisposition,
     EnvKeyExpectation, EnvKeyRemoveDisposition, EnvKeyRemoveSelector, EnvKeySetDisposition,
-    ProjectSnapshot,
+    ExampleSyncDisposition, ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
@@ -51,6 +51,10 @@ const CLI_COMMANDS: &[CliCommand] = &[
     CliCommand {
         name: "rename",
         parse: parse_rename_args,
+    },
+    CliCommand {
+        name: "example",
+        parse: parse_example_args,
     },
     CliCommand {
         name: "copy",
@@ -111,6 +115,11 @@ enum Command {
         to: String,
         output: OutputFormat,
     },
+    Example {
+        file: PathBuf,
+        example: Option<PathBuf>,
+        output: OutputFormat,
+    },
     Copy {
         source_file: PathBuf,
         key: String,
@@ -155,6 +164,7 @@ enum HelpTopic {
     Set,
     Remove,
     Rename,
+    Example,
     Copy,
     Create,
     Format,
@@ -275,6 +285,11 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             to,
             output,
         } => run_rename(&file, &from, &to, output),
+        Command::Example {
+            file,
+            example,
+            output,
+        } => run_example(&file, example.as_deref(), output),
         Command::Copy {
             source_file,
             key,
@@ -657,6 +672,39 @@ fn run_rename(
             "renamed `{}` to `{}` in {}",
             outcome.keys.from, outcome.keys.to, outcome.path
         ))?;
+    }
+
+    Ok(false)
+}
+
+fn run_example(
+    file: &Path,
+    example: Option<&Path>,
+    output: OutputFormat,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let outcome = sync_example_file(file, example).map_err(|error| error.message())?;
+
+    if output.wants_json() {
+        print_json(&outcome, output)?;
+    } else {
+        let state = match outcome.disposition {
+            ExampleSyncDisposition::Created => "created",
+            ExampleSyncDisposition::Updated => "updated",
+            ExampleSyncDisposition::AlreadyCurrent => "already current",
+        };
+        if outcome.added_keys.is_empty() {
+            stdout_line(format_args!(
+                "{state} {} from {}",
+                outcome.example_path, outcome.source_path
+            ))?;
+        } else {
+            stdout_line(format_args!(
+                "{state} {} from {}, added {}",
+                outcome.example_path,
+                outcome.source_path,
+                outcome.added_keys.join(", ")
+            ))?;
+        }
     }
 
     Ok(false)
@@ -1267,6 +1315,60 @@ fn parse_rename_args(args: ArgIter) -> Result<Command, ParseError> {
     })
 }
 
+fn parse_example_args(args: ArgIter) -> Result<Command, ParseError> {
+    let mut file = None;
+    let mut example = None;
+    let mut output = OutputFormat::Auto;
+    let mut args = args.peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Example)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Example)?,
+            "--pretty" => {
+                set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Example)?
+            }
+            "--example" => {
+                let Some(path) = args.next() else {
+                    return Err(ParseError::new(
+                        HelpTopic::Example,
+                        "--example requires a path",
+                    ));
+                };
+                if example.is_some() {
+                    return Err(ParseError::new(
+                        HelpTopic::Example,
+                        "example accepts only one --example path",
+                    ));
+                }
+                example = Some(PathBuf::from(path));
+            }
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Example)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Example,
+                    format!("unknown example option `{arg}`"),
+                ));
+            }
+            _ if file.is_none() => file = Some(PathBuf::from(arg)),
+            _ => {
+                return Err(ParseError::new(
+                    HelpTopic::Example,
+                    format!("unexpected example argument `{arg}`"),
+                ));
+            }
+        }
+    }
+
+    let file = file
+        .ok_or_else(|| ParseError::new(HelpTopic::Example, "example requires an env file path"))?;
+    Ok(Command::Example {
+        file,
+        example,
+        output,
+    })
+}
+
 fn parse_create_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut file = None;
     let mut output = OutputFormat::Auto;
@@ -1407,7 +1509,7 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, rm, and rename output contains only state, normalized paths, keys, and lines.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne copy ../other/.env DATABASE_URL .env\n"
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, rm, rename, and example output contains only state, paths, keys, and lines.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne example .env\n  vne copy ../other/.env DATABASE_URL .env\n"
         }
         HelpTopic::Check => {
             "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
@@ -1429,6 +1531,9 @@ fn usage_text(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::Rename => {
             "vne rename - rename one env key while leaving its value untouched\n\nUSAGE:\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n\nBEHAVIOR:\n  Only the key token changes. The value bytes, quoting, inline comment, export\n  prefix, spacing, and line position stay byte-identical.\n  The old key must occur exactly once and be well formed.\n  An existing new key is refused; vne never merges two keys.\n  When the old key is absent and the new key is present, vne refuses instead of\n  reporting success: file state cannot prove that this rename is what happened.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit a compact payload-free rename receipt\n  --pretty  Emit a formatted payload-free rename receipt\n\nEXAMPLES:\n  vne rename .env OLD_NAME NEW_NAME\n  vne rename .env OPENAI_KEY OPENAI_API_KEY --json\n"
+        }
+        HelpTopic::Example => {
+            "vne example - add missing keys to an example env file, never their values\n\nUSAGE:\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Keys present in the real file and missing from the example are appended as\n  valueless placeholders, in the order the real file lists them.\n  Existing example lines are never rewritten and never deleted.\n  An inline comment travels only when it does not itself look secret-like.\n  A missing example file is created; the default is a sibling .env.example.\n  Nothing to add reports alreadyCurrent without writing.\n\nOPTIONS:\n  --example <file>  Sync into this example file instead of the sibling default\n  --text            Force human text output\n  --json            Emit a compact payload-free sync receipt\n  --pretty          Emit a formatted payload-free sync receipt\n\nEXAMPLES:\n  vne example .env\n  vne example .env --example .env.sample --json\n"
         }
         HelpTopic::Copy => {
             "vne copy - copy one env key between existing files without exposing its value\n\nUSAGE:\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Source and destination must be distinct existing regular files.\n  The source key must occur exactly once and be well formed.\n  An absent destination key is added. An identical value reports alreadyPresent without writing.\n  A different destination value requires --overwrite. Duplicate destination keys are refused.\n  The value stays inside vne; output contains only state, normalized paths, and key.\n\nOPTIONS:\n  --overwrite  Replace one different existing destination value\n  --text       Force human text output\n  --json       Emit a compact payload-free copy receipt\n  --pretty     Emit a formatted payload-free copy receipt\n\nEXAMPLE:\n  vne copy ../other/.env DATABASE_URL .env\n  vne copy ../other/.env DATABASE_URL .env --overwrite --json\n"
@@ -2008,6 +2113,50 @@ mod tests {
         assert!(help.contains("inline comment"));
         assert!(help.contains("never merges"));
         assert!(help.contains("cannot prove"));
+    }
+
+    #[test]
+    fn parses_example_with_an_optional_override_path() {
+        assert_eq!(
+            parse(&["example", ".env"]),
+            Ok(Command::Example {
+                file: PathBuf::from(".env"),
+                example: None,
+                output: OutputFormat::Auto,
+            })
+        );
+        assert_eq!(
+            parse(&["example", ".env", "--example", ".env.sample", "--json"]),
+            Ok(Command::Example {
+                file: PathBuf::from(".env"),
+                example: Some(PathBuf::from(".env.sample")),
+                output: OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn example_parser_rejects_missing_extra_and_unknown_arguments() {
+        for arguments in [
+            vec!["example"],
+            vec!["example", ".env", "extra"],
+            vec!["example", ".env", "--example"],
+            vec!["example", ".env", "--values"],
+            vec!["example", ".env", "--example", "a", "--example", "b"],
+        ] {
+            assert!(
+                parse(&arguments).is_err(),
+                "{arguments:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn example_help_documents_the_additive_contract() {
+        let help = usage_text(HelpTopic::Example);
+        assert!(help.contains("never rewritten and never deleted"));
+        assert!(help.contains("valueless placeholders"));
+        assert!(help.contains("alreadyCurrent"));
     }
 
     #[test]

@@ -1628,3 +1628,100 @@ fn mutating_a_tracked_file_warns_on_stderr_without_blocking_the_write() {
         .unwrap()
         .contains("is tracked by git"));
 }
+
+#[test]
+fn example_sync_is_payload_free_additive_and_converges() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join(".env");
+    let example = dir.path().join(".env.example");
+    write(
+        &source,
+        &format!(
+            "DATABASE_URL=postgres://user:{STORED_SENTINEL}@host/db\nPORT=1420 # dev server\nTOKEN=sk-{SET_SENTINEL} # rotate with {KEEP_SENTINEL}_API_KEY=sk-live-abcdef1234567890\n"
+        ),
+    );
+
+    let args = [
+        "example".to_string(),
+        source.display().to_string(),
+        "--json".to_string(),
+    ];
+
+    let created = run_vne(args.clone());
+
+    assert_eq!(created.status.code(), Some(0));
+    assert!(created.stderr.is_empty());
+    let created_json =
+        assert_payload_absent(&created, &[STORED_SENTINEL, SET_SENTINEL, KEEP_SENTINEL]);
+    assert_eq!(created_json["disposition"], "created");
+    assert_eq!(
+        created_json["addedKeys"],
+        serde_json::json!(["DATABASE_URL", "PORT", "TOKEN"])
+    );
+    assert_eq!(
+        created_json["sourcePath"],
+        source.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(
+        created_json["examplePath"],
+        example.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(created_json.as_object().unwrap().len(), 4);
+
+    let written = fs::read_to_string(&example).unwrap();
+    assert_eq!(written, "DATABASE_URL=\nPORT= # dev server\nTOKEN=\n");
+    assert!(!written.contains(STORED_SENTINEL));
+    assert!(!written.contains(SET_SENTINEL));
+    assert!(!written.contains(KEEP_SENTINEL));
+
+    // A hand-maintained example line survives, and a rerun writes nothing.
+    let retried = run_vne(args);
+    assert_eq!(retried.status.code(), Some(0));
+    let retried_json =
+        assert_payload_absent(&retried, &[STORED_SENTINEL, SET_SENTINEL, KEEP_SENTINEL]);
+    assert_eq!(retried_json["disposition"], "alreadyCurrent");
+    assert_eq!(retried_json["addedKeys"], serde_json::json!([]));
+    assert_eq!(fs::read_to_string(&example).unwrap(), written);
+}
+
+#[test]
+fn example_sync_keeps_extra_example_keys_and_accepts_an_override_path() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join(".env");
+    let sample = dir.path().join(".env.sample");
+    write(&source, &format!("PORT=1420\nTOKEN={STORED_SENTINEL}\n"));
+    write(&sample, "# hand written\nRETIRED_KEY=\n");
+
+    let output = run_vne([
+        "example".to_string(),
+        source.display().to_string(),
+        "--example".to_string(),
+        sample.display().to_string(),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let json = assert_payload_absent(&output, &[STORED_SENTINEL]);
+    assert_eq!(json["disposition"], "updated");
+    assert_eq!(json["addedKeys"], serde_json::json!(["PORT", "TOKEN"]));
+    assert_eq!(
+        fs::read_to_string(&sample).unwrap(),
+        "# hand written\nRETIRED_KEY=\nPORT=\nTOKEN=\n"
+    );
+}
+
+#[test]
+fn example_sync_fails_on_a_missing_source_without_creating_anything() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join(".env");
+
+    let output = run_vne([
+        "example".to_string(),
+        source.display().to_string(),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!dir.path().join(".env.example").exists());
+}
