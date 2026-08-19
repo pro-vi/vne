@@ -1411,3 +1411,73 @@ fn rename_refusals_are_payload_free_and_leave_the_file_unchanged() {
         assert_eq!(fs::read_to_string(&env_file).unwrap(), initial, "{name}");
     }
 }
+
+#[test]
+fn add_warns_only_when_a_secret_like_value_arrives_as_a_command_argument() {
+    let dir = tempdir().unwrap();
+
+    let argument_file = dir.path().join("argument.env");
+    write(&argument_file, "PORT=1420\n");
+    let warned = run_vne([
+        "add".to_string(),
+        argument_file.display().to_string(),
+        "OPENAI_API_KEY".to_string(),
+        format!("sk-{SET_SENTINEL}"),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(warned.status.code(), Some(0));
+    let stderr = String::from_utf8(warned.stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("`OPENAI_API_KEY` looks secret-like"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--stdin"), "{stderr}");
+    assert!(stderr.contains("--prompt"), "{stderr}");
+    assert!(!stderr.contains(SET_SENTINEL), "{stderr}");
+    assert_payload_absent(&warned, &[SET_SENTINEL]);
+    assert_eq!(
+        fs::read_to_string(&argument_file).unwrap(),
+        format!("PORT=1420\nOPENAI_API_KEY=sk-{SET_SENTINEL}\n")
+    );
+
+    let ordinary_file = dir.path().join("ordinary.env");
+    write(&ordinary_file, "PORT=1420\n");
+    let ordinary = run_vne([
+        "add".to_string(),
+        ordinary_file.display().to_string(),
+        "FEATURE_FLAG=true".to_string(),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(ordinary.status.code(), Some(0));
+    assert!(
+        ordinary.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&ordinary.stderr)
+    );
+
+    let piped_file = dir.path().join("piped.env");
+    write(&piped_file, "PORT=1420\n");
+    let piped = run_vne_with_stdin(
+        [
+            "add".to_string(),
+            piped_file.display().to_string(),
+            "OPENAI_API_KEY".to_string(),
+            "--stdin".to_string(),
+            "--json".to_string(),
+        ],
+        &format!("sk-{SET_SENTINEL}"),
+    );
+
+    assert_eq!(piped.status.code(), Some(0));
+    assert!(
+        piped.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&piped.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&piped_file).unwrap(),
+        fs::read_to_string(&argument_file).unwrap()
+    );
+}

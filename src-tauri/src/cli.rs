@@ -1,6 +1,6 @@
 use crate::{
     append_env_key_result, atomic_write_preserving_permissions, compare_env_files, copy_env_key,
-    ensure_project_env_file, parse_env_file, redact_env_file_values_only,
+    ensure_project_env_file, infer_key_shape, parse_env_file, redact_env_file_values_only,
     redact_snapshot_values_only, remove_env_key, rename_env_key, set_env_key,
     withhold_all_env_file_payloads, withhold_all_snapshot_payloads, EnsureEnvFileOutcome,
     EnvComparison, EnvFile, EnvFileCreationDisposition, EnvKeyCopyDisposition, EnvKeyExpectation,
@@ -244,7 +244,11 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             values,
         } => {
             prepare_add_target(&file, matches!(&value, ValueSource::Prompt))?;
+            let from_argument = matches!(&value, ValueSource::Inline(_));
             let value = resolve_value_source(&key, value)?;
+            if from_argument {
+                warn_on_secret_like_argument(&key, &value)?;
+            }
             run_add(&file, &key, &value, output, values)
         }
         Command::Set {
@@ -291,6 +295,19 @@ fn resolve_value_source(
         ValueSource::Prompt => read_prompted_value(key),
         ValueSource::Stdin => read_stdin_value(),
     }
+}
+
+/// Warns when a value handed in as a command argument classifies secret-like.
+/// The warning names the key only: process lists and shell history already hold
+/// the value, and vne must not add a third copy of it.
+fn warn_on_secret_like_argument(key: &str, value: &str) -> io::Result<()> {
+    if !infer_key_shape(key, value).redacted_by_default {
+        return Ok(());
+    }
+
+    stderr_line(format_args!(
+        "warning: `{key}` looks secret-like and its value came from a command argument, which shell history and process lists can retain; use --stdin or --prompt instead"
+    ))
 }
 
 fn prepare_set_target(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
