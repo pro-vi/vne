@@ -1,9 +1,9 @@
 use crate::{
     append_env_key_result, atomic_write_preserving_permissions, compare_env_files, copy_env_key,
     ensure_project_env_file, parse_env_file, redact_env_file_values_only,
-    redact_snapshot_values_only, withhold_all_env_file_payloads, withhold_all_snapshot_payloads,
-    EnsureEnvFileOutcome, EnvComparison, EnvFile, EnvFileCreationDisposition,
-    EnvKeyCopyDisposition, ProjectSnapshot,
+    redact_snapshot_values_only, set_env_key, withhold_all_env_file_payloads,
+    withhold_all_snapshot_payloads, EnsureEnvFileOutcome, EnvComparison, EnvFile,
+    EnvFileCreationDisposition, EnvKeyCopyDisposition, EnvKeySetDisposition, ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
@@ -14,9 +14,49 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
 
-const CLI_COMMANDS: &[&str] = &[
-    "check", "inspect", "format", "add", "copy", "create", "help", "-h", "--help",
+type ArgIter = std::vec::IntoIter<String>;
+
+struct CliCommand {
+    name: &'static str,
+    parse: fn(ArgIter) -> Result<Command, ParseError>,
+}
+
+const CLI_COMMANDS: &[CliCommand] = &[
+    CliCommand {
+        name: "check",
+        parse: parse_check_args,
+    },
+    CliCommand {
+        name: "inspect",
+        parse: parse_inspect_args,
+    },
+    CliCommand {
+        name: "format",
+        parse: parse_format_args,
+    },
+    CliCommand {
+        name: "add",
+        parse: parse_add_args,
+    },
+    CliCommand {
+        name: "set",
+        parse: parse_set_args,
+    },
+    CliCommand {
+        name: "copy",
+        parse: parse_copy_args,
+    },
+    CliCommand {
+        name: "create",
+        parse: parse_create_args,
+    },
 ];
+
+const CLI_HELP_ALIASES: &[&str] = &["help", "-h", "--help"];
+
+fn cli_command(name: &str) -> Option<&'static CliCommand> {
+    CLI_COMMANDS.iter().find(|command| command.name == name)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -38,9 +78,15 @@ enum Command {
     Add {
         file: PathBuf,
         key: String,
-        value: AddValue,
+        value: ValueSource,
         output: OutputFormat,
         values: ValueOutput,
+    },
+    Set {
+        file: PathBuf,
+        key: String,
+        value: ValueSource,
+        output: OutputFormat,
     },
     Copy {
         source_file: PathBuf,
@@ -57,7 +103,7 @@ enum Command {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum AddValue {
+enum ValueSource {
     Inline(String),
     Prompt,
     Stdin,
@@ -83,6 +129,7 @@ enum HelpTopic {
     Check,
     Inspect,
     Add,
+    Set,
     Copy,
     Create,
     Format,
@@ -113,7 +160,7 @@ struct CheckOutput {
 
 pub fn is_cli_invocation(args: &[String]) -> bool {
     args.first()
-        .is_some_and(|arg| CLI_COMMANDS.contains(&arg.as_str()))
+        .is_some_and(|arg| cli_command(arg).is_some() || CLI_HELP_ALIASES.contains(&arg.as_str()))
 }
 
 pub fn run_from_env() -> ExitCode {
@@ -172,8 +219,19 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             output,
             values,
         } => {
-            let value = read_add_value(&file, &key, value)?;
+            prepare_add_target(&file, matches!(&value, ValueSource::Prompt))?;
+            let value = resolve_value_source(&key, value)?;
             run_add(&file, &key, &value, output, values)
+        }
+        Command::Set {
+            file,
+            key,
+            value,
+            output,
+        } => {
+            prepare_set_target(&file)?;
+            let value = resolve_value_source(&key, value)?;
+            run_set(&file, &key, &value, output)
         }
         Command::Copy {
             source_file,
@@ -187,17 +245,30 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
     }
 }
 
-fn read_add_value(
-    file: &Path,
+fn resolve_value_source(
     key: &str,
-    value: AddValue,
+    source: ValueSource,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    prepare_add_target(file, matches!(&value, AddValue::Prompt))?;
+    match source {
+        ValueSource::Inline(value) => Ok(value),
+        ValueSource::Prompt => read_prompted_value(key),
+        ValueSource::Stdin => read_stdin_value(),
+    }
+}
 
-    match value {
-        AddValue::Inline(value) => Ok(value),
-        AddValue::Prompt => read_prompted_value(key),
-        AddValue::Stdin => read_stdin_value(),
+fn prepare_set_target(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match fs::metadata(file) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(format!(
+            "env file {} does not exist; run `vne create <file>` and `vne add <file> <KEY>` first",
+            file.display()
+        )
+        .into()),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("could not inspect env file {}: {error}", file.display()),
+        )
+        .into()),
     }
 }
 
@@ -437,6 +508,30 @@ fn run_add(
     Ok(false)
 }
 
+fn run_set(
+    file: &Path,
+    key: &str,
+    value: &str,
+    output: OutputFormat,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let outcome = set_env_key(file, key, value).map_err(|error| error.message(key))?;
+
+    if output.wants_json() {
+        print_json(&outcome, output)?;
+    } else {
+        let state = match outcome.disposition {
+            EnvKeySetDisposition::Updated => "updated",
+            EnvKeySetDisposition::AlreadyPresent => "already present",
+        };
+        stdout_line(format_args!(
+            "{state} `{}` in {}",
+            outcome.key, outcome.path
+        ))?;
+    }
+
+    Ok(false)
+}
+
 fn run_create(file: &Path, output: OutputFormat) -> Result<bool, Box<dyn std::error::Error>> {
     let outcome = ensure_env_file_path(file)?;
 
@@ -623,22 +718,21 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, ParseEr
         return Ok(Command::Help(HelpTopic::General));
     };
 
-    match command.as_str() {
-        "-h" | "--help" | "help" => Ok(Command::Help(HelpTopic::General)),
-        "check" => parse_check_args(args),
-        "inspect" => parse_inspect_args(args),
-        "format" => parse_format_args(args),
-        "add" => parse_add_args(args),
-        "copy" => parse_copy_args(args),
-        "create" => parse_create_args(args),
-        _ => Err(ParseError::new(
+    if CLI_HELP_ALIASES.contains(&command.as_str()) {
+        return Ok(Command::Help(HelpTopic::General));
+    }
+
+    let Some(entry) = cli_command(&command) else {
+        return Err(ParseError::new(
             HelpTopic::General,
             format!("unknown command `{command}`"),
-        )),
-    }
+        ));
+    };
+
+    (entry.parse)(args.collect::<Vec<_>>().into_iter())
 }
 
-fn parse_check_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
+fn parse_check_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut file = None;
     let mut example = None;
     let mut output = OutputFormat::Auto;
@@ -689,7 +783,7 @@ fn parse_check_args(args: impl Iterator<Item = String>) -> Result<Command, Parse
     })
 }
 
-fn parse_inspect_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
+fn parse_inspect_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut dir = None;
     let mut output = OutputFormat::Auto;
     let mut values = ValueOutput::Hidden;
@@ -729,7 +823,7 @@ fn parse_inspect_args(args: impl Iterator<Item = String>) -> Result<Command, Par
     })
 }
 
-fn parse_format_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
+fn parse_format_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut file = None;
     let mut dry_run = false;
 
@@ -758,7 +852,7 @@ fn parse_format_args(args: impl Iterator<Item = String>) -> Result<Command, Pars
     Ok(Command::Format { file, dry_run })
 }
 
-fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
+fn parse_add_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut output = OutputFormat::Auto;
     let mut values = ValueOutput::Hidden;
     let mut value = None;
@@ -771,13 +865,17 @@ fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, ParseEr
             "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Add)?,
             "--pretty" => set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Add)?,
             "--values" => values = ValueOutput::Classified,
-            "--prompt" => set_add_value_source(&mut value, AddValue::Prompt)?,
-            "--stdin" => set_add_value_source(&mut value, AddValue::Stdin)?,
+            "--prompt" => set_value_source(&mut value, ValueSource::Prompt, HelpTopic::Add)?,
+            "--stdin" => set_value_source(&mut value, ValueSource::Stdin, HelpTopic::Add)?,
             "--value" => {
                 let Some(inline_value) = args.next() else {
                     return Err(ParseError::new(HelpTopic::Add, "--value requires a value"));
                 };
-                set_add_value_source(&mut value, AddValue::Inline(inline_value))?;
+                set_value_source(
+                    &mut value,
+                    ValueSource::Inline(inline_value),
+                    HelpTopic::Add,
+                )?;
             }
             "-h" | "--help" => return Ok(Command::Help(HelpTopic::Add)),
             _ => positionals.push(arg),
@@ -793,13 +891,13 @@ fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, ParseEr
             (
                 PathBuf::from(file),
                 key.to_string(),
-                AddValue::Inline(inline_value.to_string()),
+                ValueSource::Inline(inline_value.to_string()),
             )
         }
         ([file, key, inline_value], None) => (
             PathBuf::from(file),
             key.clone(),
-            AddValue::Inline(inline_value.clone()),
+            ValueSource::Inline(inline_value.clone()),
         ),
         ([_, _, _], Some(_)) => {
             return Err(ParseError::new(
@@ -828,7 +926,54 @@ fn parse_add_args(args: impl Iterator<Item = String>) -> Result<Command, ParseEr
     })
 }
 
-fn parse_create_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
+fn parse_set_args(args: ArgIter) -> Result<Command, ParseError> {
+    let mut output = OutputFormat::Auto;
+    let mut value = None;
+    let mut positionals = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Set)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Set)?,
+            "--pretty" => set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Set)?,
+            "--prompt" => set_value_source(&mut value, ValueSource::Prompt, HelpTopic::Set)?,
+            "--stdin" => set_value_source(&mut value, ValueSource::Stdin, HelpTopic::Set)?,
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Set)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Set,
+                    format!("unknown set option `{arg}`; {SET_VALUE_SOURCE_RULE}"),
+                ));
+            }
+            _ => positionals.push(arg),
+        }
+    }
+
+    let [file, key] = positionals.as_slice() else {
+        return Err(set_usage_error());
+    };
+    if key.is_empty() {
+        return Err(ParseError::new(
+            HelpTopic::Set,
+            "set requires a non-empty key",
+        ));
+    }
+    if key.contains('=') {
+        return Err(set_usage_error());
+    }
+    let Some(value) = value else {
+        return Err(set_usage_error());
+    };
+
+    Ok(Command::Set {
+        file: PathBuf::from(file),
+        key: key.clone(),
+        value,
+        output,
+    })
+}
+
+fn parse_create_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut file = None;
     let mut output = OutputFormat::Auto;
 
@@ -861,7 +1006,7 @@ fn parse_create_args(args: impl Iterator<Item = String>) -> Result<Command, Pars
     Ok(Command::Create { file, output })
 }
 
-fn parse_copy_args(args: impl Iterator<Item = String>) -> Result<Command, ParseError> {
+fn parse_copy_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut output = OutputFormat::Auto;
     let mut overwrite = false;
     let mut positionals = Vec::new();
@@ -922,15 +1067,32 @@ fn set_output_format(
     Ok(())
 }
 
-fn set_add_value_source(target: &mut Option<AddValue>, value: AddValue) -> Result<(), ParseError> {
+const SET_VALUE_SOURCE_RULE: &str =
+    "set reads the new value from --stdin or --prompt only, never from an argument";
+
+fn set_value_source(
+    target: &mut Option<ValueSource>,
+    value: ValueSource,
+    topic: HelpTopic,
+) -> Result<(), ParseError> {
     if target.is_some() {
-        return Err(ParseError::new(
-            HelpTopic::Add,
-            "add accepts only one of --prompt, --stdin, or --value",
-        ));
+        let message = match topic {
+            HelpTopic::Set => "set accepts only one of --stdin or --prompt",
+            _ => "add accepts only one of --prompt, --stdin, or --value",
+        };
+        return Err(ParseError::new(topic, message));
     }
     *target = Some(value);
     Ok(())
+}
+
+fn set_usage_error() -> ParseError {
+    ParseError::new(
+        HelpTopic::Set,
+        format!(
+            "set requires <file> <KEY> --stdin or <file> <KEY> --prompt; {SET_VALUE_SOURCE_RULE}"
+        ),
+    )
 }
 
 fn add_usage_error() -> ParseError {
@@ -951,7 +1113,7 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy output contains only its state, normalized paths, and key.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne copy ../other/.env DATABASE_URL .env\n"
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy and set output contains only its state, normalized paths, and key.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is intentionally raw and warns when piped.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne copy ../other/.env DATABASE_URL .env\n"
         }
         HelpTopic::Check => {
             "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
@@ -964,6 +1126,9 @@ fn usage_text(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::Create => {
             "vne create - ensure one empty env file exists without overwriting it\n\nUSAGE:\n  vne create <file> [--text|--json|--pretty]\n\nBEHAVIOR:\n  The parent directory must already exist.\n  The filename must look like .env, .env.local, .envrc, .flaskenv, or worker.env.\n  A new file is empty and private to its owner on Unix.\n  An existing regular file is left unchanged and reported as alreadyExists.\n  Symlinks, directories, missing parent directories, and overwrite flags are rejected.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit a compact disposition and absolute path\n  --pretty  Emit a formatted disposition and absolute path\n\nEXAMPLES:\n  vne create .env\n  vne create config.env --json\n  vne create /path/to/project/.env.local --pretty\n"
+        }
+        HelpTopic::Set => {
+            "vne set - replace one existing env key value without exposing it\n\nUSAGE:\n  vne set <file> <KEY> --stdin [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--text|--json|--pretty]\n\nBEHAVIOR:\n  The target must be an existing regular file holding exactly one occurrence of KEY.\n  The new value is read from stdin or a hidden prompt; argument value forms are refused.\n  An identical stored value reports alreadyPresent without writing.\n  Missing, duplicate, and malformed keys are refused with line numbers only.\n  An empty value clears the stored value; use `vne add` to create a new key.\n\nOPTIONS:\n  --stdin   Read the new value from stdin\n  --prompt  Read the new value from a hidden terminal prompt\n  --text    Force human text output\n  --json    Emit a compact payload-free set receipt\n  --pretty  Emit a formatted payload-free set receipt\n\nEXAMPLES:\n  vne set .env OPENAI_API_KEY --prompt\n  printf '%s' '1421' | vne set .env PORT --stdin --json\n"
         }
         HelpTopic::Copy => {
             "vne copy - copy one env key between existing files without exposing its value\n\nUSAGE:\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Source and destination must be distinct existing regular files.\n  The source key must occur exactly once and be well formed.\n  An absent destination key is added. An identical value reports alreadyPresent without writing.\n  A different destination value requires --overwrite. Duplicate destination keys are refused.\n  The value stays inside vne; output contains only state, normalized paths, and key.\n\nOPTIONS:\n  --overwrite  Replace one different existing destination value\n  --text       Force human text output\n  --json       Emit a compact payload-free copy receipt\n  --pretty     Emit a formatted payload-free copy receipt\n\nEXAMPLE:\n  vne copy ../other/.env DATABASE_URL .env\n  vne copy ../other/.env DATABASE_URL .env --overwrite --json\n"
@@ -1144,7 +1309,7 @@ mod tests {
             Ok(Command::Add {
                 file: PathBuf::from(".env"),
                 key: "REDIS_URL".to_string(),
-                value: AddValue::Inline("redis://localhost:6379".to_string()),
+                value: ValueSource::Inline("redis://localhost:6379".to_string()),
                 output: OutputFormat::Json,
                 values: ValueOutput::Hidden,
             })
@@ -1158,7 +1323,7 @@ mod tests {
             Ok(Command::Add {
                 file: PathBuf::from(".env"),
                 key: "FEATURE_FLAG".to_string(),
-                value: AddValue::Inline("true".to_string()),
+                value: ValueSource::Inline("true".to_string()),
                 output: OutputFormat::Auto,
                 values: ValueOutput::Hidden,
             })
@@ -1172,7 +1337,7 @@ mod tests {
             Ok(Command::Add {
                 file: PathBuf::from(".env"),
                 key: "OPENAI_API_KEY".to_string(),
-                value: AddValue::Prompt,
+                value: ValueSource::Prompt,
                 output: OutputFormat::Auto,
                 values: ValueOutput::Hidden,
             })
@@ -1186,7 +1351,7 @@ mod tests {
             Ok(Command::Add {
                 file: PathBuf::from(".env"),
                 key: "OPENAI_API_KEY".to_string(),
-                value: AddValue::Stdin,
+                value: ValueSource::Stdin,
                 output: OutputFormat::Json,
                 values: ValueOutput::Hidden,
             })
@@ -1330,6 +1495,102 @@ mod tests {
     fn rejects_add_with_inline_and_prompt_value_sources() {
         assert!(parse(&["add", ".env", "OPENAI_API_KEY", "sk-test", "--prompt"]).is_err());
         assert!(parse(&["add", ".env", "OPENAI_API_KEY", "--prompt", "--stdin"]).is_err());
+    }
+
+    #[test]
+    fn every_registered_command_dispatches_and_documents_itself() {
+        let general = usage_text(HelpTopic::General);
+        for command in CLI_COMMANDS {
+            let name = command.name;
+            assert!(
+                is_cli_invocation(&[name.to_string()]),
+                "`{name}` is not recognised as a CLI invocation"
+            );
+
+            let parsed = parse(&[name]);
+            assert_ne!(
+                parsed,
+                Err(format!("unknown command `{name}`")),
+                "`{name}` is registered but not dispatched"
+            );
+
+            let Ok(Command::Help(topic)) = parse(&[name, "--help"]) else {
+                panic!("`{name} --help` should resolve to its own help topic");
+            };
+            assert_ne!(topic, HelpTopic::General, "`{name}` reuses general help");
+            assert!(
+                usage_text(topic).starts_with(&format!("vne {name} ")),
+                "`{name}` help topic documents a different command"
+            );
+            assert!(
+                general.contains(&format!("vne {name} ")),
+                "`{name}` is missing from the general usage text"
+            );
+        }
+    }
+
+    #[test]
+    fn help_aliases_resolve_to_general_usage() {
+        for alias in CLI_HELP_ALIASES {
+            assert!(is_cli_invocation(&[alias.to_string()]));
+            assert_eq!(parse(&[alias]), Ok(Command::Help(HelpTopic::General)));
+        }
+    }
+
+    #[test]
+    fn parses_set_with_hidden_value_sources_only() {
+        assert_eq!(
+            parse(&["set", ".env", "OPENAI_API_KEY", "--stdin", "--json"]),
+            Ok(Command::Set {
+                file: PathBuf::from(".env"),
+                key: "OPENAI_API_KEY".to_string(),
+                value: ValueSource::Stdin,
+                output: OutputFormat::Json,
+            })
+        );
+        assert_eq!(
+            parse(&["set", ".env", "OPENAI_API_KEY", "--prompt"]),
+            Ok(Command::Set {
+                file: PathBuf::from(".env"),
+                key: "OPENAI_API_KEY".to_string(),
+                value: ValueSource::Prompt,
+                output: OutputFormat::Auto,
+            })
+        );
+    }
+
+    #[test]
+    fn set_parser_refuses_every_argument_value_form() {
+        for arguments in [
+            vec!["set", ".env", "OPENAI_API_KEY", "sk-inline"],
+            vec!["set", ".env", "OPENAI_API_KEY=sk-inline", "--stdin"],
+            vec!["set", ".env", "OPENAI_API_KEY", "--value", "sk-inline"],
+            vec!["set", ".env", "OPENAI_API_KEY"],
+            vec!["set", ".env"],
+        ] {
+            let error = parse(&arguments).expect_err(&format!("{arguments:?} should be refused"));
+            assert!(
+                error.contains("--stdin") && error.contains("--prompt"),
+                "{arguments:?} error omits the allowed value sources: {error}"
+            );
+            assert!(
+                !error.contains("sk-inline"),
+                "{arguments:?} error echoed the value: {error}"
+            );
+        }
+        assert!(parse(&["set", ".env", "KEY", "--stdin", "--prompt"]).is_err());
+        assert!(parse(&["set", ".env", "KEY", "--stdin", "--values"]).is_err());
+        assert!(parse(&["set", ".env", "KEY", "--stdin", "--json", "--text"]).is_err());
+    }
+
+    #[test]
+    fn set_help_documents_hidden_value_sources_and_convergence() {
+        let help = usage_text(HelpTopic::Set);
+        assert!(help.contains("--stdin"));
+        assert!(help.contains("--prompt"));
+        assert!(help.contains("alreadyPresent"));
+        assert!(help.contains("argument value forms are refused"));
+        assert!(!help.contains("--values"));
     }
 
     #[test]

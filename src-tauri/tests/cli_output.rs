@@ -14,6 +14,8 @@ const ADD_SENTINEL: &str = "AddF6U";
 const MALFORMED_SENTINEL: &str = "MalformedG7T";
 const COPY_SENTINEL: &str = "CopyH8S";
 const DESTINATION_SENTINEL: &str = "DestinationI9R";
+const STORED_SENTINEL: &str = "StoredJ1Q";
+const SET_SENTINEL: &str = "SetK2P";
 
 fn run_vne<I, S>(args: I) -> Output
 where
@@ -22,6 +24,51 @@ where
 {
     Command::new(env!("CARGO_BIN_EXE_vne"))
         .args(args)
+        .output()
+        .expect("vne process should run")
+}
+
+fn run_vne_with_stdin<I, S>(args: I, input: &str) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    use std::io::Write as _;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vne"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("vne process should start");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(input.as_bytes())
+        .expect("stdin should accept the value");
+    child.wait_with_output().expect("vne process should finish")
+}
+
+/// Runs `vne` with a stdout whose reader is already gone, so the first write to
+/// stdout fails deterministically instead of racing the child process.
+#[cfg(unix)]
+fn run_vne_with_failing_stdout<I, S>(args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let (reader, writer) = UnixStream::pair().expect("socket pair should be created");
+    drop(reader);
+
+    Command::new(env!("CARGO_BIN_EXE_vne"))
+        .args(args)
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::piped())
         .output()
         .expect("vne process should run")
 }
@@ -277,14 +324,7 @@ fn create_retry_converges_after_post_create_output_failure() {
         "--json".to_string(),
     ];
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_vne"))
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("vne process should start");
-    drop(child.stdout.take());
-    let failed_output = child.wait_with_output().expect("vne process should finish");
+    let failed_output = run_vne_with_failing_stdout(&args);
 
     assert_eq!(failed_output.status.code(), Some(2));
     assert_eq!(fs::read(&env_file).unwrap(), b"");
@@ -679,14 +719,7 @@ fn copy_retry_converges_after_post_write_output_failure() {
         destination.to_str().unwrap(),
         "--json",
     ];
-    let mut child = Command::new(env!("CARGO_BIN_EXE_vne"))
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    drop(child.stdout.take());
-    let failed_output = child.wait_with_output().unwrap();
+    let failed_output = run_vne_with_failing_stdout(args);
     assert_eq!(failed_output.status.code(), Some(2));
     assert!(!String::from_utf8_lossy(&failed_output.stderr).contains(COPY_SENTINEL));
 
@@ -935,4 +968,170 @@ fn add_post_write_output_failure_is_duplicate_safe_under_each_policy() {
         assert!(!String::from_utf8_lossy(&retry.stderr).contains(ADD_SENTINEL));
         assert_eq!(fs::read_to_string(&env_file).unwrap(), expected);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn set_json_is_payload_free_and_an_identical_retry_never_rewrites() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, SystemTime};
+
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let initial =
+        format!("\u{feff}# keep\r\nPORT=1420\r\nOPENAI_API_KEY='sk-{STORED_SENTINEL}' # local\r\n");
+    write(&env_file, &initial);
+    fs::set_permissions(&env_file, fs::Permissions::from_mode(0o640)).unwrap();
+
+    let args = [
+        "set".to_string(),
+        env_file.display().to_string(),
+        "OPENAI_API_KEY".to_string(),
+        "--stdin".to_string(),
+        "--json".to_string(),
+    ];
+    let piped_value = format!("sk-{SET_SENTINEL}\n");
+
+    let updated = run_vne_with_stdin(args.clone(), &piped_value);
+
+    assert_eq!(updated.status.code(), Some(0));
+    assert!(updated.stderr.is_empty());
+    let updated_json = assert_payload_absent(&updated, &[SET_SENTINEL, STORED_SENTINEL]);
+    assert_eq!(updated_json["disposition"], "updated");
+    assert_eq!(updated_json["key"], "OPENAI_API_KEY");
+    assert_eq!(
+        updated_json["path"],
+        env_file.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(updated_json.as_object().unwrap().len(), 3);
+    let expected =
+        format!("\u{feff}# keep\r\nPORT=1420\r\nOPENAI_API_KEY='sk-{SET_SENTINEL}' # local\r\n");
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), expected);
+    assert_eq!(
+        fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+
+    let frozen = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let handle = fs::OpenOptions::new().write(true).open(&env_file).unwrap();
+    handle
+        .set_times(fs::FileTimes::new().set_modified(frozen))
+        .unwrap();
+    drop(handle);
+
+    let retried = run_vne_with_stdin(args, &piped_value);
+
+    assert_eq!(retried.status.code(), Some(0));
+    assert!(retried.stderr.is_empty());
+    let retried_json = assert_payload_absent(&retried, &[SET_SENTINEL, STORED_SENTINEL]);
+    assert_eq!(retried_json["disposition"], "alreadyPresent");
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), expected);
+    assert_eq!(fs::metadata(&env_file).unwrap().modified().unwrap(), frozen);
+}
+
+#[test]
+fn set_text_receipt_contains_metadata_only() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    write(&env_file, &format!("TOKEN={STORED_SENTINEL}\n"));
+
+    let output = run_vne_with_stdin(
+        [
+            "set".to_string(),
+            env_file.display().to_string(),
+            "TOKEN".to_string(),
+            "--stdin".to_string(),
+            "--text".to_string(),
+        ],
+        SET_SENTINEL,
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "updated `TOKEN` in {}\n",
+            env_file.canonicalize().unwrap().display()
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(&env_file).unwrap(),
+        format!("TOKEN={SET_SENTINEL}\n")
+    );
+}
+
+#[test]
+fn set_errors_are_payload_free_and_leave_the_env_file_unchanged() {
+    let dir = tempdir().unwrap();
+    let duplicated = dir.path().join("duplicated.env");
+    let initial_duplicated =
+        format!("TOKEN={STORED_SENTINEL}\nPORT=1420\nTOKEN={STORED_SENTINEL}-two\n");
+    write(&duplicated, &initial_duplicated);
+    let single = dir.path().join("single.env");
+    let initial_single = format!("TOKEN={STORED_SENTINEL}\n");
+    write(&single, &initial_single);
+    let absent = dir.path().join("absent.env");
+
+    let piped_value = format!("sk-{SET_SENTINEL}");
+    let cases = [
+        (
+            "duplicate",
+            duplicated.clone(),
+            "TOKEN",
+            vec!["lines 1, 3", "remove duplicates"],
+        ),
+        (
+            "missing key",
+            single.clone(),
+            "ABSENT_KEY",
+            vec!["was not found", "vne add"],
+        ),
+        (
+            "missing file",
+            absent.clone(),
+            "TOKEN",
+            vec!["does not exist", "vne create <file>"],
+        ),
+    ];
+
+    for (name, file, key, expected_fragments) in cases {
+        let output = run_vne_with_stdin(
+            [
+                "set".to_string(),
+                file.display().to_string(),
+                key.to_string(),
+                "--stdin".to_string(),
+                "--json".to_string(),
+            ],
+            &piped_value,
+        );
+
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for fragment in expected_fragments {
+            assert!(stderr.contains(fragment), "{name}: {stderr}");
+        }
+        assert!(!stderr.contains(SET_SENTINEL), "{name}: {stderr}");
+        assert!(!stderr.contains(STORED_SENTINEL), "{name}: {stderr}");
+    }
+
+    let inline = run_vne([
+        "set".to_string(),
+        single.display().to_string(),
+        "TOKEN".to_string(),
+        format!("sk-{SET_SENTINEL}"),
+    ]);
+
+    assert_eq!(inline.status.code(), Some(2));
+    assert!(inline.stdout.is_empty());
+    let stderr = String::from_utf8(inline.stderr).unwrap();
+    assert!(stderr.contains("--stdin"), "{stderr}");
+    assert!(stderr.contains("--prompt"), "{stderr}");
+    assert!(!stderr.contains(SET_SENTINEL), "{stderr}");
+
+    assert_eq!(fs::read_to_string(&duplicated).unwrap(), initial_duplicated);
+    assert_eq!(fs::read_to_string(&single).unwrap(), initial_single);
+    assert!(!absent.exists());
 }
