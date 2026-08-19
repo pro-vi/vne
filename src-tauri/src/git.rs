@@ -48,32 +48,34 @@ pub fn env_file_git_status(path: &Path) -> EnvFileGitStatus {
     };
 
     match run_git(directory, &["rev-parse", "--is-inside-work-tree"]) {
-        GitResult::Missing => return EnvFileGitStatus::Unknown,
-        GitResult::Status(code) if code != Some(0) => return EnvFileGitStatus::OutsideRepository,
-        GitResult::Status(_) => {}
+        GitInvocation::Missing => return EnvFileGitStatus::Unknown,
+        GitInvocation::Status(code) if code != Some(0) => {
+            return EnvFileGitStatus::OutsideRepository
+        }
+        GitInvocation::Status(_) => {}
     }
 
     match run_git(directory, &["ls-files", "--error-unmatch", "--", name]) {
-        GitResult::Missing => return EnvFileGitStatus::Unknown,
-        GitResult::Status(Some(0)) => return EnvFileGitStatus::Tracked,
-        GitResult::Status(_) => {}
+        GitInvocation::Missing => return EnvFileGitStatus::Unknown,
+        GitInvocation::Status(Some(0)) => return EnvFileGitStatus::Tracked,
+        GitInvocation::Status(_) => {}
     }
 
     match run_git(directory, &["check-ignore", "-q", "--", name]) {
-        GitResult::Status(Some(0)) => EnvFileGitStatus::UntrackedIgnored,
-        GitResult::Status(Some(1)) => EnvFileGitStatus::UntrackedNotIgnored,
-        GitResult::Status(_) | GitResult::Missing => EnvFileGitStatus::Unknown,
+        GitInvocation::Status(Some(0)) => EnvFileGitStatus::UntrackedIgnored,
+        GitInvocation::Status(Some(1)) => EnvFileGitStatus::UntrackedNotIgnored,
+        GitInvocation::Status(_) | GitInvocation::Missing => EnvFileGitStatus::Unknown,
     }
 }
 
-enum GitResult {
+enum GitInvocation {
     /// `git` could not be started at all.
     Missing,
     /// `git` ran; `None` means it was killed by a signal.
     Status(Option<i32>),
 }
 
-fn run_git(directory: &Path, arguments: &[&str]) -> GitResult {
+fn run_git(directory: &Path, arguments: &[&str]) -> GitInvocation {
     let outcome = Command::new("git")
         .arg("-C")
         .arg(directory)
@@ -84,8 +86,8 @@ fn run_git(directory: &Path, arguments: &[&str]) -> GitResult {
         .status();
 
     match outcome {
-        Ok(status) => GitResult::Status(status.code()),
-        Err(_) => GitResult::Missing,
+        Ok(status) => GitInvocation::Status(status.code()),
+        Err(_) => GitInvocation::Missing,
     }
 }
 

@@ -628,7 +628,7 @@ fn run_rm(
                     "removed `{}` from {} at {}",
                     outcome.key,
                     outcome.path,
-                    line_label(&outcome.removed_lines)
+                    crate::line_number_label(&outcome.removed_lines)
                 ))?;
             }
             EnvKeyRemoveDisposition::AlreadyAbsent => {
@@ -641,19 +641,6 @@ fn run_rm(
     }
 
     Ok(false)
-}
-
-fn line_label(line_numbers: &[usize]) -> String {
-    let lines = line_numbers
-        .iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if line_numbers.len() == 1 {
-        format!("line {lines}")
-    } else {
-        format!("lines {lines}")
-    }
 }
 
 fn run_rename(

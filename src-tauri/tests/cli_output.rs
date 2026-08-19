@@ -1725,3 +1725,45 @@ fn example_sync_fails_on_a_missing_source_without_creating_anything() {
     assert!(output.stdout.is_empty());
     assert!(!dir.path().join(".env.example").exists());
 }
+
+#[test]
+fn rm_refuses_a_malformed_entry_instead_of_deleting_the_rest_of_the_file() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let initial = format!("TOKEN=\"{STORED_SENTINEL}\nPORT=1420\nDATABASE_URL={KEEP_SENTINEL}\n");
+    write(&env_file, &initial);
+
+    let output = run_vne([
+        "rm".to_string(),
+        env_file.display().to_string(),
+        "TOKEN".to_string(),
+        "--json".to_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("malformed value at line 1"), "{stderr}");
+    assert!(!stderr.contains(STORED_SENTINEL), "{stderr}");
+    assert!(!stderr.contains(KEEP_SENTINEL), "{stderr}");
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), initial);
+}
+
+#[test]
+fn git_exposure_is_unknown_when_git_cannot_be_run() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    write(&env_file, "PORT=1420\n");
+    let empty_path = dir.path().join("no-executables");
+    fs::create_dir(&empty_path).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vne"))
+        .args(["check", env_file.to_str().unwrap(), "--json"])
+        .env("PATH", &empty_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["file"]["gitStatus"], "unknown");
+}

@@ -589,6 +589,11 @@ pub enum EnvKeyRemoveError {
     Duplicate {
         line_numbers: Vec<usize>,
     },
+    /// The entry parses badly, so its extent is not trustworthy. An unclosed
+    /// quote, for one, makes the parser read to end of file.
+    Malformed {
+        line_number: usize,
+    },
     StaleSelector {
         line_number: usize,
         found_key: Option<String>,
@@ -607,6 +612,9 @@ impl EnvKeyRemoveError {
             Self::Duplicate { line_numbers } => format!(
                 "`{key}` is ambiguous at {}; pass --line <N> or --all",
                 line_number_label(line_numbers)
+            ),
+            Self::Malformed { line_number } => format!(
+                "`{key}` has a malformed value at line {line_number}; its extent is unclear, so vne will not remove it"
             ),
             Self::StaleSelector {
                 line_number,
@@ -702,7 +710,7 @@ impl From<EnvFileAccessError> for EnvKeySetError {
     }
 }
 
-fn line_number_label(line_numbers: &[usize]) -> String {
+pub(crate) fn line_number_label(line_numbers: &[usize]) -> String {
     let lines = line_numbers
         .iter()
         .map(|line| line.to_string())
@@ -1541,7 +1549,7 @@ pub fn remove_env_key(
     })
 }
 
-struct EnvKeyRemoval {
+struct EnvKeyRemovePlan {
     /// `Some` only when bytes actually change; a convergent no-op never writes.
     content: Option<String>,
     disposition: EnvKeyRemoveDisposition,
@@ -1553,7 +1561,7 @@ fn remove_env_key_content(
     key: &str,
     selector: EnvKeyRemoveSelector,
     expectation: Option<EnvKeyExpectation>,
-) -> Result<EnvKeyRemoval, EnvKeyRemoveError> {
+) -> Result<EnvKeyRemovePlan, EnvKeyRemoveError> {
     if !is_valid_env_key(key) {
         return Err(EnvKeyRemoveError::InvalidKey);
     }
@@ -1607,8 +1615,14 @@ fn remove_env_key_content(
         },
     };
 
+    if let Some(malformed) = doomed.iter().find(|entry| entry.diagnostic.is_some()) {
+        return Err(EnvKeyRemoveError::Malformed {
+            line_number: malformed.line_number,
+        });
+    }
+
     if doomed.is_empty() {
-        return Ok(EnvKeyRemoval {
+        return Ok(EnvKeyRemovePlan {
             content: None,
             disposition: EnvKeyRemoveDisposition::AlreadyAbsent,
             removed_lines: Vec::new(),
@@ -1630,7 +1644,7 @@ fn remove_env_key_content(
     }
     updated.push_str(&content[cursor..]);
 
-    Ok(EnvKeyRemoval {
+    Ok(EnvKeyRemovePlan {
         content: Some(updated),
         disposition,
         removed_lines,
@@ -1757,7 +1771,7 @@ pub fn sync_example_file(
 
     let source_content = read_env_file_at(&source_path)?;
     let example_content = read_env_file_at(&example_path)?;
-    let (updated, added_keys) = example_additions(&source_content, &example_content);
+    let (updated, added_keys) = append_missing_example_keys(&source_content, &example_content);
 
     if !added_keys.is_empty() {
         atomic_write_preserving_permissions(&example_path, &updated).map_err(|source| {
@@ -1812,7 +1826,10 @@ fn create_example_file(path: &Path) -> Result<(), ExampleSyncError> {
 /// Returns the example content with the missing keys appended, plus the key
 /// names in source order. An inline comment travels only when it survives the
 /// same secret scan the parser uses elsewhere.
-fn example_additions(source_content: &str, example_content: &str) -> (String, Vec<String>) {
+fn append_missing_example_keys(
+    source_content: &str,
+    example_content: &str,
+) -> (String, Vec<String>) {
     let example_keys = parse_env_entries(example_content)
         .into_iter()
         .map(|entry| entry.key)
@@ -4027,7 +4044,7 @@ mod tests {
         content: &str,
         key: &str,
         selector: EnvKeyRemoveSelector,
-    ) -> Result<EnvKeyRemoval, EnvKeyRemoveError> {
+    ) -> Result<EnvKeyRemovePlan, EnvKeyRemoveError> {
         remove_env_key_content(content, key, selector, None)
     }
 
@@ -4192,6 +4209,27 @@ mod tests {
     }
 
     #[test]
+    fn rm_refuses_a_malformed_entry_whose_extent_runs_to_end_of_file() {
+        // An unclosed quote makes the parser read to the end of the file, so
+        // splicing the "line" would delete every following key.
+        let content = "TOKEN=\"oops\nPORT=1420\nDATABASE_URL=postgres://x\n";
+
+        for selector in [
+            EnvKeyRemoveSelector::Only,
+            EnvKeyRemoveSelector::Line(1),
+            EnvKeyRemoveSelector::All,
+        ] {
+            assert!(
+                matches!(
+                    removal(content, "TOKEN", selector),
+                    Err(EnvKeyRemoveError::Malformed { line_number: 1 })
+                ),
+                "{selector:?} should refuse a malformed occurrence"
+            );
+        }
+    }
+
+    #[test]
     fn rm_error_messages_name_keys_and_lines_without_values() {
         assert_eq!(
             EnvKeyRemoveError::Duplicate {
@@ -4199,6 +4237,10 @@ mod tests {
             }
             .message("TOKEN"),
             "`TOKEN` is ambiguous at lines 2, 4; pass --line <N> or --all"
+        );
+        assert_eq!(
+            EnvKeyRemoveError::Malformed { line_number: 3 }.message("TOKEN"),
+            "`TOKEN` has a malformed value at line 3; its extent is unclear, so vne will not remove it"
         );
         assert_eq!(
             EnvKeyRemoveError::StaleSelector {
@@ -4368,7 +4410,7 @@ mod tests {
             "DATABASE_URL=postgres://localhost/vne\nPORT=1420 # dev server\nTOKEN=secret\n";
         let example = "# contract\nDATABASE_URL=\n";
 
-        let (updated, added) = example_additions(source, example);
+        let (updated, added) = append_missing_example_keys(source, example);
 
         assert_eq!(added, vec!["PORT".to_string(), "TOKEN".to_string()]);
         assert_eq!(
@@ -4382,7 +4424,7 @@ mod tests {
     fn example_never_copies_a_secret_looking_inline_comment() {
         let source = "TOKEN=value # OPENAI_API_KEY=sk-live-1234567890abcdef\n";
 
-        let (updated, added) = example_additions(source, "");
+        let (updated, added) = append_missing_example_keys(source, "");
 
         assert_eq!(added, vec!["TOKEN".to_string()]);
         assert_eq!(updated, "TOKEN=\n");
@@ -4390,7 +4432,7 @@ mod tests {
 
     #[test]
     fn example_reports_nothing_to_add_when_every_key_is_present() {
-        let (updated, added) = example_additions("PORT=1420\n", "PORT=\n");
+        let (updated, added) = append_missing_example_keys("PORT=1420\n", "PORT=\n");
 
         assert!(added.is_empty());
         assert_eq!(updated, "PORT=\n");
@@ -4398,7 +4440,8 @@ mod tests {
 
     #[test]
     fn example_adds_a_duplicated_source_key_once_and_preserves_line_endings() {
-        let (updated, added) = example_additions("PORT=1420\nPORT=1421\n", "DATABASE_URL=\r\n");
+        let (updated, added) =
+            append_missing_example_keys("PORT=1420\nPORT=1421\n", "DATABASE_URL=\r\n");
 
         assert_eq!(added, vec!["PORT".to_string()]);
         assert_eq!(updated, "DATABASE_URL=\r\nPORT=\r\n");
