@@ -2220,7 +2220,37 @@ fn preferred_line_ending(content: &str) -> &'static str {
     }
 }
 
-pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
+
+/// Would this VALUE alone land in a known-benign (display-safe) shape?
+/// Mirrors the classifier ladder's benign kinds; used to gate name-derived
+/// public-prefix exposure.
+fn value_is_benign_shaped(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("://") || trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("~/") {
+        return true; // url / path
+    }
+    if trimmed.parse::<u16>().is_ok() || trimmed.parse::<f64>().is_ok() {
+        return true; // numeric
+    }
+    if matches!(lower.as_str(), "true" | "false" | "1" | "0" | "yes" | "no") {
+        return true; // bool
+    }
+    if lower.split('.').all(|part| !part.is_empty()) && lower.split('.').count() >= 2 {
+        // dotted identifiers (semver-ish, package-ish, config-ish)
+        return true;
+    }
+    if trimmed.contains(',') {
+        return true; // list
+    }
+    let uuid_like = trimmed.len() == 36
+        && trimmed.as_bytes().iter().filter(|b| **b == b'-').count() == 4;
+    if looks_like_base64(trimmed) || uuid_like {
+        return true;
+    }
+    false
+}
+
+fn infer_key_shape(key: &str, value: &str) -> KeyShape {
     let upper = key.to_ascii_uppercase();
     let trimmed = value.trim();
     let mut reasons = Vec::new();
@@ -2365,11 +2395,29 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
     }
 
     if public_prefix {
+        // Agent-found (demo campaign, 2026-09-05): the prefix alone granted
+        // exposure — rename SESSION_TOKEN -> VITE_* then read via --values.
+        // Same rule as the url kind: a name-derived public shape only
+        // displays when the VALUE itself matches a known-benign shape
+        // (url/port/bool/int/uuid/email/path/host/list/json or a public
+        // provider key). An opaque value under a public prefix withholds.
+        if value_is_benign_shaped(trimmed) {
+            return shape_with_context(
+                "public",
+                "Public frontend variable",
+                "high",
+                false,
+                false,
+                Some("browser"),
+                reasons,
+            );
+        }
+        reasons.push("public-prefixed key with an unrecognized value shape; withheld".to_string());
         return shape_with_context(
             "public",
             "Public frontend variable",
-            "high",
-            false,
+            "low",
+            true,
             false,
             Some("browser"),
             reasons,
