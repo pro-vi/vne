@@ -2356,3 +2356,42 @@ fn copy_allows_benign_value_out_of_its_project() {
 }
 
 
+
+/// The terminal allowance of the egress guard (loop-002 follow-up,
+/// 2026-09-05): a withheld value may cross project directories when the
+/// subject's stdout is a real TTY — an interactive human copying between
+/// projects. The refusal tests above cover the piped/wrapper-mediated case;
+/// this one runs vne under a pty (`script`) to give it a terminal stdout.
+#[cfg(target_os = "macos")]
+#[test]
+fn copy_allows_withheld_value_out_of_its_project_on_a_terminal() {
+    let source_dir = tempdir().unwrap();
+    let destination_dir = tempdir().unwrap();
+    write(
+        &source_dir.path().join(".env"),
+        &format!("SESSION_TOKEN={WITHHELD_SENTINEL}\n"),
+    );
+    let destination = destination_dir.path().join("dest.env");
+    write(&destination, "");
+
+    let output = Command::new("script")
+        .arg("-q")
+        .arg("/dev/null")
+        .arg(env!("CARGO_BIN_EXE_vne"))
+        .arg("copy")
+        .arg(source_dir.path().join(".env").display().to_string())
+        .arg("SESSION_TOKEN")
+        .arg(destination.display().to_string())
+        .output()
+        .expect("script should allocate a pty and run vne");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a terminal-attached cross-project copy must succeed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        fs::read_to_string(&destination).unwrap().contains(WITHHELD_SENTINEL),
+        "the destination must carry the value on the terminal path"
+    );
+}

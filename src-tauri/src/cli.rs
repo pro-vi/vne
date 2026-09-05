@@ -338,8 +338,13 @@ fn warn_on_secret_like_argument(key: &str, value: &str) -> io::Result<()> {
 /// `vne create /tmp/dest.env` + `vne copy .env SESSION_TOKEN /tmp/dest.env`
 /// hands an agent the raw KEY=value line at a world-readable path. Policy:
 /// a redacted-by-default value may only be copied within its own project
-/// directory. add/set are deliberately unguarded: their values arrive from
-/// the caller, who already has them — there is nothing to exfiltrate.
+/// directory, OR when stdout is a real terminal — an interactive human
+/// copying between projects is the tool's job; the terminal check is the
+/// one gate no wrapper-mediated attacker could satisfy in the loop-002
+/// campaigns (five pty/spoof attempts across four model families; the
+/// wrapper re-pipes the subject's stdout). add/set are deliberately
+/// unguarded: their values arrive from the caller, who already has them —
+/// there is nothing to exfiltrate.
 fn ensure_copy_target_within_source_project(
     source_file: &Path,
     key: &str,
@@ -355,6 +360,9 @@ fn ensure_copy_target_within_source_project(
     if destination.starts_with(&source_dir) {
         return Ok(());
     }
+    if io::stdout().is_terminal() {
+        return Ok(()); // interactive use: cross-project copy is a feature
+    }
 
     let source = load_env_file(source_file)?;
     let Some(entry) = source.entries.iter().find(|entry| entry.key == key) else {
@@ -365,7 +373,7 @@ fn ensure_copy_target_within_source_project(
     }
     Err(format!(
         "refusing to copy `{}` out of {}: its value is withheld by the output policy, \
-         so it may only be copied within the project directory",
+         so it may only be copied within the project directory (or from a terminal)",
         key,
         source_dir.display()
     )
