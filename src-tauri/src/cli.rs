@@ -1,5 +1,5 @@
 use crate::{
-    append_env_key_result, atomic_write_preserving_metadata, compare_env_files, copy_env_key,
+    append_env_key_result, atomic_write_metadata_if_unchanged, compare_env_files, copy_env_key,
     ensure_project_env_file, infer_key_shape, parse_env_file, redact_env_file_values_only,
     redact_snapshot_values_only, remove_env_key, rename_env_key, set_env_key, sync_example_file,
     withhold_all_env_file_payloads, withhold_all_snapshot_payloads, EnsureEnvFileOutcome,
@@ -661,7 +661,11 @@ fn run_add(
     let updated =
         append_env_key_result(&content, key, value).map_err(|error| error.message(key))?;
 
-    atomic_write_preserving_metadata(file, &updated)?;
+    // Harden F0011 (2026-09-05): add is not exempt from the VNE-SEC-013
+    // stale-overwrite precondition every other mutation honors — persist
+    // only if the file still holds the bytes the append was computed from.
+    crate::atomic_write_metadata_if_unchanged(file, &updated, Some(&content))
+        .map_err(|e| format!("vne: {}", e))?;
     warn_when_tracked_by_git(file)?;
 
     if output.wants_json() {

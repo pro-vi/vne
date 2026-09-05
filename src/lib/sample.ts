@@ -8,6 +8,7 @@ const workerPath = '/demo/project/config/worker.env';
 export function sampleProject(root = '/demo/project'): ProjectSnapshot {
   return {
     root,
+    incomplete: [],
     files: [
       {
         path: basePath,

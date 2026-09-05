@@ -1,10 +1,20 @@
 export interface ProjectSnapshot {
   root: string;
   files: EnvFile[];
+  /** Discovered candidates that could NOT be inspected, with a typed
+   * reason ('unreadable' | 'invalid-utf8' | 'oversize' | 'count-limit' |
+   * 'scan-timeout') — a scan is never "complete" while this is silently
+   * empty (VNE-SEC-010; harden F0022 sync). */
+  incomplete: IncompleteEnvFile[];
   comparison: EnvComparison | null;
   layerReport: EnvLayerReport;
   frameworkProfiles: FrameworkEnvProfile[];
   findings: EnvFinding[];
+}
+
+export interface IncompleteEnvFile {
+  name: string;
+  reason: string;
 }
 
 export type EnvFileCreationDisposition = 'created' | 'alreadyExists';

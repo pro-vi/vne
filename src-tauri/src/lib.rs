@@ -993,21 +993,28 @@ pub fn run() {
 }
 
 pub fn run_with_initial_project_path(initial_path: Option<String>) {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(InitialProjectPath(initial_path.clone()))
         .manage(AuthorizedRoot(std::sync::Mutex::new(
             initial_path.map(std::path::PathBuf::from),
         )))
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_webdriver::init())
         .invoke_handler(tauri::generate_handler![
             initial_project_path,
             load_project,
             reveal_env_value,
             save_env_value,
             add_env_key,
-            ensure_env_file
-        ])
+            ensure_env_file,
+            choose_authorized_root
+        ]);
+    // Harden F0009 (2026-09-05): the webdriver plugin starts an
+    // UNAUTHENTICATED W3C server on 127.0.0.1:4445 the moment the app
+    // launches — acceptable for the oracle's debug-build lanes, never for a
+    // shipped release. Debug builds only.
+    #[cfg(debug_assertions)]
+    let builder = builder.plugin(tauri_plugin_webdriver::init());
+    builder
         .run(tauri::generate_context!())
         .expect("error while running vne");
 }
@@ -2244,30 +2251,29 @@ fn looks_like_host(trimmed: &str) -> bool {
     })
 }
 
+/// Benign-shape admission for the NAME-derived public-prefix gate. Hardened
+/// 2026-09-05 (harden F0001): dotted identifiers and base64-looking strings
+/// are deliberately NOT benign here — those are exactly the encodings
+/// secrets take (hex tokens, base64 keys, dotted cluster ids), and this
+/// predicate gates exposure granted by the KEY NAME alone, where ambiguity
+/// resolves toward withholding. A version string under VITE_APP_VERSION
+/// withholds; the unambiguous shapes below still display.
 fn value_is_benign_shaped(trimmed: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     if lower.contains("://") || trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("~/") {
         return true; // url / path
     }
     if trimmed.parse::<u16>().is_ok() || trimmed.parse::<f64>().is_ok() {
-        return true; // numeric
+        return true; // numeric (single number; dotted multi-segment values do not parse)
     }
     if matches!(lower.as_str(), "true" | "false" | "1" | "0" | "yes" | "no") {
         return true; // bool
     }
-    if lower.split('.').all(|part| !part.is_empty()) && lower.split('.').count() >= 2 {
-        // dotted identifiers (semver-ish, package-ish, config-ish)
-        return true;
-    }
     if trimmed.contains(',') {
         return true; // list
     }
-    let uuid_like = trimmed.len() == 36
-        && trimmed.as_bytes().iter().filter(|b| **b == b'-').count() == 4;
-    if looks_like_base64(trimmed) || uuid_like {
-        return true;
-    }
-    false
+    trimmed.len() == 36 && trimmed.as_bytes().iter().filter(|b| **b == b'-').count() == 4
+    // uuid
 }
 
 fn infer_key_shape(key: &str, value: &str) -> KeyShape {
@@ -3361,12 +3367,32 @@ fn resolve_project_file(root: &str, path: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Harden F0012 (2026-09-05): discovery reads (package.json / compose files)
+/// sit inside the scanned project and are attacker-shapeable, so the same
+/// SCAN_MAX_FILE_BYTES bound that governs env files governs them. An
+/// oversized discovery file is skipped (discovery is best-effort), never a
+/// scan failure — but it can no longer blow the process's memory budget.
+fn read_discovery_file_bounded(path: &Path) -> Result<String, io::Error> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > SCAN_MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!(
+                "discovery file {} exceeds the {} byte scan bound; skipping",
+                path.display(),
+                SCAN_MAX_FILE_BYTES
+            ),
+        ));
+    }
+    fs::read_to_string(path)
+}
+
 fn discover_package_json_env_files(
     root: &Path,
     discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>,
 ) {
     let path = root.join("package.json");
-    let Ok(content) = fs::read_to_string(path) else {
+    let Ok(content) = read_discovery_file_bounded(&path) else {
         return;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -3399,7 +3425,7 @@ fn discover_compose_env_files(root: &Path, discovered: &mut BTreeMap<PathBuf, BT
         "docker-compose.yml",
     ] {
         let path = root.join(compose_name);
-        let Ok(content) = fs::read_to_string(&path) else {
+        let Ok(content) = read_discovery_file_bounded(&path) else {
             continue;
         };
 
@@ -3714,6 +3740,7 @@ fn env_file_sort_key(name: &str) -> (u8, String) {
     (priority, name.to_string())
 }
 
+#[cfg(test)]
 pub fn atomic_write_preserving_metadata(path: &Path, content: &str) -> io::Result<()> {
     atomic_write_metadata_if_unchanged(path, content, None)
 }
@@ -5074,6 +5101,38 @@ mod tests {
         let updated = replace_env_value(content, "GREETING", "can't stop").unwrap();
 
         assert_eq!(updated, "GREETING='can\\'t stop'\n");
+    }
+
+    /// Harden F0001 (2026-09-05): the public-prefix gate's benign-shape
+    /// predicate must not admit the encodings secrets take — dotted
+    /// identifiers and base64-shaped strings withhold under public-prefixed
+    /// names; the unambiguous shapes still display.
+    #[test]
+    fn public_prefix_withholds_dotted_and_base64_shaped_values() {
+        for (key, value) in [
+            ("VITE_CIDR", "10.1.2.3"),
+            ("NEXT_PUBLIC_ASSET", "AbCdEfGhIjKlMnOpQrStUvWx12345678"),
+            ("PUBLIC_ID", "aabbccddeeff00112233445566778899"),
+            ("VITE_VERSION", "1.2.3"),
+        ] {
+            let shape = infer_key_shape(key, value);
+            assert!(
+                shape.redacted_by_default,
+                "{key}={value} must withhold under a public prefix"
+            );
+        }
+        for (key, value) in [
+            ("VITE_FLAG", "true"),
+            ("VITE_PORT", "5173"),
+            ("NEXT_PUBLIC_ENDPOINT", "https://api.internal"),
+            ("PUBLIC_REQUEST_ID", "123e4567-e89b-42d3-a456-426614174000"),
+        ] {
+            let shape = infer_key_shape(key, value);
+            assert!(
+                !shape.redacted_by_default,
+                "{key}={value} is an unambiguous public shape and must display"
+            );
+        }
     }
 
     #[test]
