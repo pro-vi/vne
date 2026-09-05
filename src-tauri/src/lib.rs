@@ -3464,9 +3464,13 @@ pub fn atomic_write_metadata_if_unchanged(
     temporary.as_file().sync_all()?;
     temporary.as_file().set_permissions(permissions)?;
     for name in &xattr_names {
-        if let Some(value) = xattr::get(path, name)? {
-            xattr::set(temporary.path(), name, &value)?;
-        }
+        let value = xattr::get(path, name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "xattr set changed during the write; refusing to continue (rerun the command)",
+            )
+        })?;
+        xattr::set(temporary.path(), name, &value)?;
     }
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
