@@ -1,6 +1,14 @@
 #!/usr/bin/env sh
 set -eu
 
+# Fail closed when the scanner is missing: every check_no_matches scan below
+# silently passes if rg cannot run, so absence of rg must stop the gate before
+# any check is skipped, not after two direct scans happen to notice.
+if ! command -v rg >/dev/null 2>&1; then
+  printf '%s\n' "security-check: failed - rg (ripgrep) not found on PATH; no scan can run (install ripgrep)" >&2
+  exit 1
+fi
+
 fail=0
 
 check_no_matches() {
