@@ -2224,6 +2224,26 @@ fn preferred_line_ending(content: &str) -> &'static str {
 /// Would this VALUE alone land in a known-benign (display-safe) shape?
 /// Mirrors the classifier ladder's benign kinds; used to gate name-derived
 /// public-prefix exposure.
+/// Host-shaped value: `localhost` or a dotted sequence of DNS-labels
+/// (hostname or IPv4). Deliberately excludes bare single labels — an opaque
+/// token like `vne-agent-<hex>` is one hyphenated label and must not read
+/// as a host.
+fn looks_like_host(trimmed: &str) -> bool {
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if !trimmed.contains('.') {
+        return false;
+    }
+    trimmed.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
 fn value_is_benign_shaped(trimmed: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     if lower.contains("://") || trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("~/") {
@@ -2383,11 +2403,29 @@ fn infer_key_shape(key: &str, value: &str) -> KeyShape {
     }
 
     if matches!(known_profile, Some(KnownKeyProfile::Public(_))) {
+        // Name/value split (loop-002 defender sweep, 2026-09-05): the
+        // profile NAME alone must not display — the value must match the
+        // profile's expected public shape (e.g. an anon-role JWT for
+        // SUPABASE_ANON_KEY). An opaque value riding under a renamed
+        // known-public key withholds.
+        if known_public_value {
+            return shape_with_context(
+                "public",
+                "Public provider key",
+                "high",
+                false,
+                false,
+                Some("browser"),
+                reasons,
+            );
+        }
+        reasons
+            .push("known public key name with a non-matching value shape; withheld".to_string());
         return shape_with_context(
             "public",
             "Public provider key",
-            "high",
-            false,
+            "low",
+            true,
             false,
             Some("browser"),
             reasons,
@@ -2489,13 +2527,22 @@ fn infer_key_shape(key: &str, value: &str) -> KeyShape {
         return shape("email", "Email", "medium", false, reasons);
     }
 
-    if upper.ends_with("_PATH")
-        || upper.ends_with("_DIR")
-        || upper.ends_with("_FILE")
-        || trimmed.starts_with('/')
+    // Name/value split (loop-002 campaign t1c3, 2026-09-05): a *_PATH/_DIR/
+    // _FILE name only displays when the VALUE itself is path-shaped (leading
+    // /, ./ or ~/); an opaque token under a renamed path-like key withholds.
+    // The value predicate stays the arm's original one — widening it to any
+    // slash would swallow base64 values (which this arm outranks) into a
+    // displaying kind.
+    let path_name_like =
+        upper.ends_with("_PATH") || upper.ends_with("_DIR") || upper.ends_with("_FILE");
+    let path_value_like = trimmed.starts_with('/')
         || trimmed.starts_with("./")
-        || trimmed.starts_with("~/")
-    {
+        || trimmed.starts_with("~/");
+    if path_name_like || path_value_like {
+        if path_name_like && !path_value_like {
+            reasons.push("path-like key name with a non-path value; withheld".to_string());
+            return shape("path", "File path", "low", true, reasons);
+        }
         reasons.push("path-like key or value".to_string());
         return shape("path", "File path", "medium", false, reasons);
     }
@@ -2510,7 +2557,16 @@ fn infer_key_shape(key: &str, value: &str) -> KeyShape {
         return shape("base64", "Base64", "low", true, reasons);
     }
 
+    // Name/value split (loop-002 defender sweep, 2026-09-05): same rule as
+    // the other name-derived kinds — a *_HOST/*_HOSTNAME/HOST name only
+    // displays when the VALUE is host-shaped (localhost or dotted labels).
+    // Host classification stays name-triggered only; no new value-derived
+    // display kind.
     if upper.ends_with("_HOST") || upper.ends_with("_HOSTNAME") || key == "HOST" {
+        if !looks_like_host(trimmed) {
+            reasons.push("host-like key name with a non-host value; withheld".to_string());
+            return shape("host", "Host", "low", true, reasons);
+        }
         reasons.push("host-like key name".to_string());
         return shape("host", "Host", "medium", false, reasons);
     }
@@ -5149,9 +5205,13 @@ mod tests {
             ("DATABASE_URL", "postgres://user:pass@localhost/app"),
         ] {
             let shape = infer_key_shape(key, value);
-            assert_eq!(
-                shape.sensitive, shape.redacted_by_default,
-                "{key} must preserve the classification invariant"
+            // Sensitive implies withheld. The converse stopped holding with
+            // default-deny (O2) and the name/value split gates: an opaque
+            // value under a benign-sounding name withholds without gaining
+            // a secret label (e.g. SUPABASE_ANON_KEY carrying a non-JWT).
+            assert!(
+                !shape.sensitive || shape.redacted_by_default,
+                "{key} must preserve the classification invariant (sensitive implies withheld)"
             );
         }
     }
