@@ -2274,3 +2274,85 @@ fn unreadable_file_is_an_explicit_incomplete() {
         "unreadable file must be a typed incomplete"
     );
 }
+
+// Loop-002 withheld-value egress guard (campaign t1c6, 2026-09-05): copy
+// is the only verb that moves a value the tool holds but will not print, so
+// it confines withheld values to the source file's project directory. add/set
+// write caller-supplied values and are deliberately unguarded; benign values
+// copy anywhere.
+const WITHHELD_SENTINEL: &str = "vne-guard-opaque-token-value";
+
+#[test]
+fn copy_refuses_withheld_value_out_of_its_project() {
+    let source_dir = tempdir().unwrap();
+    let destination_dir = tempdir().unwrap();
+    write(
+        &source_dir.path().join(".env"),
+        &format!("SESSION_TOKEN={WITHHELD_SENTINEL}\n"),
+    );
+    let destination = destination_dir.path().join("dest.env");
+    write(&destination, "");
+
+    let output = run_vne([
+        "copy".to_string(),
+        source_dir.path().join(".env").display().to_string(),
+        "SESSION_TOKEN".to_string(),
+        destination.display().to_string(),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("refusing to copy"),
+        "cross-tree copy of a withheld value must refuse: {stderr}"
+    );
+    assert!(
+        !fs::read_to_string(&destination).unwrap().contains(WITHHELD_SENTINEL),
+        "the destination must not carry the withheld value"
+    );
+}
+
+#[test]
+fn copy_allows_withheld_value_within_its_project() {
+    let source_dir = tempdir().unwrap();
+    write(
+        &source_dir.path().join(".env"),
+        &format!("SESSION_TOKEN={WITHHELD_SENTINEL}\n"),
+    );
+    let destination = source_dir.path().join("backup.env");
+    write(&destination, "");
+
+    let output = run_vne([
+        "copy".to_string(),
+        source_dir.path().join(".env").display().to_string(),
+        "SESSION_TOKEN".to_string(),
+        destination.display().to_string(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        fs::read_to_string(&destination).unwrap().contains(WITHHELD_SENTINEL),
+        "an in-project copy is the tool's job and must keep working"
+    );
+}
+
+#[test]
+fn copy_allows_benign_value_out_of_its_project() {
+    let source_dir = tempdir().unwrap();
+    let destination_dir = tempdir().unwrap();
+    write(
+        &source_dir.path().join(".env"),
+        "FEATURE_FLAG=true\n",
+    );
+    let destination = destination_dir.path().join("dest.env");
+    write(&destination, "");
+
+    let output = run_vne([
+        "copy".to_string(),
+        source_dir.path().join(".env").display().to_string(),
+        "FEATURE_FLAG".to_string(),
+        destination.display().to_string(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(fs::read_to_string(&destination).unwrap().contains("true"));
+}
+
+

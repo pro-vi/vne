@@ -332,6 +332,60 @@ fn warn_on_secret_like_argument(key: &str, value: &str) -> io::Result<()> {
     ))
 }
 
+/// Withheld-value egress guard (loop-002 campaign t1c6, 2026-09-05): copy
+/// is the one verb that moves a value the tool HOLDS but will not print —
+/// the display redaction never sees file contents, so without this guard
+/// `vne create /tmp/dest.env` + `vne copy .env SESSION_TOKEN /tmp/dest.env`
+/// hands an agent the raw KEY=value line at a world-readable path. Policy:
+/// a redacted-by-default value may only be copied within its own project
+/// directory. add/set are deliberately unguarded: their values arrive from
+/// the caller, who already has them — there is nothing to exfiltrate.
+fn ensure_copy_target_within_source_project(
+    source_file: &Path,
+    key: &str,
+    destination_file: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_dir = canonical_dir_of(source_file)?;
+    let destination = fs::canonicalize(destination_file).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not resolve {}: {error}", destination_file.display()),
+        )
+    })?;
+    if destination.starts_with(&source_dir) {
+        return Ok(());
+    }
+
+    let source = load_env_file(source_file)?;
+    let Some(entry) = source.entries.iter().find(|entry| entry.key == key) else {
+        return Ok(()); // copy_env_key reports the missing key itself
+    };
+    if !entry.shape.redacted_by_default {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to copy `{}` out of {}: its value is withheld by the output policy, \
+         so it may only be copied within the project directory",
+        key,
+        source_dir.display()
+    )
+    .into())
+}
+
+fn canonical_dir_of(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not resolve {}: {error}", path.display()),
+        )
+    })?;
+    let parent = canonical
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    Ok(parent)
+}
+
 fn prepare_set_target(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
     match fs::metadata(file) {
         Ok(_) => Ok(()),
@@ -754,6 +808,7 @@ fn run_copy(
     overwrite: bool,
     output: OutputFormat,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    ensure_copy_target_within_source_project(source_file, key, destination_file)?;
     let outcome = copy_env_key(source_file, key, destination_file, overwrite)
         .map_err(|error| error.message(key))?;
     if outcome.disposition != EnvKeyCopyDisposition::AlreadyPresent {
