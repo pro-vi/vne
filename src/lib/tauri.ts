@@ -1,5 +1,4 @@
 import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
 import { sampleProject } from './sample';
 import type { EnsureEnvFileOutcome, ProjectSnapshot } from './types';
 
@@ -14,7 +13,10 @@ export async function loadProject(path: string): Promise<ProjectSnapshot> {
     return redactProject(sampleProject(sampleRoot));
   }
 
-  return invoke<ProjectSnapshot>('load_project', { path });
+  // The backend loads its authorized root; the path argument is only used
+  // by the browser-preview sample.
+  void path;
+  return invoke<ProjectSnapshot>('load_project');
 }
 
 export async function initialProjectPath(): Promise<string | null> {
@@ -37,7 +39,7 @@ export async function revealEnvValue(root: string, path: string, key: string, li
     return entry.value;
   }
 
-  return invoke<string>('reveal_env_value', { root, path, key, lineNumber });
+  return invoke<string>('reveal_env_value', { path: relativeIdentifier(root, path), key, lineNumber });
 }
 
 export async function saveEnvValue(
@@ -52,7 +54,7 @@ export async function saveEnvValue(
     throw new Error('Saving is available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
-  return invoke<ProjectSnapshot>('save_env_value', { root, path, key, lineNumber, value });
+  return invoke<ProjectSnapshot>('save_env_value', { path: relativeIdentifier(root, path), key, lineNumber, value });
 }
 
 export async function addEnvKey(root: string, path: string, key: string, value: string): Promise<ProjectSnapshot> {
@@ -61,7 +63,7 @@ export async function addEnvKey(root: string, path: string, key: string, value: 
     throw new Error('Adding missing keys is available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
-  return invoke<ProjectSnapshot>('add_env_key', { root, path, key, value });
+  return invoke<ProjectSnapshot>('add_env_key', { path: relativeIdentifier(root, path), key, value });
 }
 
 export async function ensureEnvFile(root: string, name: string): Promise<EnsureEnvFileOutcome> {
@@ -70,23 +72,27 @@ export async function ensureEnvFile(root: string, name: string): Promise<EnsureE
     throw new Error('Creating env files is available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
-  const outcome = await invoke<unknown>('ensure_env_file', { root, name });
+  const outcome = await invoke<unknown>('ensure_env_file', { name });
   return parseEnsureEnvFileOutcome(outcome);
 }
 
 export async function pickProjectDirectory(defaultPath: string): Promise<string | null> {
+  void defaultPath;
   if (!isTauriRuntime()) {
     return null;
   }
 
-  const selected = await open({
-    title: 'Open project folder',
-    directory: true,
-    multiple: false,
-    defaultPath: defaultPath || undefined
-  });
+  // Backend-owned dialog: the selected folder lands in Rust authorized-root
+  // state directly; the webview only receives it for display.
+  return invoke<string | null>('choose_authorized_root');
+}
 
-  return Array.isArray(selected) ? (selected[0] ?? null) : selected;
+function relativeIdentifier(root: string, path: string): string {
+  const normalizedRoot = root.endsWith('/') ? root : `${root}/`;
+  if (path.startsWith(normalizedRoot)) {
+    return path.slice(normalizedRoot.length);
+  }
+  return path.replace(/^\\/g, '/').split('/').pop() ?? path;
 }
 
 function delay(milliseconds: number): Promise<void> {

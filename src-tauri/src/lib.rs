@@ -818,21 +818,80 @@ fn initial_project_path(path: tauri::State<'_, InitialProjectPath>) -> Option<St
     path.0.clone()
 }
 
-#[tauri::command]
-fn load_project(path: String) -> Result<ProjectSnapshot, String> {
-    snapshot_project(Path::new(&path))
+/// Backend-owned authorized project root (VNE-SEC-001): set exactly once at
+/// launch from the trusted initial path. The webview never supplies it.
+#[derive(Debug, Default)]
+pub struct AuthorizedRoot(pub std::sync::Mutex<Option<std::path::PathBuf>>);
+
+/// The one IPC resolution seam: a RELATIVE identifier under the authorized
+/// root. Absolute paths, `..` escapes, symlinked components, missing
+/// authorization, and outside targets are all refused — the caller-root
+/// self-attestation attack is structurally unexpressible.
+pub fn resolve_authorized(
+    authorized: Option<&std::path::Path>,
+    identifier: &str,
+) -> Result<std::path::PathBuf, String> {
+    let root = authorized.ok_or("no authorized project root is active")?;
+    if std::path::Path::new(identifier).is_absolute() {
+        return Err("env file identifiers must be relative to the authorized project root".into());
+    }
+    let mut clean = std::path::PathBuf::from(identifier);
+    if clean.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("env file identifiers must not contain `..`".into());
+    }
+    if clean.is_absolute() || clean.starts_with("/") {
+        return Err("env file identifiers must be relative".into());
+    }
+    let _ = &mut clean;
+    let target = root.join(&clean);
+    ensure_mutation_target(&target, "target").map_err(|e| e.message())?;
+    let canonical_target = target.canonicalize().map_err(|e| e.to_string())?;
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err("env file is outside the authorized project root".into());
+    }
+    Ok(canonical_target)
+}
+
+pub fn load_project_authorized(root: Option<&Path>) -> Result<ProjectSnapshot, String> {
+    let root = root.ok_or("no authorized project root is active")?;
+    snapshot_project(root)
         .map(redact_snapshot)
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn reveal_env_value(
-    root: String,
-    path: String,
-    key: String,
+fn load_project(root_state: tauri::State<'_, AuthorizedRoot>) -> Result<ProjectSnapshot, String> {
+    load_project_authorized(root_state.0.lock().unwrap().as_deref())
+}
+
+/// Backend-owned re-anchor (VNE-SEC-001 remediation): the folder dialog
+/// runs NATIVELY and hands the selected path straight into Rust state —
+/// the webview never names a path. Returns the new root for display.
+#[tauri::command]
+async fn choose_authorized_root(
+    root_state: tauri::State<'_, AuthorizedRoot>,
+    app: tauri::AppHandle,
+) -> Result<Option<String>, String> {
+    let picked = app.dialog().file().blocking_pick_folder();
+    match picked {
+        Some(tauri_plugin_dialog::FilePath::Path(path)) => {
+            let display = path.display().to_string();
+            *root_state.0.lock().unwrap() = Some(path);
+            Ok(Some(display))
+        }
+        Some(other) => Err(format!("unsupported selection: {other:?}")),
+        None => Ok(None),
+    }
+}
+
+pub fn reveal_env_value_authorized(
+    root: Option<&Path>,
+    identifier: &str,
+    key: &str,
     line_number: usize,
 ) -> Result<String, String> {
-    let path = resolve_project_file(&root, &path)?;
+    let path = resolve_authorized(root, identifier)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
 
     parse_env_entries(&content)
@@ -843,52 +902,90 @@ fn reveal_env_value(
 }
 
 #[tauri::command]
+fn reveal_env_value(
+    root_state: tauri::State<'_, AuthorizedRoot>,
+    path: String,
+    key: String,
+    line_number: usize,
+) -> Result<String, String> {
+    reveal_env_value_authorized(root_state.0.lock().unwrap().as_deref(), &path, &key, line_number)
+}
+
+pub fn save_env_value_authorized(
+    root: Option<&Path>,
+    identifier: &str,
+    key: &str,
+    line_number: usize,
+    value: &str,
+) -> Result<ProjectSnapshot, String> {
+    let authorized = root.ok_or("no authorized project root is active")?;
+    let path = resolve_authorized(root, identifier)?;
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let updated = replace_env_value_at(&content, key, line_number, value)
+        .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))?;
+
+    atomic_write_metadata_if_unchanged(&path, &updated, Some(&content)).map_err(|error| error.to_string())?;
+    snapshot_project(authorized)
+        .map(redact_snapshot)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn save_env_value(
-    root: String,
+    root_state: tauri::State<'_, AuthorizedRoot>,
     path: String,
     key: String,
     line_number: usize,
     value: String,
 ) -> Result<ProjectSnapshot, String> {
-    let root_path = Path::new(&root)
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let path = resolve_project_file(&root, &path)?;
+    save_env_value_authorized(root_state.0.lock().unwrap().as_deref(), &path, &key, line_number, &value)
+}
+
+pub fn add_env_key_authorized(
+    root: Option<&Path>,
+    identifier: &str,
+    key: &str,
+    value: &str,
+) -> Result<ProjectSnapshot, String> {
+    let authorized = root.ok_or("no authorized project root is active")?;
+    let path = resolve_authorized(root, identifier)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let updated = replace_env_value_at(&content, &key, line_number, &value)
-        .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))?;
+    let updated =
+        append_env_key_result(&content, key, value).map_err(|error| error.message(key))?;
 
     atomic_write_metadata_if_unchanged(&path, &updated, Some(&content)).map_err(|error| error.to_string())?;
-    snapshot_project(&root_path)
+    snapshot_project(authorized)
         .map(redact_snapshot)
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 fn add_env_key(
-    root: String,
+    root_state: tauri::State<'_, AuthorizedRoot>,
     path: String,
     key: String,
     value: String,
 ) -> Result<ProjectSnapshot, String> {
-    let root_path = Path::new(&root)
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let path = resolve_project_file(&root, &path)?;
-    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let updated =
-        append_env_key_result(&content, &key, &value).map_err(|error| error.message(&key))?;
+    add_env_key_authorized(root_state.0.lock().unwrap().as_deref(), &path, &key, &value)
+}
 
-    atomic_write_metadata_if_unchanged(&path, &updated, Some(&content)).map_err(|error| error.to_string())?;
-    snapshot_project(&root_path)
-        .map(redact_snapshot)
-        .map_err(|error| error.to_string())
+pub fn ensure_env_file_authorized(
+    root: Option<&Path>,
+    name: &str,
+) -> Result<EnsureEnvFileOutcome, String> {
+    let root = root.ok_or("no authorized project root is active")?;
+    ensure_project_env_file(root, name).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn ensure_env_file(root: String, name: String) -> Result<EnsureEnvFileOutcome, String> {
-    ensure_project_env_file(Path::new(&root), &name).map_err(|error| error.to_string())
+fn ensure_env_file(
+    root_state: tauri::State<'_, AuthorizedRoot>,
+    name: String,
+) -> Result<EnsureEnvFileOutcome, String> {
+    ensure_env_file_authorized(root_state.0.lock().unwrap().as_deref(), &name)
 }
+
+use tauri_plugin_dialog::DialogExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -897,7 +994,10 @@ pub fn run() {
 
 pub fn run_with_initial_project_path(initial_path: Option<String>) {
     tauri::Builder::default()
-        .manage(InitialProjectPath(initial_path))
+        .manage(InitialProjectPath(initial_path.clone()))
+        .manage(AuthorizedRoot(std::sync::Mutex::new(
+            initial_path.map(std::path::PathBuf::from),
+        )))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             initial_project_path,
@@ -5317,13 +5417,13 @@ mod tests {
     #[test]
     fn ensure_command_creates_a_discoverable_empty_file() {
         let project = tempdir().unwrap();
-        let outcome = ensure_env_file(
-            project.path().to_string_lossy().to_string(),
-            ".env".to_string(),
+        let outcome = ensure_env_file_authorized(
+            Some(project.path()),
+            ".env",
         )
         .unwrap();
 
-        let snapshot = load_project(project.path().to_string_lossy().to_string()).unwrap();
+        let snapshot = load_project_authorized(Some(project.path())).unwrap();
         assert_eq!(outcome.disposition, EnvFileCreationDisposition::Created);
         assert_eq!(snapshot.files.len(), 1);
         assert_eq!(snapshot.files[0].path, outcome.path);
@@ -5389,7 +5489,7 @@ mod tests {
         )
         .unwrap();
 
-        let hidden = load_project(dir.path().to_string_lossy().to_string()).unwrap();
+        let hidden = load_project_authorized(Some(dir.path())).unwrap();
         let hidden_file = hidden
             .files
             .iter()
@@ -5413,25 +5513,15 @@ mod tests {
         assert!(!hidden_file.content.contains("user:pass"));
         assert_eq!(hidden_file.content, RAW_PREVIEW_WITHHELD);
 
-        let revealed_token = reveal_env_value(
-            dir.path().to_string_lossy().to_string(),
-            env_path.to_string_lossy().to_string(),
-            "API_TOKEN".to_string(),
-            1,
-        )
-        .unwrap();
-        let revealed_database = reveal_env_value(
-            dir.path().to_string_lossy().to_string(),
-            env_path.to_string_lossy().to_string(),
-            "DATABASE_URL".to_string(),
-            3,
-        )
-        .unwrap();
+        let revealed_token =
+            reveal_env_value_authorized(Some(dir.path()), ".env", "API_TOKEN", 1).unwrap();
+        let revealed_database =
+            reveal_env_value_authorized(Some(dir.path()), ".env", "DATABASE_URL", 3).unwrap();
 
         assert_eq!(revealed_token, "sk-hidden");
         assert_eq!(revealed_database, "postgres://user:pass@localhost/app");
 
-        let still_hidden = load_project(dir.path().to_string_lossy().to_string()).unwrap();
+        let still_hidden = load_project_authorized(Some(dir.path())).unwrap();
         let still_hidden_file = still_hidden
             .files
             .iter()
@@ -5450,7 +5540,7 @@ mod tests {
         )
         .unwrap();
 
-        let hidden = load_project(dir.path().to_string_lossy().to_string()).unwrap();
+        let hidden = load_project_authorized(Some(dir.path())).unwrap();
         let hidden_file = hidden
             .files
             .iter()
@@ -5628,14 +5718,9 @@ mod tests {
                 && finding.key.as_deref() == Some("API_TOKEN")
         }));
 
-        let after = save_env_value(
-            dir.path().to_string_lossy().to_string(),
-            env_path.to_string_lossy().to_string(),
-            "API_TOKEN".to_string(),
-            1,
-            "sk-updated".to_string(),
-        )
-        .unwrap();
+        let after =
+            save_env_value_authorized(Some(dir.path()), ".env", "API_TOKEN", 1, "sk-updated")
+                .unwrap();
         let refreshed_env = after.files.iter().find(|file| file.name == ".env").unwrap();
         let refreshed_entry = refreshed_env
             .entries
@@ -5651,13 +5736,8 @@ mod tests {
                 && finding.key.as_deref() == Some("API_TOKEN")
         }));
 
-        let revealed = reveal_env_value(
-            dir.path().to_string_lossy().to_string(),
-            env_path.to_string_lossy().to_string(),
-            "API_TOKEN".to_string(),
-            1,
-        )
-        .unwrap();
+        let revealed =
+            reveal_env_value_authorized(Some(dir.path()), ".env", "API_TOKEN", 1).unwrap();
         assert_eq!(revealed, "sk-updated");
     }
 
@@ -5673,13 +5753,9 @@ mod tests {
             finding.action_kind == "add-missing-key" && finding.key.as_deref() == Some("REDIS_URL")
         }));
 
-        let after = add_env_key(
-            dir.path().to_string_lossy().to_string(),
-            env_path.to_string_lossy().to_string(),
-            "REDIS_URL".to_string(),
-            "redis://localhost:6379".to_string(),
-        )
-        .unwrap();
+        let after =
+            add_env_key_authorized(Some(dir.path()), ".env", "REDIS_URL", "redis://localhost:6379")
+                .unwrap();
         let refreshed_env = after.files.iter().find(|file| file.name == ".env").unwrap();
 
         assert!(refreshed_env
@@ -6001,5 +6077,97 @@ mod tests {
             staging_names,
             vec![".env.staging.local", ".env.staging", ".env.local", ".env"]
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// O5 Tier-A: refusal battery against the AuthorizedRoot seam. The
+// vulnerability proofs that preceded the migration (caller-root reads
+// passing) are preserved in the loop journal; these lock the fixed shape.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod o5_authorized_root_battery {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn rooted() -> (tempfile::TempDir, tempfile::TempDir) {
+        let project = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(project.path().join(".env"), "IN=1\n").unwrap();
+        std::fs::write(outside.path().join(".env"), "OUTSIDE_SECRET=vne-o5-x\n").unwrap();
+        (project, outside)
+    }
+
+    #[test]
+    fn no_authorized_root_fails_closed_everywhere() {
+        assert!(load_project_authorized(None).is_err());
+        assert!(reveal_env_value_authorized(None, ".env", "IN", 1).is_err());
+        assert!(save_env_value_authorized(None, ".env", "IN", 1, "v").is_err());
+        assert!(add_env_key_authorized(None, ".env", "K", "v").is_err());
+    }
+
+    #[test]
+    fn absolute_and_parent_identifiers_refused() {
+        let (project, _) = rooted();
+        let root = project.path();
+        for ident in ["/etc/hosts", "../../etc/hosts", "/"] {
+            assert!(
+                resolve_authorized(Some(root), ident).is_err(),
+                "identifier `{ident}` must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn outside_targets_cannot_be_named() {
+        let (project, outside) = rooted();
+        let root = project.path();
+        // even a RELATIVE traversal-shaped identifier is refused
+        assert!(resolve_authorized(Some(root), "../x/.env").is_err());
+        // the outside file simply is not reachable: reveal by identifier only
+        let outside_ident = outside.path().join(".env");
+        assert!(reveal_env_value_authorized(
+            Some(root),
+            outside_ident.to_str().unwrap(),
+            "OUTSIDE_SECRET",
+            1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn symlinked_identifier_components_refused() {
+        let (project, outside) = rooted();
+        let link = project.path().join("linked.env");
+        std::os::unix::fs::symlink(outside.path().join(".env"), &link).unwrap();
+        assert!(
+            resolve_authorized(Some(project.path()), "linked.env").is_err(),
+            "symlinked identifier must be refused (O3 contact-evidence item)"
+        );
+    }
+
+    #[test]
+    fn load_project_output_carries_no_unknown_shape_canary() {
+        let project = tempdir().unwrap();
+        let canary = "vne-o5-canary-0123456789abcdef0123456789abcdef";
+        std::fs::write(project.path().join(".env"), format!("OPAQUE={canary}\n")).unwrap();
+        let snapshot = load_project_authorized(Some(project.path())).unwrap();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !json.contains(canary),
+            "unknown-shape canary must not appear anywhere in the initial IPC payload"
+        );
+    }
+
+    #[test]
+    fn save_outside_is_unreachable_and_inroot_save_works() {
+        let (project, _) = rooted();
+        let root = project.path();
+        // in-root save works through the seam
+        let snap = save_env_value_authorized(Some(root), ".env", "IN", 1, "2").unwrap();
+        assert!(snap.files.iter().any(|f| f.name == ".env"));
+        let content = std::fs::read_to_string(root.join(".env")).unwrap();
+        assert!(content.contains("IN=2"));
     }
 }
