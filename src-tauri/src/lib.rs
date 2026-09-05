@@ -3402,6 +3402,14 @@ pub fn atomic_write_metadata_if_unchanged(
     content: &str,
     unchanged: Option<&str>,
 ) -> io::Result<()> {
+    // Identity at entry: the persist-time re-check requires the SAME inode
+    // that was on the path when the write began (VNE-SEC-013).
+    #[cfg(unix)]
+    let identity_at_entry = {
+        use std::os::unix::fs::MetadataExt;
+        let stat = fs::symlink_metadata(path)?;
+        (stat.dev(), stat.ino())
+    };
     let original = fs::symlink_metadata(path)?;
     if original.file_type().is_symlink() {
         return Err(io::Error::new(
@@ -3438,6 +3446,17 @@ pub fn atomic_write_metadata_if_unchanged(
                 io::ErrorKind::AlreadyExists,
                 "file changed since it was read; refusing to overwrite (rerun the command)",
             ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let now = fs::symlink_metadata(path)?;
+            if (now.dev(), now.ino()) != identity_at_entry {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "file identity changed since the write began; refusing to replace (rerun the command)",
+                ));
+            }
         }
     }
     temporary.write_all(content.as_bytes())?;
