@@ -20,11 +20,29 @@ pub use git::EnvFileGitStatus;
 pub struct ProjectSnapshot {
     pub root: String,
     pub files: Vec<EnvFile>,
+    /// Discovered candidates that could NOT be inspected, with a typed
+    /// reason — a scan is never "complete" while this is silently empty
+    /// (VNE-SEC-010). Each record also surfaces as a warning finding.
+    pub incomplete: Vec<IncompleteEnvFile>,
     pub comparison: Option<EnvComparison>,
     pub layer_report: EnvLayerReport,
     pub framework_profiles: Vec<FrameworkEnvProfile>,
     pub findings: Vec<EnvFinding>,
 }
+
+/// Terminal non-read outcome for one discovered candidate.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IncompleteEnvFile {
+    pub name: String,
+    /// "unreadable" | "invalid-utf8" | "oversize" | "count-limit" | "scan-timeout"
+    pub reason: &'static str,
+}
+
+/// Scan bounds (VNE-SEC-014 scan half): explicit, tunable, enforced.
+pub const SCAN_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+pub const SCAN_MAX_FILES: usize = 500;
+pub const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -929,31 +947,97 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
         )
     });
 
-    let files = env_paths
-        .into_iter()
-        .filter_map(|(path, reasons)| {
-            fs::read_to_string(&path).ok().map(|content| {
+    // Every discovered candidate resolves to exactly one terminal outcome:
+    // a parsed file or an explicit incomplete record (VNE-SEC-010).
+    let scan_started = std::time::Instant::now();
+    let mut files = Vec::new();
+    let mut incomplete = Vec::new();
+    for (index, (path, reasons)) in env_paths.into_iter().enumerate() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        if index >= SCAN_MAX_FILES {
+            incomplete.push(IncompleteEnvFile {
+                name,
+                reason: "count-limit",
+            });
+            continue;
+        }
+        if scan_started.elapsed() >= SCAN_DEADLINE {
+            incomplete.push(IncompleteEnvFile {
+                name,
+                reason: "scan-timeout",
+            });
+            continue;
+        }
+        let meta = match fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                incomplete.push(IncompleteEnvFile {
+                    name,
+                    reason: "unreadable",
+                });
+                continue;
+            }
+        };
+        if meta.len() > SCAN_MAX_FILE_BYTES {
+            incomplete.push(IncompleteEnvFile {
+                name,
+                reason: "oversize",
+            });
+            continue;
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => {
                 let mut file =
                     parse_env_file_with_reasons(&path, content, reasons.into_iter().collect());
                 file.git_status = git::env_file_git_status(&path);
-                file
-            })
-        })
-        .collect::<Vec<_>>();
+                files.push(file);
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                incomplete.push(IncompleteEnvFile {
+                    name,
+                    reason: "invalid-utf8",
+                });
+            }
+            Err(_) => {
+                incomplete.push(IncompleteEnvFile {
+                    name,
+                    reason: "unreadable",
+                });
+            }
+        }
+    }
 
     let comparison = compare_actual_to_example(&files);
     let layer_report = build_layer_report(&files);
     let framework_profiles = build_framework_profiles(&root, &files);
-    let findings = build_findings(
+    let mut findings = build_findings(
         comparison.as_ref(),
         &layer_report,
         &framework_profiles,
         &files,
     );
+    for record in &incomplete {
+        findings.push(EnvFinding {
+            severity: "warning".into(),
+            action_kind: "incompleteScan".into(),
+            title: format!("`{}` was not inspected ({})", record.name, record.reason),
+            detail: "The scan is incomplete: this discovered env file has no inspection result.".into(),
+            evidence: vec![record.name.clone()],
+            mutation_preview: None,
+            file_path: None,
+            key: None,
+            line_number: None,
+            entry_id: None,
+        });
+    }
 
     Ok(ProjectSnapshot {
         root: root.to_string_lossy().to_string(),
         files,
+        incomplete,
         comparison,
         layer_report,
         framework_profiles,
@@ -978,6 +1062,7 @@ pub fn withhold_all_snapshot_payloads(snapshot: ProjectSnapshot) -> ProjectSnaps
     let ProjectSnapshot {
         root,
         files,
+        incomplete,
         comparison,
         layer_report,
         framework_profiles,
@@ -990,6 +1075,7 @@ pub fn withhold_all_snapshot_payloads(snapshot: ProjectSnapshot) -> ProjectSnaps
             .into_iter()
             .map(withhold_all_env_file_payloads)
             .collect(),
+        incomplete,
         comparison,
         layer_report,
         framework_profiles,
@@ -1001,6 +1087,7 @@ pub fn redact_snapshot_values_only(snapshot: ProjectSnapshot) -> ProjectSnapshot
     let ProjectSnapshot {
         root,
         files,
+        incomplete,
         comparison,
         layer_report,
         framework_profiles,
@@ -1010,6 +1097,7 @@ pub fn redact_snapshot_values_only(snapshot: ProjectSnapshot) -> ProjectSnapshot
     ProjectSnapshot {
         root,
         files: files.into_iter().map(redact_env_file_values_only).collect(),
+        incomplete,
         comparison,
         layer_report,
         framework_profiles,

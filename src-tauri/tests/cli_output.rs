@@ -2210,3 +2210,67 @@ fn hanging_git_is_bounded_and_reports_unknown() {
         "a killed git is Unknown, never a guess"
     );
 }
+
+#[test]
+fn scan_reports_incomplete_files_explicitly_and_nonzero() {
+    let dir = tempdir().unwrap();
+    write(&dir.path().join(".env"), "GOOD=1\n");
+    let mut invalid = b"SETTING=".to_vec();
+    invalid.extend_from_slice(&[0xff, 0xfe, 0x41]);
+    invalid.push(b'\n');
+    fs::write(dir.path().join(".env.dev"), invalid).unwrap();
+
+    let output = run_vne(["inspect".to_string(), dir.path().display().to_string(), "--json".to_string()]);
+    assert_eq!(output.status.code(), Some(1), "incomplete scan must not exit clean");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let incomplete = json["incomplete"].as_array().unwrap();
+    let reasons: Vec<&str> = incomplete
+        .iter()
+        .map(|r| r["reason"].as_str().unwrap_or(""))
+        .collect();
+    assert!(reasons.contains(&"invalid-utf8"), "{reasons:?}");
+    assert!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["actionKind"] == "incompleteScan"),
+        "incomplete records must surface as findings"
+    );
+    // clean project: empty incomplete, exit 0 preserved
+    let clean = run_vne(["inspect".to_string(), dir.path().display().to_string(), "--json".to_string()]);
+    let _ = clean;
+}
+
+#[test]
+fn clean_project_still_exits_zero_with_empty_incomplete() {
+    let dir = tempdir().unwrap();
+    write(&dir.path().join(".env"), "GOOD=1\n");
+    let output = run_vne(["inspect".to_string(), dir.path().display().to_string(), "--json".to_string()]);
+    assert_eq!(output.status.code(), Some(0));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["incomplete"].as_array().map(Vec::len), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_file_is_an_explicit_incomplete() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    write(&dir.path().join(".env"), "GOOD=1\n");
+    write(&dir.path().join(".env.local"), "OTHER=1\n");
+    fs::set_permissions(dir.path().join(".env.local"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = run_vne(["inspect".to_string(), dir.path().display().to_string(), "--json".to_string()]);
+    fs::set_permissions(dir.path().join(".env.local"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json["incomplete"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["reason"] == "unreadable"),
+        "unreadable file must be a typed incomplete"
+    );
+}
