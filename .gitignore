@@ -6,5 +6,8 @@ src-tauri/target/
 .vscode/
 .idea/
 
+# Local loop execution state
+.loop/
+
 # Local cross-project inbox notes
 .inbox/
