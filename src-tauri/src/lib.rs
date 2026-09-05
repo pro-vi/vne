@@ -999,6 +999,7 @@ pub fn run_with_initial_project_path(initial_path: Option<String>) {
             initial_path.map(std::path::PathBuf::from),
         )))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_webdriver::init())
         .invoke_handler(tauri::generate_handler![
             initial_project_path,
             load_project,
