@@ -2429,7 +2429,17 @@ fn infer_key_shape(key: &str, value: &str) -> KeyShape {
         return shape("url", "URL / DSN", "high", false, reasons);
     }
 
-    if upper.ends_with("_PORT") || key == "PORT" || trimmed.parse::<u16>().is_ok() {
+    // Name/value split (loop-002 campaign t1c1, 2026-09-05): a NAME-derived
+    // port shape with a value that is not itself numeric must not display —
+    // an opaque value riding under a renamed *_PORT key stays withheld, the
+    // same rule the url kind enforces.
+    let port_name_like = upper.ends_with("_PORT") || key == "PORT";
+    let port_value_like = trimmed.parse::<u16>().is_ok();
+    if port_name_like || port_value_like {
+        if port_name_like && !port_value_like {
+            reasons.push("port-like key name with a non-numeric value; withheld".to_string());
+            return shape("port", "Port", "low", true, reasons);
+        }
         reasons.push("port-like key or numeric port value".to_string());
         return shape("port", "Port", "medium", false, reasons);
     }
@@ -2447,11 +2457,17 @@ fn infer_key_shape(key: &str, value: &str) -> KeyShape {
         return shape("int", "Integer", "medium", false, reasons);
     }
 
-    if upper.ends_with("_TIMEOUT")
+    // Name/value split (loop-002 defender sweep, 2026-09-05): same rule as
+    // port — a *_TIMEOUT/_TTL/_INTERVAL name only displays when the VALUE
+    // itself parses as a duration.
+    let duration_name_like = upper.ends_with("_TIMEOUT")
         || upper.ends_with("_TTL")
-        || upper.ends_with("_INTERVAL")
-        || looks_like_duration(trimmed)
-    {
+        || upper.ends_with("_INTERVAL");
+    if duration_name_like || looks_like_duration(trimmed) {
+        if duration_name_like && !looks_like_duration(trimmed) {
+            reasons.push("duration-like key name with a non-duration value; withheld".to_string());
+            return shape("duration", "Duration", "low", true, reasons);
+        }
         reasons.push("duration-like key or value".to_string());
         return shape("duration", "Duration", "medium", false, reasons);
     }
