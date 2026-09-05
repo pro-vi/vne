@@ -868,20 +868,27 @@ fn malformed_entry_diagnostics_do_not_echo_payloads() {
 }
 
 #[test]
-fn piped_format_warns_that_it_emits_raw_content() {
+fn piped_format_refuses_to_emit_raw_content() {
     let dir = tempdir().unwrap();
     let env_file = dir.path().join("format.env");
     write(&env_file, &format!("RAW_SETTING={ORDINARY_SENTINEL}\n"));
 
+    // Replaces the pre-fix contract that asserted the raw leak itself
+    // (audit VNE-SEC-003): piped stdout now gets exit 2, empty stdout, and
+    // a value-free refusal.
     let output = run_vne([
         "format".to_string(),
         env_file.display().to_string(),
         "--dry-run".to_string(),
     ]);
 
-    assert_eq!(output.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&output.stdout).contains(ORDINARY_SENTINEL));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("raw env content"));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stdout_lossy = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout_lossy.contains(ORDINARY_SENTINEL));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("refuses piped stdout"), "{stderr}");
+    assert!(!stderr.contains(ORDINARY_SENTINEL), "{stderr}");
 }
 
 #[test]
@@ -2044,4 +2051,19 @@ fn add_warns_about_an_argv_value_even_when_the_target_is_missing() {
     assert!(stderr.contains("does not exist"), "{stderr}");
     assert!(!stderr.contains(SET_SENTINEL), "{stderr}");
     assert!(!absent.exists());
+}
+
+#[test]
+fn format_without_dry_run_still_errors_value_free() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    write(&env_file, &format!("KEY={ORDINARY_SENTINEL}\n"));
+
+    let output = run_vne(["format".to_string(), env_file.display().to_string()]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("requires --dry-run"), "{stderr}");
+    assert!(!stderr.contains(ORDINARY_SENTINEL), "{stderr}");
 }
