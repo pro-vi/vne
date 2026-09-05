@@ -75,19 +75,56 @@ enum GitInvocation {
     Status(Option<i32>),
 }
 
+/// Per-invocation deadline for git children. A git that exceeds it is
+/// killed and reported as signal-death (`Status(None)` -> Unknown) — an
+/// unobservable git is an honest Unknown, never a guess and never a hang
+/// (VNE-SEC-014).
+const GIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn run_git(directory: &Path, arguments: &[&str]) -> GitInvocation {
-    let outcome = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(directory)
+        // Repo and global config cannot register execution for plumbing
+        // (VNE-SEC-007): core.fsmonitor and friends are pinned off, system
+        // config ignored. Plumbing never needs them.
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("core.untrackedCache=false")
+        .arg("-c")
+        .arg("core.splitIndex=false")
         .args(arguments)
+        // Scrubbed environment: the child sees PATH (to find git) and
+        // nothing else — caller environment is not an inheritance channel.
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    match outcome {
-        Ok(status) => GitInvocation::Status(status.code()),
-        Err(_) => GitInvocation::Missing,
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return GitInvocation::Missing;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return GitInvocation::Status(status.code()),
+            Ok(None) => {
+                if started.elapsed() >= GIT_DEADLINE {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return GitInvocation::Status(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return GitInvocation::Status(None);
+            }
+        }
     }
 }
 

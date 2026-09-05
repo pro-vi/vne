@@ -2099,3 +2099,110 @@ fn concurrent_edit_refuses_to_clobber_and_value_stays_free() {
     assert!(between.contains("KEY="));
     assert!(!between.contains("first-") || between.trim_end().ends_with(&format!("first-{SET_SENTINEL}")));
 }
+
+#[test]
+fn repo_fsmonitor_never_executes_during_inspection() {
+    let dir = tempdir().unwrap();
+    let marker = dir.path().join("fsm-marker");
+    let script = dir.path().join(".fsmon.sh");
+    fs::write(&script, format!("#!/bin/sh\necho x >> \"{}\"\n", marker.display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(dir.path().join(".env"), "HOSTILE=true\n").unwrap();
+    for args in [vec!["init", "-q"], vec!["add", ".env"]] {
+        let ok = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "fixture setup: git {args:?}");
+    }
+    // arm the hook AFTER all fixture git calls, directly in .git/config
+    let git_config = dir.path().join(".git/config");
+    let existing = fs::read_to_string(&git_config).unwrap();
+    fs::write(
+        &git_config,
+        format!("{}\n[core]\n\tfsmonitor = {}\n", existing, script.display()),
+    )
+    .unwrap();
+    let _ = fs::remove_file(&marker);
+
+    let output = run_vne(["inspect".to_string(), dir.path().display().to_string(), "--json".to_string()]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        !marker.exists(),
+        "core.fsmonitor must never execute during inspection (VNE-SEC-007)"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_child_environment_is_scrubbed() {
+    // A fsmonitor that would run sees only the scrubbed env; prove the
+    // scrub directly: a hostile GIT_DIR-style env var on the vne
+    // invocation must not influence the git child (plumbing still answers
+    // for the real directory).
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join(".env"), "K=v\n").unwrap();
+    let decoy = dir.path().join("decoy");
+    fs::create_dir(&decoy).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vne"))
+        .args(["inspect", dir.path().to_str().unwrap(), "--json"])
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("GIT_DIR", decoy.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    // with GIT_DIR ignored, the real dir is a repository-free temp dir:
+    // status is unknown or outsideRepository, never influenced by the decoy
+    let statuses: Vec<&str> = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["gitStatus"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        statuses.iter().all(|s| *s == "unknown" || *s == "outsideRepository"),
+        "decoy GIT_DIR must not reach the git child: {statuses:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hanging_git_is_bounded_and_reports_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let shim = dir.path().join("shim");
+    fs::create_dir(&shim).unwrap();
+    fs::write(shim.join("git"), "#!/bin/sh\nsleep 60\n").unwrap();
+    fs::set_permissions(shim.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(dir.path().join(".env"), "K=v\n").unwrap();
+
+    let started = std::time::Instant::now();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vne"))
+        .args(["check", dir.path().join(".env").to_str().unwrap(), "--json"])
+        .env_clear()
+        .env("PATH", format!("{}:{}", shim.display(), std::env::var("PATH").unwrap()))
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(output.status.code(), Some(0), "vne itself must complete");
+    assert!(
+        elapsed.as_secs() < 30,
+        "three bounded git calls must stay well under 30s, took {elapsed:?}"
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["file"]["gitStatus"], "unknown",
+        "a killed git is Unknown, never a guess"
+    );
+}
