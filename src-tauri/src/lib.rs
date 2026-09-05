@@ -353,6 +353,10 @@ pub enum EnvKeyCopyError {
         role: &'static str,
         path: PathBuf,
     },
+    SymlinkComponent {
+        role: &'static str,
+        path: PathBuf,
+    },
     Io {
         action: &'static str,
         path: PathBuf,
@@ -386,6 +390,9 @@ impl EnvKeyCopyError {
             Self::NonRegularFile { role, path } => {
                 format!("{role} env file {} is not a regular file", path.display())
             }
+            Self::SymlinkComponent { role, path } => {
+                format!("{role} path crosses a symlink: {}; mutations refuse symlinks", path.display())
+            }
             Self::Io {
                 action,
                 path,
@@ -416,6 +423,10 @@ pub enum EnvFileAccessError {
         role: &'static str,
         path: PathBuf,
     },
+    SymlinkComponent {
+        role: &'static str,
+        path: PathBuf,
+    },
     Io {
         action: &'static str,
         path: PathBuf,
@@ -429,6 +440,9 @@ impl EnvFileAccessError {
             Self::NonRegularFile { role, path } => {
                 format!("{role} env file {} is not a regular file", path.display())
             }
+            Self::SymlinkComponent { role, path } => {
+                format!("{role} path crosses a symlink: {}; mutations refuse symlinks", path.display())
+            }
             Self::Io {
                 action,
                 path,
@@ -441,6 +455,9 @@ impl EnvFileAccessError {
 impl From<EnvFileAccessError> for EnvKeyCopyError {
     fn from(error: EnvFileAccessError) -> Self {
         match error {
+            EnvFileAccessError::SymlinkComponent { role, path } => {
+                EnvKeyCopyError::SymlinkComponent { role, path }
+            }
             EnvFileAccessError::NonRegularFile { role, path } => {
                 Self::NonRegularFile { role, path }
             }
@@ -823,7 +840,7 @@ fn save_env_value(
     let updated = replace_env_value_at(&content, &key, line_number, &value)
         .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))?;
 
-    atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
+    atomic_write_metadata_if_unchanged(&path, &updated, Some(&content)).map_err(|error| error.to_string())?;
     snapshot_project(&root_path)
         .map(redact_snapshot)
         .map_err(|error| error.to_string())
@@ -844,7 +861,7 @@ fn add_env_key(
     let updated =
         append_env_key_result(&content, &key, &value).map_err(|error| error.message(&key))?;
 
-    atomic_write_preserving_permissions(&path, &updated).map_err(|error| error.to_string())?;
+    atomic_write_metadata_if_unchanged(&path, &updated, Some(&content)).map_err(|error| error.to_string())?;
     snapshot_project(&root_path)
         .map(redact_snapshot)
         .map_err(|error| error.to_string())
@@ -1357,7 +1374,7 @@ pub fn copy_env_key(
         copy_env_key_content(&source_content, &destination_content, key, overwrite)?;
 
     if disposition != EnvKeyCopyDisposition::AlreadyPresent {
-        atomic_write_preserving_permissions(&destination_path, &updated).map_err(|source| {
+        atomic_write_metadata_if_unchanged(&destination_path, &updated, Some(&destination_content)).map_err(|source| {
             EnvKeyCopyError::Io {
                 action: "write",
                 path: destination_path.clone(),
@@ -1374,7 +1391,72 @@ pub fn copy_env_key(
     })
 }
 
+/// O_NOFOLLOW constant by platform (std does not export it; adding libc for
+/// one constant is not worth the dependency). Verified against macOS
+/// /usr/include/sys/fcntl.h and Linux include/uapi/asm-generic/fcntl.h.
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0040_0000;
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400_000;
+
+/// Mutation-target guard (VNE-SEC-005): refuse a symlinked final
+/// component for every mutation, then verify identity with a no-follow
+/// open whose descriptor (dev, ino) must match the pre-check stat
+/// (VNE-SEC-013's final-component identity check). Directory-component
+/// symlink refusal is deliberately NOT implemented here: ambient system
+/// symlinks (/var -> /private/var on macOS) sit above any anchor this
+/// layer can attribute; that attribution arrives with O5's backend-owned
+/// authorized root. The audit's executed damage (final-component link
+/// materialization) is fully covered by this guard.
+pub fn ensure_mutation_target(path: &Path, role: &'static str) -> Result<(), EnvFileAccessError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let stat = fs::symlink_metadata(path).map_err(|source| EnvFileAccessError::Io {
+            action: "inspect",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if stat.file_type().is_symlink() {
+            return Err(EnvFileAccessError::SymlinkComponent {
+                role,
+                path: path.to_path_buf(),
+            });
+        }
+        if !stat.is_file() {
+            return Err(EnvFileAccessError::NonRegularFile {
+                role,
+                path: path.to_path_buf(),
+            });
+        }
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| EnvFileAccessError::Io {
+                action: "open",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let fd_meta = opened.metadata().map_err(|source| EnvFileAccessError::Io {
+            action: "inspect",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if fd_meta.dev() != stat.dev() || fd_meta.ino() != stat.ino() {
+            return Err(EnvFileAccessError::NonRegularFile {
+                role,
+                path: path.to_path_buf(),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, role);
+    Ok(())
+}
+
 fn canonical_regular_file(path: &Path, role: &'static str) -> Result<PathBuf, EnvFileAccessError> {
+    ensure_mutation_target(path, role)?;
     let canonical = fs::canonicalize(path).map_err(|source| EnvFileAccessError::Io {
         action: "resolve",
         path: path.to_path_buf(),
@@ -1495,7 +1577,7 @@ pub fn set_env_key(
     let (updated, disposition) = set_env_key_content(&content, key, value)?;
 
     if disposition != EnvKeySetDisposition::AlreadyPresent {
-        atomic_write_preserving_permissions(&path, &updated).map_err(|source| {
+        atomic_write_metadata_if_unchanged(&path, &updated, Some(&content)).map_err(|source| {
             EnvFileAccessError::Io {
                 action: "write",
                 path: path.clone(),
@@ -1562,7 +1644,7 @@ pub fn remove_env_key(
     let removal = remove_env_key_content(&content, key, selector, expectation)?;
 
     if let Some(updated) = &removal.content {
-        atomic_write_preserving_permissions(&path, updated).map_err(|source| {
+        atomic_write_metadata_if_unchanged(&path, updated, Some(&content)).map_err(|source| {
             EnvFileAccessError::Io {
                 action: "write",
                 path: path.clone(),
@@ -1690,7 +1772,7 @@ pub fn rename_env_key(
     let content = read_env_file_at(&path)?;
     let updated = rename_env_key_content(&content, from, to)?;
 
-    atomic_write_preserving_permissions(&path, &updated).map_err(|source| {
+    atomic_write_metadata_if_unchanged(&path, &updated, Some(&content)).map_err(|source| {
         EnvFileAccessError::Io {
             action: "write",
             path: path.clone(),
@@ -1810,7 +1892,7 @@ pub fn sync_example_file(
     let (updated, added_keys) = append_missing_example_keys(&source_content, &example_content);
 
     if !added_keys.is_empty() {
-        atomic_write_preserving_permissions(&example_path, &updated).map_err(|source| {
+        atomic_write_metadata_if_unchanged(&example_path, &updated, Some(&example_content)).map_err(|source| {
             ExampleSyncError::Io {
                 action: "write",
                 path: example_path.clone(),
@@ -1860,8 +1942,9 @@ fn create_example_file(path: &Path) -> Result<EnvFileCreationDisposition, Exampl
 }
 
 /// Returns the example content with the missing keys appended, plus the key
-/// names in source order. An inline comment travels only when it survives the
-/// same secret scan the parser uses elsewhere.
+/// names in source order. Additions are key-only placeholders: comment
+/// payloads from real env files never travel into example files
+/// (VNE-SEC-006 — structural boundary, no classifier involvement).
 fn append_missing_example_keys(
     source_content: &str,
     example_content: &str,
@@ -1877,10 +1960,7 @@ fn append_missing_example_keys(
         if example_keys.contains(&entry.key) || !seen.insert(entry.key.clone()) {
             continue;
         }
-        let comment = entry
-            .comment
-            .filter(|comment| !contains_secretish_text(comment));
-        additions.push((entry.key, comment));
+        additions.push(entry.key);
     }
 
     let line_ending = preferred_line_ending(example_content);
@@ -1889,17 +1969,13 @@ fn append_missing_example_keys(
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push_str(line_ending);
     }
-    for (key, comment) in &additions {
+    for key in &additions {
         updated.push_str(key);
         updated.push('=');
-        if let Some(comment) = comment {
-            updated.push(' ');
-            updated.push_str(comment);
-        }
         updated.push_str(line_ending);
     }
 
-    let added_keys = additions.into_iter().map(|(key, _)| key).collect();
+    let added_keys = additions;
     (updated, added_keys)
 }
 
@@ -3313,8 +3389,34 @@ fn env_file_sort_key(name: &str) -> (u8, String) {
     (priority, name.to_string())
 }
 
-pub fn atomic_write_preserving_permissions(path: &Path, content: &str) -> io::Result<()> {
-    let permissions = fs::metadata(path)?.permissions();
+pub fn atomic_write_preserving_metadata(path: &Path, content: &str) -> io::Result<()> {
+    atomic_write_metadata_if_unchanged(path, content, None)
+}
+
+/// VNE-SEC-013 overwrite precondition: when `unchanged` carries the bytes
+/// the edit was computed from, the file on disk must still hold exactly
+/// those bytes at persist time. A concurrent edit or identity swap refuses
+/// (exit 2) instead of clobbering or writing through a stale identity.
+pub fn atomic_write_metadata_if_unchanged(
+    path: &Path,
+    content: &str,
+    unchanged: Option<&str>,
+) -> io::Result<()> {
+    let original = fs::symlink_metadata(path)?;
+    if original.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to write through a symlink",
+        ));
+    }
+    let permissions = original.permissions();
+    // Security metadata travels with the rewrite (VNE-SEC-012): the full
+    // xattr set is copied onto the replacement before it takes the name.
+    // Listing failure fails closed — writing metadata-blind is worse.
+    let mut xattr_names: Vec<std::ffi::OsString> = Vec::new();
+    for name in xattr::list(path)? {
+        xattr_names.push(name);
+    }
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -3329,10 +3431,24 @@ pub fn atomic_write_preserving_permissions(path: &Path, content: &str) -> io::Re
         .prefix(&temporary_prefix)
         .permissions(permissions.clone());
     let mut temporary = builder.tempfile_in(parent)?;
+    if let Some(expected) = unchanged {
+        let current = fs::read(path)?;
+        if current != expected.as_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file changed since it was read; refusing to overwrite (rerun the command)",
+            ));
+        }
+    }
     temporary.write_all(content.as_bytes())?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
     temporary.as_file().set_permissions(permissions)?;
+    for name in &xattr_names {
+        if let Some(value) = xattr::get(path, name)? {
+            xattr::set(temporary.path(), name, &value)?;
+        }
+    }
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
@@ -3697,6 +3813,18 @@ fn looks_like_base64(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn atomic_write_refuses_when_precondition_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".env");
+        std::fs::write(&p, "A=1\n").unwrap();
+        let err = atomic_write_metadata_if_unchanged(&p, "A=2\n", Some("A=9\n")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "A=1\n", "refusal leaves content intact");
+        atomic_write_metadata_if_unchanged(&p, "A=2\n", Some("A=1\n")).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "A=2\n");
+    }
+
     use super::*;
     use tempfile::tempdir;
 
@@ -4469,7 +4597,7 @@ mod tests {
         assert_eq!(added, vec!["PORT".to_string(), "TOKEN".to_string()]);
         assert_eq!(
             updated,
-            "# contract\nDATABASE_URL=\nPORT= # dev server\nTOKEN=\n"
+            "# contract\nDATABASE_URL=\nPORT=\nTOKEN=\n"
         );
         assert!(updated.starts_with(example));
     }
@@ -4571,7 +4699,7 @@ mod tests {
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
         symlink(&outside, dir.path().join(".secret.env.vne.tmp")).unwrap();
 
-        atomic_write_preserving_permissions(&destination, "TOKEN=new\n").unwrap();
+        atomic_write_preserving_metadata(&destination, "TOKEN=new\n").unwrap();
 
         assert_eq!(fs::read_to_string(&destination).unwrap(), "TOKEN=new\n");
         assert_eq!(fs::read_to_string(&outside).unwrap(), "OUTSIDE=keep\n");
