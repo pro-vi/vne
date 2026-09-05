@@ -2254,7 +2254,15 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
         return shape("host", "Host", "medium", false, reasons);
     }
 
-    shape("text", "Text", "low", false, reasons)
+    // Default-deny (VNE-SEC-002 CLI half): a value matching NO known-benign
+    // shape is withheld, not exposed. Known-benign shapes (url, port, bool,
+    // int, duration, json, uuid, email, path, list, host, public) still show
+    // under --values; anything unrecognized is treated as possibly secret.
+    // Note: withheld (redacted) WITHOUT being labeled sensitive — the
+    // plain `shape()` helper couples the two flags, and lookalike keys must
+    // not gain a secret label.
+    reasons.push("unrecognized shape; withheld by default".to_string());
+    shape_with_context("text", "Text", "low", true, false, None, reasons)
 }
 
 fn parse_env_entries(content: &str) -> Vec<ParsedLine> {
@@ -4846,13 +4854,18 @@ mod tests {
             assert!(shape.redacted_by_default);
         }
 
+        // Lookalikes are still NOT classified secret (kind discipline), but
+        // since the default-deny change they withhold like all unrecognized
+        // shapes — absence of a secret label no longer means exposure.
         for (key, value) in [
             ("SK_THEME", "dark"),
             ("SERVICE_ROLE_NAME", "worker"),
             ("UNRECOGNIZED", "flask_config"),
             ("UNRECOGNIZED", "eyJ.not-a-complete-token"),
         ] {
-            assert!(!infer_key_shape(key, value).sensitive, "{key}={value}");
+            let shape = infer_key_shape(key, value);
+            assert!(!shape.sensitive, "{key}={value}");
+            assert!(shape.redacted_by_default, "{key}={value} must withhold (default-deny)");
         }
 
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwdW5jdHVhdGVkIn0.signature";
@@ -5493,8 +5506,10 @@ mod tests {
             .collect::<Vec<_>>();
         let projected = redact_env_file_values_only(file);
 
-        assert_eq!(projected.entries[0].value, "OrdinaryB2Y");
-        assert_eq!(projected.entries[0].display_value, "OrdinaryB2Y");
+        // default-deny: an unrecognized text value withholds under the
+        // values-only projection too (VNE-SEC-002 CLI half)
+        assert_eq!(projected.entries[0].value, "");
+        assert_eq!(projected.entries[0].display_value, "********");
         assert_eq!(projected.entries[1].value, "");
         assert_eq!(projected.entries[1].display_value, "********");
         assert!(projected

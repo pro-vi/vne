@@ -427,8 +427,9 @@ fn inspect_values_mode_keeps_values_but_withholds_source_context() {
     assert_eq!(output.status.code(), Some(0));
     let json = assert_payload_absent(&output, &[COMMENT_SENTINEL]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(ORDINARY_SENTINEL));
-    assert!(stdout.contains(LOCAL_SENTINEL));
+    // default-deny: unknown-shape values withhold even under --values
+    assert!(!stdout.contains(ORDINARY_SENTINEL));
+    assert!(!stdout.contains(LOCAL_SENTINEL));
     assert!(json["files"].as_array().unwrap().iter().all(|file| {
         file["content"] == "[raw content withheld by output policy]"
             && file["entries"].as_array().unwrap().iter().all(|entry| {
@@ -471,8 +472,9 @@ fn add_json_is_payload_free_without_changing_written_bytes() {
     assert_eq!(hidden.status.code(), Some(0));
     assert_eq!(values.status.code(), Some(0));
     assert_payload_absent(&hidden, &[ADD_SENTINEL, COMMENT_SENTINEL]);
-    assert!(String::from_utf8_lossy(&values.stdout).contains(ADD_SENTINEL));
-    let values_json = assert_payload_absent(&values, &[COMMENT_SENTINEL]);
+    // default-deny: the opaque added value withholds even under --values
+    assert!(!String::from_utf8_lossy(&values.stdout).contains(ADD_SENTINEL));
+    let values_json = assert_payload_absent(&values, &[ADD_SENTINEL, COMMENT_SENTINEL]);
     assert_eq!(
         values_json["content"],
         "[raw content withheld by output policy]"
@@ -754,7 +756,8 @@ fn values_mode_keeps_ordinary_values_but_redacts_detected_payloads() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout.clone()).unwrap();
-    assert!(stdout.contains(ORDINARY_SENTINEL));
+    // default-deny: the opaque ordinary value withholds under --values
+    assert!(!stdout.contains(ORDINARY_SENTINEL));
     assert_payload_absent(&output, &[SERVICE_ROLE_SENTINEL, COMMENT_SENTINEL]);
 }
 
@@ -776,7 +779,8 @@ fn values_mode_keeps_ordinary_values_but_withholds_source_context() {
 
     assert_eq!(output.status.code(), Some(0));
     let json = assert_payload_absent(&output, &[COMMENT_SENTINEL]);
-    assert_eq!(json["file"]["entries"][0]["value"], ORDINARY_SENTINEL);
+    // default-deny: unknown-shape entry value withholds under --values
+    assert_eq!(json["file"]["entries"][0]["value"], "");
     assert_eq!(
         json["file"]["entries"][0]["comment"],
         "# [comment withheld by output policy]"
