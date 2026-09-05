@@ -2284,6 +2284,14 @@ pub fn infer_key_shape(key: &str, value: &str) -> KeyShape {
     }
 
     let url_like = upper.ends_with("_URL") || upper.ends_with("_URI") || trimmed.contains("://");
+    // Name/url split (agent-found O9 exploit): a NAME-derived url shape
+    // with a value that is not itself URL-like must not display — the
+    // value riding under a renamed benign-sounding key stays withheld.
+    let url_value_like = trimmed.contains("://") || trimmed.starts_with('/');
+    if url_like && !url_value_like {
+        reasons.push("URL-like key name with a non-URL value; withheld".to_string());
+        return shape("url", "URL / DSN", "low", true, reasons);
+    }
     if upper.contains("DSN") {
         reasons.push("DSN-like key name".to_string());
         if url_like {
