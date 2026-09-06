@@ -2250,9 +2250,14 @@ fn looks_like_host(trimmed: &str) -> bool {
             && label
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    }) && !trimmed
-        .split('.')
-        .all(|label| label.len() >= 2 && label.bytes().all(|b| b.is_ascii_hexdigit()))
+    }) && trimmed.split('.').any(|label| {
+        // A label of hex DIGITS that includes at least one hex LETTER marks
+        // dotted-hex token material; pure-decimal labels are IP octets and
+        // stay host-shaped (harden F0041).
+        label.len() >= 2
+            && label.bytes().all(|b| b.is_ascii_hexdigit())
+            && label.bytes().any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
+    })
 }
 
 /// Benign-shape admission for the NAME-derived public-prefix gate. Hardened
@@ -2293,7 +2298,14 @@ fn value_is_benign_shaped(trimmed: &str) -> bool {
             && domain.split('.').all(|label| {
                 !label.is_empty() && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
             });
-        if !local.is_empty() && dotted_domain {
+        // Harden F0040: the local part is restricted to unreserved
+        // address characters — credential userinfo (user:pass@) and spaced
+        // strings are not email shapes and withhold.
+        let plain_local = !local.is_empty()
+            && local
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-'));
+        if plain_local && dotted_domain {
             return true;
         }
     }
@@ -2934,7 +2946,10 @@ fn build_framework_profiles(root: &Path, files: &[EnvFile]) -> Vec<FrameworkEnvP
 }
 
 fn read_package_json(root: &Path) -> Option<serde_json::Value> {
-    let content = fs::read_to_string(root.join("package.json")).ok()?;
+    // Harden F0042 (2026-09-06): the same SCAN_MAX_FILE_BYTES bound that
+    // governs the other discovery reads — read_package_json is a second
+    // reader of the same attacker-shapeable file.
+    let content = read_discovery_file_bounded(&root.join("package.json")).ok()?;
     serde_json::from_str(&content).ok()
 }
 
