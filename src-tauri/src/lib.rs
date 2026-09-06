@@ -2234,7 +2234,9 @@ fn preferred_line_ending(content: &str) -> &'static str {
 /// Host-shaped value: `localhost` or a dotted sequence of DNS-labels
 /// (hostname or IPv4). Deliberately excludes bare single labels — an opaque
 /// token like `vne-agent-<hex>` is one hyphenated label and must not read
-/// as a host.
+/// as a host — and (harden F0023) values whose every label is pure hex:
+/// dotted hex is a secret encoding (dead.beef.cafe), and name-derived
+/// display resolves ambiguity toward withholding.
 fn looks_like_host(trimmed: &str) -> bool {
     if trimmed.eq_ignore_ascii_case("localhost") {
         return true;
@@ -2248,7 +2250,9 @@ fn looks_like_host(trimmed: &str) -> bool {
             && label
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    })
+    }) && !trimmed
+        .split('.')
+        .all(|label| label.len() >= 2 && label.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Benign-shape admission for the NAME-derived public-prefix gate. Hardened
@@ -2257,7 +2261,11 @@ fn looks_like_host(trimmed: &str) -> bool {
 /// secrets take (hex tokens, base64 keys, dotted cluster ids), and this
 /// predicate gates exposure granted by the KEY NAME alone, where ambiguity
 /// resolves toward withholding. A version string under VITE_APP_VERSION
-/// withholds; the unambiguous shapes below still display.
+/// withholds; the unambiguous shapes below still display. Hardened
+/// 2026-09-06 (F0031): email is unambiguous (local@domain with a dotted
+/// domain) and displays; dotted host-like shapes stay withheld here even
+/// though the *_HOST arm admits them with its own stricter predicate —
+/// under a public prefix, dotted remains a secret encoding.
 fn value_is_benign_shaped(trimmed: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     if lower.contains("://") || trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("~/") {
@@ -2272,8 +2280,24 @@ fn value_is_benign_shaped(trimmed: &str) -> bool {
     if trimmed.contains(',') {
         return true; // list
     }
-    trimmed.len() == 36 && trimmed.as_bytes().iter().filter(|b| **b == b'-').count() == 4
-    // uuid
+    if trimmed.len() == 36
+        && trimmed.as_bytes().iter().filter(|b| **b == b'-').count() == 4
+    {
+        return true; // uuid
+    }
+    // email: exactly one @ whose right side is a dotted domain — a shape
+    // secrets do not take (F0031)
+    if trimmed.matches('@').count() == 1 {
+        let (local, domain) = trimmed.split_once('@').unwrap_or(("", ""));
+        let dotted_domain = domain.contains('.')
+            && domain.split('.').all(|label| {
+                !label.is_empty() && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            });
+        if !local.is_empty() && dotted_domain {
+            return true;
+        }
+    }
+    false
 }
 
 fn infer_key_shape(key: &str, value: &str) -> KeyShape {
@@ -3367,14 +3391,20 @@ fn resolve_project_file(root: &str, path: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Harden F0012 (2026-09-05): discovery reads (package.json / compose files)
-/// sit inside the scanned project and are attacker-shapeable, so the same
-/// SCAN_MAX_FILE_BYTES bound that governs env files governs them. An
-/// oversized discovery file is skipped (discovery is best-effort), never a
-/// scan failure — but it can no longer blow the process's memory budget.
+/// Harden F0012 (2026-09-05), F0026 (2026-09-06): discovery reads
+/// (package.json / compose files) sit inside the scanned project and are
+/// attacker-shapeable, so the READ itself — not the stat — is bounded.
+/// File::open + take() caps memory at SCAN_MAX_FILE_BYTES + 1 regardless
+/// of what the file becomes after the open (symlinks to character devices
+/// included); an oversized or infinite source skips (discovery is
+/// best-effort), never a scan failure.
 fn read_discovery_file_bounded(path: &Path) -> Result<String, io::Error> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > SCAN_MAX_FILE_BYTES {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path)?;
+    let mut buf = String::new();
+    let mut limited = file.take(SCAN_MAX_FILE_BYTES + 1);
+    limited.read_to_string(&mut buf)?;
+    if buf.len() as u64 > SCAN_MAX_FILE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::FileTooLarge,
             format!(
@@ -3384,7 +3414,7 @@ fn read_discovery_file_bounded(path: &Path) -> Result<String, io::Error> {
             ),
         ));
     }
-    fs::read_to_string(path)
+    Ok(buf)
 }
 
 fn discover_package_json_env_files(
