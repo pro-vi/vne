@@ -2250,10 +2250,12 @@ fn looks_like_host(trimmed: &str) -> bool {
             && label
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    }) && trimmed.split('.').any(|label| {
+    }) && !trimmed.split('.').any(|label| {
         // A label of hex DIGITS that includes at least one hex LETTER marks
         // dotted-hex token material; pure-decimal labels are IP octets and
-        // stay host-shaped (harden F0041).
+        // stay host-shaped. NEGATED: ANY such label disqualifies the value
+        // (harden F0041 -> F0045: the delta-2 edit dropped this `!` and
+        // inverted the arm — dotted-hex displayed while hosts withheld).
         label.len() >= 2
             && label.bytes().all(|b| b.is_ascii_hexdigit())
             && label.bytes().any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
