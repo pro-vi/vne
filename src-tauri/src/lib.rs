@@ -2251,11 +2251,12 @@ fn looks_like_host(trimmed: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
     }) && !trimmed.split('.').any(|label| {
-        // A label of hex DIGITS that includes at least one hex LETTER marks
-        // dotted-hex token material; pure-decimal labels are IP octets and
-        // stay host-shaped. NEGATED: ANY such label disqualifies the value
-        // (harden F0041 -> F0045: the delta-2 edit dropped this `!` and
-        // inverted the arm — dotted-hex displayed while hosts withheld).
+        // ANY single label of hex DIGITS that includes at least one hex
+        // LETTER disqualifies the whole value (harden F0041 -> F0045 ->
+        // F0057): dotted-hex is token material even mixed with word
+        // labels, and pure-decimal labels remain IP octets. The `!` is
+        // load-bearing — dropping it displayed dotted-hex under _HOST
+        // names while real hosts withheld.
         label.len() >= 2
             && label.bytes().all(|b| b.is_ascii_hexdigit())
             && label.bytes().any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
@@ -5178,6 +5179,35 @@ mod tests {
             assert!(
                 !shape.redacted_by_default,
                 "{key}={value} is an unambiguous public shape and must display"
+            );
+        }
+    }
+
+    /// Harden F0055 (2026-09-08): the host arm's DISPLAY direction is
+    /// pinned in unit tests too — ordinary hostnames, IPv4, and localhost
+    /// must not be withheld under *_HOST names (the over-withhold mirror
+    /// of the F0045 inversion passed every standing lane).
+    #[test]
+    fn host_arm_displays_host_shaped_values() {
+        for (key, value) in [
+            ("DB_HOST", "api.example.internal"),
+            ("DB_HOST", "192.168.100.200"),
+            ("DB_HOST", "localhost"),
+            ("SERVICE_HOST", "smtp.example.com"),
+            ("SERVICE_HOST", "10.0.0.1"),
+        ] {
+            let shape = infer_key_shape(key, value);
+            assert!(
+                !shape.redacted_by_default,
+                "{key}={value} is host-shaped and must display under a _HOST name"
+            );
+        }
+        // ...while dotted-hex token material withholds.
+        for value in ["dead.beef.cafe", "cafe.babe", "aabb.ccdd.eeff"] {
+            let shape = infer_key_shape("DB_HOST", value);
+            assert!(
+                shape.redacted_by_default,
+                "DB_HOST={value} is dotted-hex token material and must withhold"
             );
         }
     }
