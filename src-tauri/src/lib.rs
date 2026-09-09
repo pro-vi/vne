@@ -1021,6 +1021,13 @@ pub fn run_with_initial_project_path(initial_path: Option<String>) {
 
 pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     let root = root.canonicalize()?;
+    // Harden F0010 (2026-09-09): the deadline starts at the scan's first
+    // filesystem work — the discovery phase (read_dir, package.json and
+    // compose reads, stat/canonicalize of every reference) was previously
+    // unmeasured; a 9.3MB compose with 550k duplicate references burned
+    // 3.25s of work no deadline covered.
+    let scan_started = std::time::Instant::now();
+    clear_discovery_seen();
     let mut discovered = BTreeMap::<PathBuf, BTreeSet<String>>::new();
 
     for entry in fs::read_dir(&root)? {
@@ -1058,7 +1065,6 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
 
     // Every discovered candidate resolves to exactly one terminal outcome:
     // a parsed file or an explicit incomplete record (VNE-SEC-010).
-    let scan_started = std::time::Instant::now();
     let mut files = Vec::new();
     let mut incomplete = Vec::new();
     // Harden F0009: discovery anomalies surface as typed incompletes.
@@ -3386,6 +3392,15 @@ fn key_set(file: &EnvFile) -> BTreeSet<String> {
     file.entries.iter().map(|entry| entry.key.clone()).collect()
 }
 
+thread_local! {
+    static DISCOVERY_SEEN: std::cell::RefCell<std::collections::BTreeSet<PathBuf>> =
+        std::cell::RefCell::new(std::collections::BTreeSet::new());
+}
+
+fn clear_discovery_seen() {
+    DISCOVERY_SEEN.with(|s| s.borrow_mut().clear());
+}
+
 fn add_discovered_env_file(
     root: &Path,
     candidate: impl AsRef<Path>,
@@ -3398,6 +3413,15 @@ fn add_discovered_env_file(
     } else {
         root.join(candidate)
     };
+
+    // Harden F0010 (2026-09-09): dedupe BEFORE the filesystem work — a
+    // compose file with hundreds of thousands of duplicate env_file
+    // references stat+canonicalized the same path each time, unmeasured.
+    // The canonical map keys cannot be consulted pre-canonicalization, so
+    // a seen-paths set on the joined form carries the dedup.
+    if !DISCOVERY_SEEN.with(|s| s.borrow_mut().insert(path.clone())) {
+        return; // same candidate already processed this scan
+    }
 
     let Ok(metadata) = fs::metadata(&path) else {
         return;
