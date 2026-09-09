@@ -12,3 +12,5 @@ oracle/target/
 
 # Local cross-project inbox notes
 .inbox/
+.claude/
+.prov/
