@@ -1038,8 +1038,9 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
         }
     }
 
-    discover_package_json_env_files(&root, &mut discovered);
-    discover_compose_env_files(&root, &mut discovered);
+    let mut discovery_notes: Vec<String> = Vec::new();
+    discover_package_json_env_files(&root, &mut discovered, &mut discovery_notes);
+    discover_compose_env_files(&root, &mut discovered, &mut discovery_notes);
 
     let mut env_paths = discovered.into_iter().collect::<Vec<_>>();
     env_paths.sort_by_key(|(path, _)| {
@@ -1060,6 +1061,15 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     let scan_started = std::time::Instant::now();
     let mut files = Vec::new();
     let mut incomplete = Vec::new();
+    // Harden F0009: discovery anomalies surface as typed incompletes.
+    for note in discovery_notes {
+        if let Some((name, reason)) = note.split_once(':') {
+            incomplete.push(IncompleteEnvFile {
+                name: name.to_string(),
+                reason: if reason == "unparseable" { "invalid-utf8" } else { "oversize" },
+            });
+        }
+    }
     for (index, (path, reasons)) in env_paths.into_iter().enumerate() {
         let name = path
             .file_name()
@@ -1096,7 +1106,25 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
             });
             continue;
         }
-        match fs::read_to_string(&path) {
+        // Harden F0008 (2026-09-09): bound the READ, not the stat — a
+        // discovered file flipped to a /dev/zero symlink between the stat
+        // and this read reported size 0 and read unbounded (12 GB RSS in
+        // the owner review's probe). take() caps memory regardless of what
+        // the file becomes after the open.
+        let bounded = (|| -> io::Result<String> {
+            use std::io::Read as _;
+            let mut file = fs::File::open(&path)?;
+            let mut buf = String::new();
+            file.take(SCAN_MAX_FILE_BYTES + 1).read_to_string(&mut buf)?;
+            if buf.len() as u64 > SCAN_MAX_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "exceeds the scan bound",
+                ));
+            }
+            Ok(buf)
+        })();
+        match bounded {
             Ok(content) => {
                 let mut file =
                     parse_env_file_with_reasons(&path, content, reasons.into_iter().collect());
@@ -3438,12 +3466,24 @@ fn read_discovery_file_bounded(path: &Path) -> Result<String, io::Error> {
 fn discover_package_json_env_files(
     root: &Path,
     discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>,
+    notes: &mut Vec<String>,
 ) {
     let path = root.join("package.json");
-    let Ok(content) = read_discovery_file_bounded(&path) else {
+    let Ok(content) = read_discovery_file_bounded(&path).map_err(|e| {
+        // Harden F0009 (2026-09-09): discovery anomalies are TYPED, never
+        // silent — but ABSENCE is the normal state for a discovery file
+        // and stays silent. Only real anomalies (oversize, unreadable,
+        // symlinked char device, invalid UTF-8) surface as incomplete
+        // records instead of vanishing.
+        if e.kind() != io::ErrorKind::NotFound {
+            notes.push("package.json:unreadable-or-oversize".to_string());
+        }
+        e
+    }) else {
         return;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        notes.push("package.json:unparseable".to_string());
         return;
     };
     let Some(scripts) = value.get("scripts").and_then(serde_json::Value::as_object) else {
@@ -3465,7 +3505,11 @@ fn discover_package_json_env_files(
     }
 }
 
-fn discover_compose_env_files(root: &Path, discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>) {
+fn discover_compose_env_files(
+    root: &Path,
+    discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>,
+    notes: &mut Vec<String>,
+) {
     for compose_name in [
         "compose.yaml",
         "compose.yml",
@@ -3473,7 +3517,12 @@ fn discover_compose_env_files(root: &Path, discovered: &mut BTreeMap<PathBuf, BT
         "docker-compose.yml",
     ] {
         let path = root.join(compose_name);
-        let Ok(content) = read_discovery_file_bounded(&path) else {
+        let Ok(content) = read_discovery_file_bounded(&path).map_err(|e| {
+            if e.kind() != io::ErrorKind::NotFound {
+                notes.push(format!("{compose_name}:unreadable-or-oversize"));
+            }
+            e
+        }) else {
             continue;
         };
 
@@ -5187,6 +5236,37 @@ mod tests {
     /// pinned in unit tests too — ordinary hostnames, IPv4, and localhost
     /// must not be withheld under *_HOST names (the over-withhold mirror
     /// of the F0045 inversion passed every standing lane).
+    /// Harden F0003 (2026-09-09): duration and path arms' DISPLAY
+    /// directions pinned — benign durations and paths must appear under
+    /// their names while opaque values withhold.
+    #[test]
+    fn duration_and_path_arms_display_benign_values() {
+        for (key, value) in [
+            ("HTTP_TIMEOUT", "30s"),
+            ("CACHE_TTL", "5m"),
+            ("RETRY_INTERVAL", "1h"),
+            ("ASSET_PATH", "/usr/local/bin"),
+            ("CONFIG_DIR", "./config"),
+        ] {
+            let shape = infer_key_shape(key, value);
+            assert!(
+                !shape.redacted_by_default,
+                "{key}={value} is a benign {shape_kind} value and must display",
+                shape_kind = shape.kind
+            );
+        }
+        for (key, value) in [
+            ("HTTP_TIMEOUT", "vne-agent-0011223344556677"),
+            ("ASSET_PATH", "vne-agent-0011223344556677"),
+        ] {
+            let shape = infer_key_shape(key, value);
+            assert!(
+                shape.redacted_by_default,
+                "{key}={value} is opaque and must withhold under a duration/path name"
+            );
+        }
+    }
+
     #[test]
     fn host_arm_displays_host_shaped_values() {
         for (key, value) in [
