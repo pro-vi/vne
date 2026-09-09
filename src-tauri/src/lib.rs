@@ -1072,7 +1072,7 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
         if let Some((name, reason)) = note.split_once(':') {
             incomplete.push(IncompleteEnvFile {
                 name: name.to_string(),
-                reason: if reason == "unparseable" { "invalid-utf8" } else { "oversize" },
+                reason: discovery_reason_token(reason),
             });
         }
     }
@@ -3395,11 +3395,38 @@ fn key_set(file: &EnvFile) -> BTreeSet<String> {
 thread_local! {
     static DISCOVERY_SEEN: std::cell::RefCell<std::collections::BTreeSet<PathBuf>> =
         std::cell::RefCell::new(std::collections::BTreeSet::new());
+    static DISCOVERY_CANONICAL: std::cell::RefCell<std::collections::BTreeMap<PathBuf, PathBuf>> =
+        std::cell::RefCell::new(std::collections::BTreeMap::new());
 }
+
+/// F0035: reference bookkeeping is a scan-scoped resource, bounded like
+/// every other scan resource.
+pub const SCAN_MAX_DISCOVERY_REFS: usize = 10_000;
 
 fn clear_discovery_seen() {
     DISCOVERY_SEEN.with(|s| s.borrow_mut().clear());
+    DISCOVERY_CANONICAL.with(|s| s.borrow_mut().clear());
 }
+
+/// F0033: the anomaly kind as a stable IncompleteEnvFile reason token.
+fn discovery_reason(e: &io::Error) -> &'static str {
+    match e.kind() {
+        io::ErrorKind::FileTooLarge => "oversize",
+        io::ErrorKind::InvalidData => "invalid-utf8",
+        io::ErrorKind::PermissionDenied => "unreadable",
+        _ => "unreadable",
+    }
+}
+
+fn discovery_reason_token(reason: &str) -> &'static str {
+    match reason {
+        "oversize" => "oversize",
+        "invalid-utf8" => "invalid-utf8",
+        "unparseable" => "invalid-utf8",
+        _ => "unreadable",
+    }
+}
+
 
 fn add_discovered_env_file(
     root: &Path,
@@ -3419,8 +3446,15 @@ fn add_discovered_env_file(
     // references stat+canonicalized the same path each time, unmeasured.
     // The canonical map keys cannot be consulted pre-canonicalization, so
     // a seen-paths set on the joined form carries the dedup.
-    if !DISCOVERY_SEEN.with(|s| s.borrow_mut().insert(path.clone())) {
-        return; // same candidate already processed this scan
+    let fresh = DISCOVERY_SEEN.with(|s| s.borrow_mut().insert(path.clone()));
+    if !fresh {
+        // F0034: same candidate again — skip the filesystem work but still
+        // record THIS discovery reason against the cached canonical path.
+        let canonical = DISCOVERY_CANONICAL.with(|s| s.borrow().get(&path).cloned());
+        if let Some(canonical) = canonical {
+            discovered.entry(canonical).or_default().insert(reason);
+        }
+        return;
     }
 
     let Ok(metadata) = fs::metadata(&path) else {
@@ -3434,6 +3468,13 @@ fn add_discovered_env_file(
         return;
     };
     if !canonical.starts_with(root) {
+        return;
+    }
+    DISCOVERY_CANONICAL.with(|s| s.borrow_mut().insert(path, canonical.clone()));
+
+    // F0035: past the reference cap, stop bookkeeping — the scan's typed
+    // accounting (count-limit) covers the overflow at the file layer.
+    if DISCOVERY_SEEN.with(|s| s.borrow().len()) > SCAN_MAX_DISCOVERY_REFS {
         return;
     }
 
@@ -3500,7 +3541,8 @@ fn discover_package_json_env_files(
         // symlinked char device, invalid UTF-8) surface as incomplete
         // records instead of vanishing.
         if e.kind() != io::ErrorKind::NotFound {
-            notes.push("package.json:unreadable-or-oversize".to_string());
+            // F0033: the label carries the ACTUAL anomaly kind.
+            notes.push(format!("package.json:{}", discovery_reason(&e)));
         }
         e
     }) else {
@@ -3543,7 +3585,7 @@ fn discover_compose_env_files(
         let path = root.join(compose_name);
         let Ok(content) = read_discovery_file_bounded(&path).map_err(|e| {
             if e.kind() != io::ErrorKind::NotFound {
-                notes.push(format!("{compose_name}:unreadable-or-oversize"));
+                notes.push(format!("{compose_name}:{}", discovery_reason(&e)));
             }
             e
         }) else {
@@ -5287,6 +5329,26 @@ mod tests {
             assert!(
                 shape.redacted_by_default,
                 "{key}={value} is opaque and must withhold under a duration/path name"
+            );
+        }
+    }
+
+    /// Harden F0037 (2026-09-09): url and port display directions pinned,
+    /// completing both-direction unit coverage for all seven arms.
+    #[test]
+    fn url_and_port_arms_display_benign_values() {
+        for (key, value) in [
+            ("LEGACY_URL", "https://api.internal"),
+            ("FEEDBACK_URI", "https://feedback.internal"),
+            ("APP_URL", "postgres://localhost/app"),
+            ("HTTP_PORT", "8080"),
+            ("PORT", "5173"),
+        ] {
+            let shape = infer_key_shape(key, value);
+            assert!(
+                !shape.redacted_by_default,
+                "{key}={value} is a benign {} value and must display",
+                shape.kind
             );
         }
     }
