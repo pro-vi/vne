@@ -2322,10 +2322,8 @@ fn value_is_benign_shaped(trimmed: &str) -> bool {
     if trimmed.contains(',') {
         return true; // list
     }
-    if trimmed.len() == 36
-        && trimmed.as_bytes().iter().filter(|b| **b == b'-').count() == 4
-    {
-        return true; // uuid
+    if looks_like_uuid(trimmed) {
+        return true; // uuid — same predicate the uuid arm enforces
     }
     // email: exactly one @ whose right side is a dotted domain — a shape
     // secrets do not take (F0031)
@@ -5351,6 +5349,18 @@ mod tests {
                 shape.kind
             );
         }
+    }
+
+    /// Final-cycle find (2026-09-10): the benign predicate's uuid branch
+    /// now enforces the same hex discipline as looks_like_uuid — a
+    /// 36-char/4-dash NON-hex value under a public prefix withholds; a
+    /// real UUID still displays.
+    #[test]
+    fn public_prefix_uuid_branch_requires_hex() {
+        let shape = infer_key_shape("VITE_X", "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz");
+        assert!(shape.redacted_by_default, "non-hex 36/4-dash must withhold under a public prefix");
+        let ok = infer_key_shape("VITE_X", "123e4567-e89b-42d3-a456-426614174000");
+        assert!(!ok.redacted_by_default, "a real UUID displays");
     }
 
     #[test]
