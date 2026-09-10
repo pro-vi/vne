@@ -1,5 +1,5 @@
 use crate::{
-    append_env_key_result, atomic_write_metadata_if_unchanged, compare_env_files, copy_env_key,
+    append_env_key_result, compare_env_files, copy_env_key,
     ensure_project_env_file, infer_key_shape, parse_env_file, redact_env_file_values_only,
     redact_snapshot_values_only, remove_env_key, rename_env_key, set_env_key, sync_example_file,
     withhold_all_env_file_payloads, withhold_all_snapshot_payloads, EnsureEnvFileOutcome,

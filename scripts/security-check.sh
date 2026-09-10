@@ -15,7 +15,19 @@ check_no_matches() {
   label="$1"
   shift
 
-  matches="$("$@" || true)"
+  # Gate FM8 (2026-09-10): a scanner ERROR is not a clean scan — an rg
+  # failure (bad target, wrong cwd) must fail the gate, not pass it
+  # having scanned nothing.
+  # rg: 0 = matches found, 1 = no matches (clean), >=2 = scanner ERROR
+  # (gate FM8: an error is not a clean scan). `|| rc=$` keeps set -e calm.
+  rc=0
+  matches="$("$@" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ge 2 ]; then
+    printf '%s
+' "security-check: failed - scanner errored (rc=$rc) on: $*" >&2
+    fail=1
+    continue
+  fi
   if [ -n "$matches" ]; then
     printf '%s\n' "security-check: failed $label" >&2
     printf '%s\n' "$matches" >&2

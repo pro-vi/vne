@@ -835,14 +835,11 @@ pub fn resolve_authorized(
     if std::path::Path::new(identifier).is_absolute() {
         return Err("env file identifiers must be relative to the authorized project root".into());
     }
-    let mut clean = std::path::PathBuf::from(identifier);
+    let clean = std::path::PathBuf::from(identifier);
     if clean.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return Err("env file identifiers must not contain `..`".into());
     }
-    if clean.is_absolute() || clean.starts_with("/") {
-        return Err("env file identifiers must be relative".into());
-    }
-    let _ = &mut clean;
+    
     let target = root.join(&clean);
     ensure_mutation_target(&target, "target").map_err(|e| e.message())?;
     let canonical_target = target.canonicalize().map_err(|e| e.to_string())?;
@@ -1112,25 +1109,7 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
             });
             continue;
         }
-        // Harden F0008 (2026-09-09): bound the READ, not the stat — a
-        // discovered file flipped to a /dev/zero symlink between the stat
-        // and this read reported size 0 and read unbounded (12 GB RSS in
-        // the owner review's probe). take() caps memory regardless of what
-        // the file becomes after the open.
-        let bounded = (|| -> io::Result<String> {
-            use std::io::Read as _;
-            let mut file = fs::File::open(&path)?;
-            let mut buf = String::new();
-            file.take(SCAN_MAX_FILE_BYTES + 1).read_to_string(&mut buf)?;
-            if buf.len() as u64 > SCAN_MAX_FILE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::FileTooLarge,
-                    "exceeds the scan bound",
-                ));
-            }
-            Ok(buf)
-        })();
-        match bounded {
+        match read_discovery_file_bounded(&path) {
             Ok(content) => {
                 let mut file =
                     parse_env_file_with_reasons(&path, content, reasons.into_iter().collect());
