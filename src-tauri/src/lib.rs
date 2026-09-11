@@ -3458,6 +3458,7 @@ fn add_discovered_env_file(
     discovered.entry(canonical).or_default().insert(reason);
 }
 
+#[cfg(test)]
 fn resolve_project_file(root: &str, path: &str) -> Result<PathBuf, String> {
     let root = Path::new(root)
         .canonicalize()
@@ -3488,7 +3489,7 @@ fn resolve_project_file(root: &str, path: &str) -> Result<PathBuf, String> {
 /// best-effort), never a scan failure.
 fn read_discovery_file_bounded(path: &Path) -> Result<String, io::Error> {
     use std::io::Read as _;
-    let mut file = fs::File::open(path)?;
+    let file = fs::File::open(path)?;
     let mut buf = String::new();
     let mut limited = file.take(SCAN_MAX_FILE_BYTES + 1);
     limited.read_to_string(&mut buf)?;
