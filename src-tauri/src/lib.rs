@@ -2638,8 +2638,222 @@ fn infer_key_shape(key: &str, value: &str) -> KeyShape {
     shape_with_context("text", "Text", "low", true, false, None, reasons)
 }
 
+/// One key a `vne run` command receives, and the file it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeEnvVar {
+    pub key: String,
+    pub value: String,
+    pub path: PathBuf,
+}
+
+/// Why `vne run` refused to start a command. Messages name files, keys and
+/// line numbers only, never a value.
+#[derive(Debug)]
+pub enum RuntimeEnvError {
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    UnreadableLine {
+        path: PathBuf,
+        line_number: usize,
+    },
+    Malformed {
+        path: PathBuf,
+        key: String,
+        line_number: usize,
+    },
+    Duplicate {
+        path: PathBuf,
+        key: String,
+        line_numbers: Vec<usize>,
+    },
+    Conflict {
+        key: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
+    AmbiguousEscape {
+        path: PathBuf,
+        key: String,
+        line_number: usize,
+    },
+    NulByte {
+        path: PathBuf,
+        key: String,
+        line_number: usize,
+    },
+}
+
+impl RuntimeEnvError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Io { path, source } => {
+                format!("could not read env file {}: {source}", path.display())
+            }
+            Self::UnreadableLine { path, line_number } => format!(
+                "{} line {line_number} is not a KEY=value entry, a comment, or blank; run reads env files as data and will not skip a line a shell would execute",
+                path.display()
+            ),
+            Self::Malformed {
+                path,
+                key,
+                line_number,
+            } => format!(
+                "`{key}` at {} line {line_number} is malformed",
+                path.display()
+            ),
+            Self::Duplicate {
+                path,
+                key,
+                line_numbers,
+            } => format!(
+                "`{key}` occurs more than once in {} (lines {}); keep one occurrence",
+                path.display(),
+                line_numbers
+                    .iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Conflict { key, first, second } => format!(
+                "`{key}` is defined in both {} and {}; run cannot tell which value you meant",
+                first.display(),
+                second.display()
+            ),
+            Self::AmbiguousEscape {
+                path,
+                key,
+                line_number,
+            } => format!(
+                "`{key}` at {} line {line_number} uses a backslash escape other than a doubled backslash or an escaped quote; shells and dotenv libraries read it differently, so run refuses it",
+                path.display()
+            ),
+            Self::NulByte {
+                path,
+                key,
+                line_number,
+            } => format!(
+                "`{key}` at {} line {line_number} holds a NUL byte, which a process environment cannot carry",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Reads env files for `vne run` as data and returns the keys to hand to one
+/// command (ADR 0005). Whatever cannot be read unambiguously refuses the whole
+/// load: a line that is not an entry, a malformed or duplicated entry, a key
+/// defined in two files, or an escape this parser's writer never produces.
+/// Values are literal; nothing is expanded or executed.
+pub fn load_runtime_env(paths: &[PathBuf]) -> Result<Vec<RuntimeEnvVar>, RuntimeEnvError> {
+    let mut loaded: Vec<RuntimeEnvVar> = Vec::new();
+    for path in paths {
+        let content = fs::read_to_string(path).map_err(|source| RuntimeEnvError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        for var in runtime_env_from_content(path, &content)? {
+            if let Some(earlier) = loaded.iter().find(|earlier| earlier.key == var.key) {
+                return Err(RuntimeEnvError::Conflict {
+                    key: var.key,
+                    first: earlier.path.clone(),
+                    second: var.path,
+                });
+            }
+            loaded.push(var);
+        }
+    }
+    Ok(loaded)
+}
+
+fn runtime_env_from_content(
+    path: &Path,
+    content: &str,
+) -> Result<Vec<RuntimeEnvVar>, RuntimeEnvError> {
+    let (entries, unreadable_lines) = parse_env_lines(content);
+    if let Some(&line_number) = unreadable_lines.first() {
+        return Err(RuntimeEnvError::UnreadableLine {
+            path: path.to_path_buf(),
+            line_number,
+        });
+    }
+
+    let mut vars = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        if entry.diagnostic.is_some() {
+            return Err(RuntimeEnvError::Malformed {
+                path: path.to_path_buf(),
+                key: entry.key.clone(),
+                line_number: entry.line_number,
+            });
+        }
+        let line_numbers = entries
+            .iter()
+            .filter(|other| other.key == entry.key)
+            .map(|other| other.line_number)
+            .collect::<Vec<_>>();
+        if line_numbers.len() > 1 {
+            return Err(RuntimeEnvError::Duplicate {
+                path: path.to_path_buf(),
+                key: entry.key.clone(),
+                line_numbers,
+            });
+        }
+        let value = runtime_value(entry).ok_or_else(|| RuntimeEnvError::AmbiguousEscape {
+            path: path.to_path_buf(),
+            key: entry.key.clone(),
+            line_number: entry.line_number,
+        })?;
+        if value.contains('\0') {
+            return Err(RuntimeEnvError::NulByte {
+                path: path.to_path_buf(),
+                key: entry.key.clone(),
+                line_number: entry.line_number,
+            });
+        }
+        vars.push(RuntimeEnvVar {
+            key: entry.key.clone(),
+            value,
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(vars)
+}
+
+/// The value a process receives. Unquoted values are taken as written. Inside
+/// quotes, only the two escapes `escape_*_quoted_value` produce are read — a
+/// backslash before a backslash or before the value's own quote; any other
+/// escape returns `None` because readers disagree on what it means.
+fn runtime_value(entry: &ParsedLine) -> Option<String> {
+    let Some(quote) = entry.quote else {
+        return Some(entry.value.clone());
+    };
+    let mut value = String::with_capacity(entry.value.len());
+    let mut chars = entry.value.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            value.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some(escaped) if escaped == '\\' || escaped == quote => value.push(escaped),
+            _ => return None,
+        }
+    }
+    Some(value)
+}
+
 fn parse_env_entries(content: &str) -> Vec<ParsedLine> {
+    parse_env_lines(content).0
+}
+
+/// Parses every entry, and also returns the line numbers of lines that are not
+/// blank, not a comment and not an entry — lines the editor can skip but a
+/// shell sourcing the file would execute.
+fn parse_env_lines(content: &str) -> (Vec<ParsedLine>, Vec<usize>) {
     let mut entries = Vec::new();
+    let mut unreadable_lines = Vec::new();
     let mut offset = 0;
     let mut line_number = 1;
 
@@ -2649,13 +2863,27 @@ fn parse_env_entries(content: &str) -> Vec<ParsedLine> {
             offset = parsed.next_start;
             entries.push(parsed);
         } else {
+            if !is_blank_or_comment_line(content, offset) {
+                unreadable_lines.push(line_number);
+            }
             let next = next_line_start(content, offset);
             line_number += count_newlines(&content[offset..next]);
             offset = next;
         }
     }
 
-    entries
+    (entries, unreadable_lines)
+}
+
+fn is_blank_or_comment_line(content: &str, line_start: usize) -> bool {
+    let line_body = &content[line_start..current_line_body_end(content, line_start)];
+    let bytes = line_body.as_bytes();
+    let mut index = 0;
+    if line_start == 0 && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        index = 3;
+    }
+    skip_spaces(bytes, &mut index);
+    index >= bytes.len() || bytes[index] == b'#'
 }
 
 fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> Option<ParsedLine> {
@@ -4641,6 +4869,95 @@ mod tests {
 
         assert_eq!(disposition, EnvKeySetDisposition::AlreadyPresent);
         assert_eq!(unchanged, content);
+    }
+
+    fn runtime_pairs(content: &str) -> Result<Vec<(String, String)>, RuntimeEnvError> {
+        runtime_env_from_content(Path::new("keys.env"), content).map(|vars| {
+            vars.into_iter()
+                .map(|var| (var.key, var.value))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn runtime_values_are_literal_and_read_only_the_writers_escapes() {
+        let content = "\u{feff}# keys\n\nexport PLAIN=a$HOME\\b # note\nDOUBLE=\"say \\\"hi\\\" \\\\ $(id)\"\nSINGLE='it\\'s'\nMULTI=\"one\ntwo\"\n";
+
+        assert_eq!(
+            runtime_pairs(content).unwrap(),
+            vec![
+                ("PLAIN".to_string(), "a$HOME\\b".to_string()),
+                ("DOUBLE".to_string(), "say \"hi\" \\ $(id)".to_string()),
+                ("SINGLE".to_string(), "it's".to_string()),
+                ("MULTI".to_string(), "one\ntwo".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_values_round_trip_what_set_writes() {
+        for stored in [
+            "has space",
+            "quote \" inside",
+            "back\\slash and \"quote\"",
+            "line\nbreak",
+        ] {
+            let (content, _) = set_env_key_content("TOKEN=old\n", "TOKEN", stored).unwrap();
+            assert_eq!(
+                runtime_pairs(&content).unwrap(),
+                vec![("TOKEN".to_string(), stored.to_string())],
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_load_refuses_what_it_cannot_read_unambiguously() {
+        let cases = [
+            ("set -a\nTOKEN=x\n", "line 1 is not a KEY=value entry"),
+            ("TOKEN=x\n1BAD=y\n", "line 2 is not a KEY=value entry"),
+            (
+                "TOKEN=\"never closed\n",
+                "`TOKEN` at keys.env line 1 is malformed",
+            ),
+            (
+                "TOKEN=a\nOTHER=b\nTOKEN=c\n",
+                "occurs more than once in keys.env (lines 1, 3)",
+            ),
+            (
+                "TOKEN=\"a\\nb\"\n",
+                "`TOKEN` at keys.env line 1 uses a backslash escape",
+            ),
+            (
+                "TOKEN=\"trailing\\\"\n",
+                "`TOKEN` at keys.env line 1 is malformed",
+            ),
+            ("TOKEN=a\0b\n", "holds a NUL byte"),
+        ];
+        for (content, expected) in cases {
+            let message = runtime_pairs(content).unwrap_err().message();
+            assert!(message.contains(expected), "{content:?} gave {message}");
+        }
+    }
+
+    #[test]
+    fn runtime_load_refuses_a_key_defined_in_two_files_and_never_names_a_value() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.env");
+        let second = dir.path().join("second.env");
+        fs::write(&first, "SHARED=FirstValueQ1\nONLY_FIRST=1\n").unwrap();
+        fs::write(&second, "SHARED=SecondValueQ2\n").unwrap();
+
+        let message = load_runtime_env(&[first.clone(), second.clone()])
+            .unwrap_err()
+            .message();
+
+        assert!(message.contains("`SHARED` is defined in both"), "{message}");
+        assert!(message.contains("first.env") && message.contains("second.env"));
+        assert!(!message.contains("FirstValueQ1") && !message.contains("SecondValueQ2"));
+
+        let loaded = load_runtime_env(&[first]).unwrap();
+        assert_eq!(loaded.len(), 2);
     }
 
     #[test]

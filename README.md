@@ -105,13 +105,40 @@ npm run install:local
 Use this project command instead of plain `cargo install --path src-tauri`: Tauri release binaries need the
 `custom-protocol` feature to load the bundled interface when the Vite development server is not running.
 
+## Running A Command With Keys
+
+`vne run` starts one command with env files loaded into that command's environment only, so the shell you run it
+from, and every other process it starts, never holds the keys:
+
+```sh
+vne run ~/.config/keys/fal.env -- falgen image "a lighthouse"
+vne run .env .env.local -- npm run dev
+```
+
+This is the replacement for `set -a; source keys.env` in a shell startup file, which puts every key into every
+process, where any command that prints an environment (`env`, `ps eww`, a crash dump) shows them. `run` reads the
+files as data, never as shell code: values are literal, and a line that is not an entry, a malformed or repeated
+entry, a key defined in two files, or a quoted escape other than `\\` and an escaped quote refuses the run before the
+command starts. A key from a file replaces an inherited variable of the same name. vne prints nothing on the way in.
+
+`run` refuses `env`, `printenv`, and `sh -c` scripts that list the environment. That check catches a slip, not a
+caller who wants the value: any program you run can print what it receives. To call an API with a key, pass it on
+stdin so it never appears in a process's arguments:
+
+```sh
+vne run keys.env -- sh -c 'printf "Authorization: Bearer %s\n" "$API_KEY" | curl -H @- https://api.example.com'
+```
+
+The reasoning is in [ADR 0005](docs/adr/0005-run-loads-env-files-into-one-child.md).
+
 ## Privacy
 
 Env contents stay local. The current app has no network path for env data and no telemetry. Tauri CSP is enabled for local assets and IPC. Default Tauri snapshots scrub classifier-detected entry values and secret-like inline comments, and withhold raw preview payloads for files with redacted values or secret-like comments/malformed lines. CLI JSON uses a stronger structural boundary: `inspect`, `check`, and `add` always withhold comments and raw previews, and withhold values unless `--values` is supplied; `create` returns only its disposition and absolute path; `copy` returns only its disposition, normalized paths, and key. Reveal fetches only the selected key occurrence into the local webview and clears it on hide, selection change, reload, or save. Newly created env files are empty and owner-private on Unix. `format --dry-run` is a human-terminal command: it refuses piped stdout (exit 2) and asks for an interactive `y` confirmation before printing raw values.
 
 vne's guarantee is that env values never appear in its output, not that no fact derived from a value is inferable:
 a disposition such as `alreadyPresent` tells the caller that the value it supplied equals the stored one, and any
-local process with file access can read env files directly.
+local process with file access can read env files directly. `run` is the one command that hands values on: it prints
+none itself, but the command it starts receives them and can print them.
 
 See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the current local-only threat model and release safety checklist.
 

@@ -1,6 +1,6 @@
 use crate::{
-    append_env_key_result, compare_env_files, copy_env_key,
-    ensure_project_env_file, infer_key_shape, parse_env_file, redact_env_file_values_only,
+    append_env_key_result, compare_env_files, copy_env_key, ensure_project_env_file,
+    infer_key_shape, load_runtime_env, parse_env_file, redact_env_file_values_only,
     redact_snapshot_values_only, remove_env_key, rename_env_key, set_env_key, sync_example_file,
     withhold_all_env_file_payloads, withhold_all_snapshot_payloads, EnsureEnvFileOutcome,
     EnvComparison, EnvFile, EnvFileCreationDisposition, EnvFileGitStatus, EnvKeyCopyDisposition,
@@ -9,6 +9,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::env;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
@@ -63,6 +64,10 @@ const CLI_COMMANDS: &[CliCommand] = &[
     CliCommand {
         name: "create",
         parse: parse_create_args,
+    },
+    CliCommand {
+        name: "run",
+        parse: parse_run_args,
     },
 ];
 
@@ -132,6 +137,11 @@ enum Command {
         file: PathBuf,
         output: OutputFormat,
     },
+    Run {
+        files: Vec<PathBuf>,
+        program: String,
+        args: Vec<String>,
+    },
     Help(HelpTopic),
 }
 
@@ -169,6 +179,7 @@ enum HelpTopic {
     Copy,
     Create,
     Format,
+    Run,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -212,6 +223,11 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> ExitCode {
                 ExitCode::from(2)
             }
         }
+        Ok(Command::Run {
+            files,
+            program,
+            args,
+        }) => run_with_env(&files, &program, &args),
         Ok(command) => match run(command) {
             Ok(has_findings) => {
                 if has_findings {
@@ -301,6 +317,7 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             output,
         } => run_copy(&source_file, &key, &destination_file, overwrite, output),
         Command::Create { file, output } => run_create(&file, output),
+        Command::Run { .. } => unreachable!("run_from_args starts `run` itself"),
         Command::Help(_) => Ok(false),
     }
 }
@@ -842,6 +859,132 @@ fn run_copy(
     }
 
     Ok(false)
+}
+
+/// `vne run` (ADR 0005): loads env files into one command's environment and
+/// starts it. vne writes nothing on the way in, so the command's own output is
+/// the only output; refusals exit 2 before the command starts.
+fn run_with_env(files: &[PathBuf], program: &str, args: &[String]) -> ExitCode {
+    if let Some(reason) = environment_printer_refusal(program, args) {
+        let _ = stderr_line(format_args!("vne: {reason}"));
+        return ExitCode::from(2);
+    }
+    let vars = match load_runtime_env(files) {
+        Ok(vars) => vars,
+        Err(error) => {
+            let _ = stderr_line(format_args!("vne: {}", error.message()));
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut command = ProcessCommand::new(program);
+    command.args(args);
+    for var in &vars {
+        command.env(&var.key, &var.value);
+    }
+    start_command(command, program)
+}
+
+/// Replaces vne with the command, so signals, stdio and the exit status belong
+/// to the command itself. Returns only when the command could not start.
+#[cfg(unix)]
+fn start_command(mut command: ProcessCommand, program: &str) -> ExitCode {
+    use std::os::unix::process::CommandExt;
+
+    let error = command.exec();
+    command_start_failure(program, &error)
+}
+
+#[cfg(not(unix))]
+fn start_command(mut command: ProcessCommand, program: &str) -> ExitCode {
+    match command.status() {
+        Ok(status) => ExitCode::from(
+            status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .unwrap_or(1),
+        ),
+        Err(error) => command_start_failure(program, &error),
+    }
+}
+
+/// Exits the way a shell does when a command cannot start: 127 when the
+/// program is not found, 126 otherwise.
+fn command_start_failure(program: &str, error: &io::Error) -> ExitCode {
+    let _ = stderr_line(format_args!(
+        "vne: could not start `{}`: {error}",
+        argument_label(program)
+    ));
+    if error.kind() == io::ErrorKind::NotFound {
+        ExitCode::from(127)
+    } else {
+        ExitCode::from(126)
+    }
+}
+
+const ENVIRONMENT_PRINTERS: &[&str] = &["env", "printenv"];
+const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
+
+/// Refuses a command whose purpose is to print the environment `run` is about
+/// to load. This narrows a slip; it is not a boundary, because any program the
+/// caller picks can print what it receives.
+fn environment_printer_refusal(program: &str, args: &[String]) -> Option<String> {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(program);
+    if ENVIRONMENT_PRINTERS.contains(&name) {
+        return Some(format!(
+            "run refuses `{name}` as the command: it would print the keys run loads; run the program that needs them instead"
+        ));
+    }
+    if !SCRIPT_SHELLS.contains(&name) {
+        return None;
+    }
+    let script = shell_script_operand(args)?;
+    script_prints_environment(script)
+        .then(|| format!("run refuses this `{name}` script: it would print the keys run loads"))
+}
+
+/// The script of `sh -c script`: the argument after the first short-option
+/// cluster that contains `c`, such as `-c`, `-ec` or `-lc`.
+fn shell_script_operand(args: &[String]) -> Option<&str> {
+    let flag = args.iter().position(|arg| {
+        arg.len() > 1
+            && arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && arg.contains('c')
+    })?;
+    args.get(flag + 1).map(String::as_str)
+}
+
+/// Whether any simple command in the script lists the environment: `env` or
+/// `printenv`, a bare `set`, or `export`, `declare` or `typeset` with no
+/// operands except the `-p`/`-x` listing flags. The split on shell operators is
+/// deliberately coarse; quoting is not parsed.
+fn script_prints_environment(script: &str) -> bool {
+    script
+        .split([';', '|', '&', '\n', '(', ')', '`', '{', '}'])
+        .any(|segment| {
+            let mut words = segment.split_whitespace().skip_while(|word| {
+                matches!(*word, "exec" | "command" | "builtin") || word.contains('=')
+            });
+            let Some(first) = words.next() else {
+                return false;
+            };
+            let first = first.rsplit('/').next().unwrap_or(first);
+            match first {
+                "env" | "printenv" => true,
+                "set" => words.next().is_none(),
+                "export" | "declare" | "typeset" => words.all(|word| {
+                    word.len() > 1
+                        && word.starts_with('-')
+                        && word[1..].chars().all(|c| matches!(c, 'p' | 'x'))
+                }),
+                _ => false,
+            }
+        })
 }
 
 fn ensure_env_file_path(file: &Path) -> io::Result<EnsureEnvFileOutcome> {
@@ -1502,6 +1645,44 @@ fn parse_create_args(args: ArgIter) -> Result<Command, ParseError> {
     Ok(Command::Create { file, output })
 }
 
+fn parse_run_args(mut args: ArgIter) -> Result<Command, ParseError> {
+    let mut files = Vec::new();
+    loop {
+        let Some(arg) = args.next() else {
+            return Err(ParseError::new(
+                HelpTopic::Run,
+                "run requires `--` between the env files and the command",
+            ));
+        };
+        match arg.as_str() {
+            "--" => break,
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Run)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Run,
+                    format!("unknown run option `{}`", argument_label(&arg)),
+                ));
+            }
+            _ => files.push(PathBuf::from(arg)),
+        }
+    }
+
+    if files.is_empty() {
+        return Err(ParseError::new(
+            HelpTopic::Run,
+            "run requires at least one env file before `--`",
+        ));
+    }
+    let program = args
+        .next()
+        .ok_or_else(|| ParseError::new(HelpTopic::Run, "run requires a command after `--`"))?;
+    Ok(Command::Run {
+        files,
+        program,
+        args: args.collect(),
+    })
+}
+
 fn parse_copy_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut output = OutputFormat::Auto;
     let mut overwrite = false;
@@ -1630,9 +1811,9 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--allow-empty] [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--allow-empty] [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, rm, rename, and example output contains only state, paths, keys, and lines.
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--allow-empty] [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--allow-empty] [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n  vne run <file>... -- <command> [args...]\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, rm, rename, and example output contains only state, paths, keys, and lines.
   example additions are key-only placeholders; comments never travel from real files.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is a human-terminal command: it refuses piped stdout and
-  asks for confirmation before printing raw values.\n  A disposition can reveal whether a value you supplied equals the stored one;\n  vne keeps values out of its output, not every fact derived from them.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne example .env\n  vne copy ../other/.env DATABASE_URL .env\n"
+  asks for confirmation before printing raw values.\n  A disposition can reveal whether a value you supplied equals the stored one;\n  vne keeps values out of its output, not every fact derived from them.\n  run prints nothing itself; the command it starts receives the values.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne example .env\n  vne copy ../other/.env DATABASE_URL .env\n  vne run ~/.config/keys/fal.env -- falgen image \"a lighthouse\"\n"
         }
         HelpTopic::Check => {
             "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
@@ -1660,6 +1841,9 @@ fn usage_text(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::Copy => {
             "vne copy - copy one env key between existing files without exposing its value\n\nUSAGE:\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Source and destination must be distinct existing regular files.\n  The source key must occur exactly once and be well formed.\n  An absent destination key is added. An identical value reports alreadyPresent without writing.\n  That disposition tells the caller the two values are equal.\n  A different destination value requires --overwrite. Duplicate destination keys are refused.\n  The value stays inside vne; output contains only state, normalized paths, and key.\n\nOPTIONS:\n  --overwrite  Replace one different existing destination value\n  --text       Force human text output\n  --json       Emit a compact payload-free copy receipt\n  --pretty     Emit a formatted payload-free copy receipt\n\nEXAMPLE:\n  vne copy ../other/.env DATABASE_URL .env\n  vne copy ../other/.env DATABASE_URL .env --overwrite --json\n"
+        }
+        HelpTopic::Run => {
+            "vne run - start one command with env files loaded into its environment only\n\nUSAGE:\n  vne run <file>... -- <command> [args...]\n\nBEHAVIOR:\n  Keys from the files reach the command and nothing else; the calling shell never\n  holds them. A key from a file replaces an inherited variable of the same name.\n  Files are read as data. Values are literal: nothing is expanded or executed.\n  Inside quotes, only \\\\ and an escaped quote are read; any other escape refuses.\n  A line that is not an entry, a comment, or blank refuses the run, as do a\n  malformed entry, a key repeated in one file, and a key defined in two files.\n  `env`, `printenv`, and shell -c scripts that list the environment are refused.\n  That check catches a slip; any command you choose can still print what it gets.\n  vne prints nothing when the command starts. Refusals exit 2; a command that\n  cannot start exits 127 (not found) or 126, as a shell would; otherwise the\n  exit status is the command's own.\n\nEXAMPLES:\n  vne run ~/.config/keys/fal.env -- falgen image \"a lighthouse\"\n  vne run .env .env.local -- npm run dev\n  vne run keys.env -- sh -c 'printf \"Authorization: Bearer %s\\n\" \"$API_KEY\" | curl -H @- https://api.example.com'\n"
         }
         HelpTopic::Format => {
             "vne format - print the parsed env file without rewriting it\n\nWARNING:\n  This command emits raw env content. It does not apply JSON payload withholding or classified redaction.\n\nUSAGE:\n  vne format <file> --dry-run\n\nOPTIONS:\n  --dry-run  Required; print the current raw file content instead of writing\n\nEXAMPLE:\n  vne format .env --dry-run\n"
@@ -2307,5 +2491,83 @@ mod tests {
             fs::read_to_string(env_path).unwrap(),
             "PORT=1420\nPORT=3000\n"
         );
+    }
+
+    #[test]
+    fn parses_run_files_before_the_separator_and_the_command_after_it() {
+        assert_eq!(
+            parse(&["run", "a.env", "b.env", "--", "node", "--help", "--", "x"]).unwrap(),
+            Command::Run {
+                files: vec![PathBuf::from("a.env"), PathBuf::from("b.env")],
+                program: "node".to_string(),
+                args: vec!["--help".to_string(), "--".to_string(), "x".to_string()],
+            }
+        );
+        assert_eq!(
+            parse(&["run", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Run)
+        );
+    }
+
+    #[test]
+    fn rejects_run_without_a_separator_files_or_command() {
+        for (input, expected) in [
+            (&["run", "a.env", "node"][..], "run requires `--`"),
+            (&["run", "--", "node"][..], "at least one env file"),
+            (&["run", "a.env", "--"][..], "a command after `--`"),
+            (
+                &["run", "--values", "a.env", "--", "node"][..],
+                "unknown run option `--values`",
+            ),
+        ] {
+            let message = parse(input).unwrap_err();
+            assert!(message.contains(expected), "{input:?} gave {message}");
+        }
+    }
+
+    #[test]
+    fn run_refuses_commands_that_print_the_environment() {
+        let refused = [
+            ("env", vec![]),
+            ("/usr/bin/env", vec!["-0"]),
+            ("printenv", vec![]),
+            ("sh", vec!["-c", "env"]),
+            (
+                "bash",
+                vec!["-o", "pipefail", "-lc", "echo start; printenv | sort"],
+            ),
+            ("/bin/zsh", vec!["-c", "x=$(env)"]),
+            ("sh", vec!["-ec", "FOO=1 exec env"]),
+            ("bash", vec!["-c", "declare -px"]),
+            ("sh", vec!["-c", "true && export"]),
+            ("sh", vec!["-c", "set"]),
+        ];
+        for (program, args) in refused {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(
+                environment_printer_refusal(program, &args).is_some(),
+                "{program} {args:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn run_allows_ordinary_commands_and_scripts() {
+        let allowed = [
+            ("node", vec!["server.js"]),
+            ("envoy", vec![]),
+            ("sh", vec!["./deploy.sh", "env"]),
+            ("sh", vec!["-c", "set -euo pipefail; node x.js"]),
+            ("bash", vec!["-c", "export PATH=/opt/bin:$PATH; make"]),
+            ("sh", vec!["-c", "grep env README.md"]),
+            ("python3", vec!["-c", "import os; print(os.environ)"]),
+        ];
+        for (program, args) in allowed {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(
+                environment_printer_refusal(program, &args).is_none(),
+                "{program} {args:?} should be allowed"
+            );
+        }
     }
 }

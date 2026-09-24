@@ -2395,3 +2395,124 @@ fn copy_allows_withheld_value_out_of_its_project_on_a_terminal() {
         "the destination must carry the value on the terminal path"
     );
 }
+
+const RUN_SENTINEL: &str = "RunKeyM4N";
+
+fn run_vne_run(keys: &[&Path], command: &[&str]) -> Output {
+    let mut vne = Command::new(env!("CARGO_BIN_EXE_vne"));
+    vne.arg("run");
+    vne.args(keys);
+    vne.arg("--");
+    vne.args(command);
+    vne.env("RUN_KEY", "InheritedP5Q")
+        .output()
+        .expect("vne process should run")
+}
+
+fn assert_no_run_sentinel(output: &Output) {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !text.contains(RUN_SENTINEL),
+        "vne output named the value: {text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_hands_file_keys_to_the_command_and_prints_none_of_them() {
+    let dir = tempdir().unwrap();
+    let keys = dir.path().join("keys.env");
+    write(
+        &keys,
+        &format!("# keys\nexport RUN_KEY=\"{RUN_SENTINEL} \\\"quoted\\\" $HOME\"\nOTHER=plain\n"),
+    );
+    let received = dir.path().join("received.txt");
+    let received = received.to_str().unwrap();
+
+    let output = run_vne_run(
+        &[&keys],
+        &[
+            "sh",
+            "-c",
+            r#"printf %s "$RUN_KEY" > "$1"; exit 7"#,
+            "sh",
+            received,
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the command's exit status passes through"
+    );
+    assert_eq!(
+        fs::read_to_string(received).unwrap(),
+        format!("{RUN_SENTINEL} \"quoted\" $HOME"),
+        "the file value replaces the inherited one, literally"
+    );
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_refusals_start_nothing_and_name_no_value() {
+    let dir = tempdir().unwrap();
+    let keys = dir.path().join("keys.env");
+    write(&keys, &format!("RUN_KEY={RUN_SENTINEL}\n"));
+    let clash = dir.path().join("clash.env");
+    write(&clash, &format!("RUN_KEY={RUN_SENTINEL}x\n"));
+    let sourced = dir.path().join("sourced.env");
+    write(&sourced, &format!("set -a\nRUN_KEY={RUN_SENTINEL}\n"));
+    let escaped = dir.path().join("escaped.env");
+    write(&escaped, &format!("RUN_KEY=\"{RUN_SENTINEL}\\n\"\n"));
+    let marker = dir.path().join("started");
+    let marker = marker.to_str().unwrap();
+    let touch = ["sh", "-c", r#": > "$1""#, "sh", marker];
+
+    let cases: [(Vec<&Path>, &[&str], &str); 5] = [
+        (vec![&keys], &["env"], "run refuses `env`"),
+        (
+            vec![&keys],
+            &["sh", "-c", "printenv | sort"],
+            "run refuses this `sh` script",
+        ),
+        (vec![&keys, &clash], &touch, "`RUN_KEY` is defined in both"),
+        (vec![&sourced], &touch, "line 1 is not a KEY=value entry"),
+        (vec![&escaped], &touch, "uses a backslash escape"),
+    ];
+    for (files, command, expected) in cases {
+        let output = run_vne_run(&files, command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{command:?}: {stderr}");
+        assert!(stderr.contains(expected), "{command:?}: {stderr}");
+        assert!(output.stdout.is_empty());
+        assert_no_run_sentinel(&output);
+        assert!(
+            !Path::new(marker).exists(),
+            "{expected}: the command must not start"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_exits_like_a_shell_when_the_command_cannot_start() {
+    let dir = tempdir().unwrap();
+    let keys = dir.path().join("keys.env");
+    write(&keys, &format!("RUN_KEY={RUN_SENTINEL}\n"));
+    let not_executable = dir.path().join("plain.txt");
+    write(&not_executable, "");
+
+    let missing = run_vne_run(&[&keys], &["/nonexistent/vne-run-probe"]);
+    assert_eq!(missing.status.code(), Some(127));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("could not start"));
+    assert_no_run_sentinel(&missing);
+
+    let denied = run_vne_run(&[&keys], &[not_executable.to_str().unwrap()]);
+    assert_eq!(denied.status.code(), Some(126));
+    assert_no_run_sentinel(&denied);
+}
