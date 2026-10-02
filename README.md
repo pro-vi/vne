@@ -47,7 +47,10 @@ Commands that look at files:
 ```sh
 vne inspect .                              # every env file in a project
 vne check .env --example .env.example      # missing, extra, shared, duplicate keys
+vne where OPENAI_API_KEY . ~/.config/keys  # which file holds a key, and whether it is set
 ```
+
+`where` searches the current directory when given no path, and only the paths you name otherwise.
 
 `vne help` lists every option; `vne <command> --help` has examples.
 
@@ -67,9 +70,9 @@ Files are read as data, not shell code. `run` refuses to start if a line is not 
 - **Key meaning.** URL/DSN, secret, public frontend variable, bool, int, port, JSON, PEM, and common provider keys are labelled inline. A public-prefixed name that looks secret, such as `NEXT_PUBLIC_API_KEY`, is flagged as browser-exposed.
 - **Duplicates.** `add` refuses a duplicate and prints the existing line numbers. The editor asks which occurrence to change. `rm` needs `--line <N>` or `--all` for a duplicated key.
 - **Faithful edits.** One occurrence changes; comments, order, quote style, `export` prefixes, and multiline values around it do not. Tests cover CRLF, UTF-8 BOM, empty values, inline comments, `#` inside values, and the [adversarial corpus](fixtures/adversarial-dotenv).
-- **File discovery.** `.env`, `.env.local`, `.env.production`, `.env.example`, `.env.sample`, `.envrc`, `.flaskenv`, plus files named by `package.json` scripts (`--env-file`, `dotenv -e`, `env-cmd -f`, `DOTENV_CONFIG_PATH`) and Docker Compose `env_file`.
+- **File discovery.** `.env`, `.env.local`, `.env.production`, `.env.example`, `.env.sample`, `.envrc`, `.flaskenv`, plus files named by `package.json` scripts (`--env-file`, `dotenv -e`, `env-cmd -f`, `DOTENV_CONFIG_PATH`) and Docker Compose `env_file`. A symlink or special file with one of these names in the project directory is not followed; the scan reports it as not read.
 - **Layers.** Reports overrides across real env files. It names a winner only when Next.js or Vite load-order rules explain it.
-- **Git exposure.** `inspect` and `check` report each file as `tracked`, `untrackedIgnored`, `untrackedNotIgnored`, `outsideRepository`, or `unknown`. Every write warns on stderr if it landed in a tracked file. The warning never blocks the write.
+- **Git exposure.** `inspect` and `check` report each file, and `where` each match, as `tracked`, `untrackedIgnored`, `untrackedNotIgnored`, `outsideRepository`, or `unknown`. Every write warns on stderr if it landed in a tracked file. The warning never blocks the write.
 - **Refuses what it cannot prove.** `rename` refuses when the old key is gone and the new one is present, because file state cannot show that a rename produced it. `--expect present|absent` turns a wrong belief about a key into exit 2.
 
 ## Privacy
@@ -79,12 +82,13 @@ Env values never appear in vne's output.
 | Surface | What it shows |
 | --- | --- |
 | Desktop snapshot | Secret-like values, secret-like inline comments, and credential-bearing URLs redacted. Reveal fetches one selected occurrence into the local webview and clears it on hide, selection change, reload, or save. |
-| CLI JSON (piped output) | No values, comments, or raw previews. `--values` adds values the classifier judges non-secret; detected secrets stay redacted. |
+| CLI JSON (piped output) | No values, comments, or raw previews. Each entry's `valueState` says `set`, `empty`, or `placeholder`. `--values` adds values the classifier judges non-secret; detected secrets stay redacted. |
 | `create`, `copy`, `set`, `rm`, `rename`, `example` | Receipts only: disposition, paths, key names, line numbers. |
+| `where` | Key name, paths, line numbers, git status, each value's state, and which discovered files it did not read. |
 | `run` | Prints nothing. The command it starts receives the values and can print them. |
 | `format --dry-run` | Prints raw values. Refuses piped stdout and asks for an interactive `y`. |
 
-Two limits. A disposition such as `alreadyPresent` tells the caller that the value it supplied equals the stored one. And any local process with file access can read env files directly. Threat model and release checklist: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+Two limits. Some facts about values do appear: a disposition such as `alreadyPresent` tells the caller that the value it supplied equals the stored one, and `valueState` tells whether a value is empty or a template such as `changeme`. And any local process with file access can read env files directly. Threat model and release checklist: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 ## Development
 

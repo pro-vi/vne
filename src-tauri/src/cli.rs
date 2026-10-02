@@ -5,7 +5,7 @@ use crate::{
     withhold_all_env_file_payloads, withhold_all_snapshot_payloads, EnsureEnvFileOutcome,
     EnvComparison, EnvFile, EnvFileCreationDisposition, EnvFileGitStatus, EnvKeyCopyDisposition,
     EnvKeyExpectation, EnvKeyRemoveDisposition, EnvKeyRemoveSelector, EnvKeySetDisposition,
-    ExampleSyncDisposition, ProjectSnapshot,
+    EnvValueState, ExampleSyncDisposition, IncompleteEnvFile, ProjectSnapshot,
 };
 use serde::Serialize;
 use std::env;
@@ -69,9 +69,14 @@ const CLI_COMMANDS: &[CliCommand] = &[
         name: "run",
         parse: parse_run_args,
     },
+    CliCommand {
+        name: "where",
+        parse: parse_where_args,
+    },
 ];
 
 const CLI_HELP_ALIASES: &[&str] = &["help", "-h", "--help"];
+const CLI_VERSION_ALIASES: &[&str] = &["--version", "-V"];
 
 fn cli_command(name: &str) -> Option<&'static CliCommand> {
     CLI_COMMANDS.iter().find(|command| command.name == name)
@@ -142,7 +147,13 @@ enum Command {
         program: String,
         args: Vec<String>,
     },
+    Where {
+        key: String,
+        paths: Vec<PathBuf>,
+        output: OutputFormat,
+    },
     Help(HelpTopic),
+    Version,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -180,6 +191,7 @@ enum HelpTopic {
     Create,
     Format,
     Run,
+    Where,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -205,9 +217,40 @@ struct CheckOutput {
     comparison: Option<EnvComparison>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WhereOutput {
+    key: String,
+    found: bool,
+    matches: Vec<WhereMatch>,
+    searched: Vec<WhereSearch>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WhereMatch {
+    path: String,
+    line_number: usize,
+    value_state: EnvValueState,
+    git_status: EnvFileGitStatus,
+}
+
+/// What one path argument covered, so a miss shows its own scope: a directory
+/// with no env files reads differently from a key absent from ten files.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WhereSearch {
+    path: String,
+    files: Vec<String>,
+    incomplete: Vec<IncompleteEnvFile>,
+}
+
 pub fn is_cli_invocation(args: &[String]) -> bool {
-    args.first()
-        .is_some_and(|arg| cli_command(arg).is_some() || CLI_HELP_ALIASES.contains(&arg.as_str()))
+    args.first().is_some_and(|arg| {
+        cli_command(arg).is_some()
+            || CLI_HELP_ALIASES.contains(&arg.as_str())
+            || CLI_VERSION_ALIASES.contains(&arg.as_str())
+    })
 }
 
 pub fn run_from_env() -> ExitCode {
@@ -216,12 +259,9 @@ pub fn run_from_env() -> ExitCode {
 
 pub fn run_from_args(args: impl IntoIterator<Item = String>) -> ExitCode {
     match parse_args(args) {
-        Ok(Command::Help(topic)) => {
-            if print_usage(topic).is_ok() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(2)
-            }
+        Ok(Command::Help(topic)) => exit_after_print(print_usage(topic)),
+        Ok(Command::Version) => {
+            exit_after_print(stdout_line(format_args!("{}", version_text())))
         }
         Ok(Command::Run {
             files,
@@ -247,6 +287,14 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> ExitCode {
             let _ = print_usage_to_stderr(error.topic);
             ExitCode::from(2)
         }
+    }
+}
+
+fn exit_after_print(printed: io::Result<()>) -> ExitCode {
+    if printed.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
     }
 }
 
@@ -317,8 +365,9 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error>> {
             output,
         } => run_copy(&source_file, &key, &destination_file, overwrite, output),
         Command::Create { file, output } => run_create(&file, output),
+        Command::Where { key, paths, output } => run_where(&key, &paths, output),
         Command::Run { .. } => unreachable!("run_from_args starts `run` itself"),
-        Command::Help(_) => Ok(false),
+        Command::Help(_) | Command::Version => Ok(false),
     }
 }
 
@@ -619,6 +668,123 @@ fn run_inspect(
     }
 
     Ok(has_findings)
+}
+
+/// Reports every occurrence of `key` in the env files each path names or
+/// discovers. Returns true, for exit 1, only when every discovered file was
+/// read and none holds the key; a miss with files left unread is an error,
+/// because one of them may hold the key or name an env file that does.
+fn run_where(
+    key: &str,
+    paths: &[PathBuf],
+    output_format: OutputFormat,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut matches = Vec::new();
+    let mut searched = Vec::new();
+
+    for path in paths {
+        let (root, files, incomplete) = if path.is_dir() {
+            let snapshot = crate::snapshot_project(path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("could not scan {}: {error}", path.display()),
+                )
+            })?;
+            (snapshot.root, snapshot.files, snapshot.incomplete)
+        } else {
+            let file = load_env_file(path)?;
+            (file.path.clone(), vec![file], Vec::new())
+        };
+
+        for file in &files {
+            matches.extend(
+                file.entries
+                    .iter()
+                    .filter(|entry| entry.key == key)
+                    .map(|entry| WhereMatch {
+                        path: file.path.clone(),
+                        line_number: entry.line_number,
+                        value_state: entry.value_state,
+                        git_status: file.git_status,
+                    }),
+            );
+        }
+        searched.push(WhereSearch {
+            path: root,
+            files: files.into_iter().map(|file| file.path).collect(),
+            incomplete,
+        });
+    }
+
+    let found = !matches.is_empty();
+    let unread = searched
+        .iter()
+        .map(|search| search.incomplete.len())
+        .sum::<usize>();
+    let output = WhereOutput {
+        key: key.to_string(),
+        found,
+        matches,
+        searched,
+    };
+
+    if output_format.wants_json() {
+        print_json(&output, output_format)?;
+    } else {
+        print_where_text(&output)?;
+    }
+
+    if !found && unread > 0 {
+        return Err(format!(
+            "`{key}` was not found, but {unread} discovered file(s) were not read"
+        )
+        .into());
+    }
+    Ok(!found)
+}
+
+fn print_where_text(output: &WhereOutput) -> io::Result<()> {
+    if output.found {
+        stdout_line(format_args!("{}", output.key))?;
+        for found in &output.matches {
+            stdout_line(format_args!(
+                "  {}:{}  {}, {}",
+                found.path,
+                found.line_number,
+                found.value_state.label(),
+                found.git_status.label()
+            ))?;
+        }
+    } else {
+        stdout_line(format_args!("{} not found", output.key))?;
+    }
+
+    for search in &output.searched {
+        if !output.found {
+            match search.files.len() {
+                0 => stdout_line(format_args!("  {}: no env files", search.path))?,
+                count => stdout_line(format_args!(
+                    "  {}: {count} env file(s) searched",
+                    search.path
+                ))?,
+            }
+        }
+        for skipped in &search.incomplete {
+            stdout_line(format_args!(
+                "  {}: not read: {} ({})",
+                search.path, skipped.name, skipped.reason
+            ))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn version_text() -> String {
+    match option_env!("VNE_GIT_COMMIT") {
+        Some(commit) => format!("vne {} ({commit})", env!("CARGO_PKG_VERSION")),
+        None => format!("vne {}", env!("CARGO_PKG_VERSION")),
+    }
 }
 
 fn run_format(file: &Path, dry_run: bool) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1148,6 +1314,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, ParseEr
 
     if CLI_HELP_ALIASES.contains(&command.as_str()) {
         return Ok(Command::Help(HelpTopic::General));
+    }
+    if CLI_VERSION_ALIASES.contains(&command.as_str()) {
+        return Ok(Command::Version);
     }
 
     let Some(entry) = cli_command(&command) else {
@@ -1683,6 +1852,49 @@ fn parse_run_args(mut args: ArgIter) -> Result<Command, ParseError> {
     })
 }
 
+fn parse_where_args(args: ArgIter) -> Result<Command, ParseError> {
+    let mut output = OutputFormat::Auto;
+    let mut positionals = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "--text" => set_output_format(&mut output, OutputFormat::Text, HelpTopic::Where)?,
+            "--json" => set_output_format(&mut output, OutputFormat::Json, HelpTopic::Where)?,
+            "--pretty" => {
+                set_output_format(&mut output, OutputFormat::PrettyJson, HelpTopic::Where)?
+            }
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Where)),
+            _ if arg.starts_with('-') => {
+                return Err(ParseError::new(
+                    HelpTopic::Where,
+                    format!("unknown where option `{}`", argument_label(&arg)),
+                ));
+            }
+            _ => positionals.push(arg),
+        }
+    }
+
+    let mut positionals = positionals.into_iter();
+    let Some(key) = positionals.next() else {
+        return Err(ParseError::new(HelpTopic::Where, "where requires a <KEY>"));
+    };
+    if key.is_empty() {
+        return Err(ParseError::new(
+            HelpTopic::Where,
+            "where requires a non-empty key",
+        ));
+    }
+    if key.contains('=') {
+        return Err(assignment_in_key_slot(HelpTopic::Where, "where"));
+    }
+    let mut paths = positionals.map(PathBuf::from).collect::<Vec<_>>();
+    if paths.is_empty() {
+        paths.push(PathBuf::from("."));
+    }
+
+    Ok(Command::Where { key, paths, output })
+}
+
 fn parse_copy_args(args: ArgIter) -> Result<Command, ParseError> {
     let mut output = OutputFormat::Auto;
     let mut overwrite = false;
@@ -1811,9 +2023,9 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--allow-empty] [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--allow-empty] [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n  vne run <file>... -- <command> [args...]\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  copy, set, rm, rename, and example output contains only state, paths, keys, and lines.
-  example additions are key-only placeholders; comments never travel from real files.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is a human-terminal command: it refuses piped stdout and
-  asks for confirmation before printing raw values.\n  A disposition can reveal whether a value you supplied equals the stored one;\n  vne keeps values out of its output, not every fact derived from them.\n  run prints nothing itself; the command it starts receives the values.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne example .env\n  vne copy ../other/.env DATABASE_URL .env\n  vne run ~/.config/keys/fal.env -- falgen image \"a lighthouse\"\n"
+            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--allow-empty] [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--allow-empty] [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n  vne run <file>... -- <command> [args...]\n  vne where <KEY> [path...] [--text|--json|--pretty]\n  vne --version\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  Each entry's valueState says whether the stored value is set, empty, or a\n  placeholder such as changeme, with or without --values.\n  copy, set, rm, rename, and example output contains only state, paths, keys, and lines.
+  example additions are key-only placeholders; comments never travel from real files.\n  where output contains only the key, paths, lines, value states, git status,\n  and the name and reason of each discovered file it did not read.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is a human-terminal command: it refuses piped stdout and
+  asks for confirmation before printing raw values.\n  A disposition can reveal whether a value you supplied equals the stored one,\n  and valueState whether a value is empty or a template; vne keeps values out of\n  its output, not every fact derived from them.\n  run prints nothing itself; the command it starts receives the values.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne where OPENAI_API_KEY . ~/.config/keys\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne example .env\n  vne copy ../other/.env DATABASE_URL .env\n  vne run ~/.config/keys/fal.env -- falgen image \"a lighthouse\"\n"
         }
         HelpTopic::Check => {
             "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
@@ -1844,6 +2056,9 @@ fn usage_text(topic: HelpTopic) -> &'static str {
         }
         HelpTopic::Run => {
             "vne run - start one command with env files loaded into its environment only\n\nUSAGE:\n  vne run <file>... -- <command> [args...]\n\nBEHAVIOR:\n  Keys from the files reach the command and nothing else; the calling shell never\n  holds them. A key from a file replaces an inherited variable of the same name.\n  Files are read as data. Values are literal: nothing is expanded or executed.\n  Inside quotes, only \\\\ and an escaped quote are read; any other escape refuses.\n  A line that is not an entry, a comment, or blank refuses the run, as do a\n  malformed entry, a key repeated in one file, and a key defined in two files.\n  `env`, `printenv`, and shell -c scripts that list the environment are refused.\n  That check catches a slip; any command you choose can still print what it gets.\n  vne prints nothing when the command starts. Refusals exit 2; a command that\n  cannot start exits 127 (not found) or 126, as a shell would; otherwise the\n  exit status is the command's own.\n\nEXAMPLES:\n  vne run ~/.config/keys/fal.env -- falgen image \"a lighthouse\"\n  vne run .env .env.local -- npm run dev\n  vne run keys.env -- sh -c 'printf \"Authorization: Bearer %s\\n\" \"$API_KEY\" | curl -H @- https://api.example.com'\n"
+        }
+        HelpTopic::Where => {
+            "vne where - find which env files hold a key, without printing its value\n\nUSAGE:\n  vne where <KEY> [path...] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Each path is a project directory, scanned the way `vne inspect` scans one, or a\n  single env file. With no path, the current directory is scanned. Directories\n  are not searched recursively, and no other location is searched unless named.\n  A symlink with an env filename is not followed and is reported as not read;\n  name the symlink as a path to read the file it points to.\n  Each match reports its file, line, value state, and git status. Values never\n  appear. A value of only whitespace or quote characters counts as empty; a\n  template such as changeme, todo, tbd, your_..., or <...> (any case) counts as\n  placeholder.\n  Exit 2 when a named path cannot be read, even if another path holds the key,\n  or when the key is not found and a discovered file was not read. Otherwise\n  exit 0 when the key is found and 1 when it is not.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit compact one-line JSON\n  --pretty  Emit formatted JSON\n\nEXAMPLES:\n  vne where OPENAI_API_KEY\n  vne where FAL_KEY . ~/.config/keys\n  vne where DATABASE_URL .env.local --json\n"
         }
         HelpTopic::Format => {
             "vne format - print the parsed env file without rewriting it\n\nWARNING:\n  This command emits raw env content. It does not apply JSON payload withholding or classified redaction.\n\nUSAGE:\n  vne format <file> --dry-run\n\nOPTIONS:\n  --dry-run  Required; print the current raw file content instead of writing\n\nEXAMPLE:\n  vne format .env --dry-run\n"
@@ -2247,6 +2462,40 @@ mod tests {
             assert!(is_cli_invocation(&[alias.to_string()]));
             assert_eq!(parse(&[alias]), Ok(Command::Help(HelpTopic::General)));
         }
+    }
+
+    #[test]
+    fn version_aliases_resolve_to_version() {
+        for alias in CLI_VERSION_ALIASES {
+            assert!(is_cli_invocation(&[alias.to_string()]));
+            assert_eq!(parse(&[alias]), Ok(Command::Version));
+        }
+    }
+
+    #[test]
+    fn parses_where_with_current_directory_default_and_named_paths() {
+        assert_eq!(
+            parse(&["where", "OPENAI_API_KEY"]),
+            Ok(Command::Where {
+                key: "OPENAI_API_KEY".to_string(),
+                paths: vec![PathBuf::from(".")],
+                output: OutputFormat::Auto,
+            })
+        );
+        assert_eq!(
+            parse(&["where", "FAL_KEY", ".", "/keys", "--json"]),
+            Ok(Command::Where {
+                key: "FAL_KEY".to_string(),
+                paths: vec![PathBuf::from("."), PathBuf::from("/keys")],
+                output: OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn where_parser_rejects_missing_and_empty_keys() {
+        assert!(parse(&["where"]).is_err());
+        assert!(parse(&["where", ""]).is_err());
     }
 
     #[test]

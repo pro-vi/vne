@@ -3,8 +3,8 @@ export interface ProjectSnapshot {
   files: EnvFile[];
   /** Discovered candidates that could NOT be inspected, with a typed
    * reason ('unreadable' | 'invalid-utf8' | 'oversize' | 'count-limit' |
-   * 'scan-timeout') — a scan is never "complete" while this is silently
-   * empty (VNE-SEC-010; harden F0022 sync). */
+   * 'scan-timeout' | 'not-regular-file') — a scan is never "complete" while
+   * this is silently empty (VNE-SEC-010; harden F0022 sync). */
   incomplete: IncompleteEnvFile[];
   comparison: EnvComparison | null;
   layerReport: EnvLayerReport;
@@ -47,6 +47,7 @@ export interface EnvEntry {
   key: string;
   value: string;
   displayValue: string;
+  valueState: EnvValueState;
   lineNumber: number;
   exported: boolean;
   quote: string | null;
@@ -54,6 +55,8 @@ export interface EnvEntry {
   shape: KeyShape;
   diagnostics: string[];
 }
+
+export type EnvValueState = 'set' | 'empty' | 'placeholder';
 
 export interface KeyShape {
   kind: string;

@@ -1842,6 +1842,10 @@ fn a_rejected_argument_never_echoes_the_value_half_to_stderr() {
             vec!["rm".into(), path.clone(), assignment.clone()],
         ),
         (
+            "where key slot",
+            vec!["where".into(), assignment.clone(), path.clone()],
+        ),
+        (
             "rename source slot",
             vec![
                 "rename".into(),
@@ -2515,4 +2519,247 @@ fn run_exits_like_a_shell_when_the_command_cannot_start() {
     let denied = run_vne_run(&[&keys], &[not_executable.to_str().unwrap()]);
     assert_eq!(denied.status.code(), Some(126));
     assert_no_run_sentinel(&denied);
+}
+
+#[test]
+fn value_state_survives_both_output_policies() {
+    let dir = tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    write(
+        &env_file,
+        &format!(
+            "SESSION_TOKEN={ORDINARY_SENTINEL}\nEMPTY_TOKEN=\nQUOTED_TOKEN=\"\"\nTEMPLATE_TOKEN=changeme\n"
+        ),
+    );
+
+    for policy in [None, Some("--values")] {
+        let mut args = vec![
+            "check".to_string(),
+            env_file.display().to_string(),
+            "--json".to_string(),
+        ];
+        args.extend(policy.map(str::to_string));
+        let output = run_vne(args);
+
+        assert_eq!(output.status.code(), Some(0), "{policy:?}");
+        let json = assert_payload_absent(&output, &[ORDINARY_SENTINEL]);
+        let states = json["file"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["key"].as_str().unwrap(),
+                    entry["valueState"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            [
+                ("SESSION_TOKEN", "set"),
+                ("EMPTY_TOKEN", "empty"),
+                ("QUOTED_TOKEN", "empty"),
+                ("TEMPLATE_TOKEN", "placeholder"),
+            ],
+            "{policy:?}"
+        );
+    }
+}
+
+fn where_match_summary(json: &Value) -> Vec<(String, u64, String)> {
+    json["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|found| {
+            let path = Path::new(found["path"].as_str().unwrap());
+            (
+                path.file_name().unwrap().to_string_lossy().to_string(),
+                found["lineNumber"].as_u64().unwrap(),
+                found["valueState"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn where_reports_file_line_and_state_without_values() {
+    let dir = tempdir().unwrap();
+    write(
+        &dir.path().join(".env"),
+        &format!("PORT=1420\nSESSION_TOKEN={ORDINARY_SENTINEL}\n"),
+    );
+    write(&dir.path().join(".env.example"), "SESSION_TOKEN=\n");
+    let project = dir.path().display().to_string();
+
+    let json_output = run_vne(["where", "SESSION_TOKEN", &project, "--json"]);
+    assert_eq!(json_output.status.code(), Some(0));
+    let json = assert_payload_absent(&json_output, &[ORDINARY_SENTINEL]);
+    assert_eq!(json["found"], true);
+    assert_eq!(
+        where_match_summary(&json),
+        [
+            (".env".to_string(), 2, "set".to_string()),
+            (".env.example".to_string(), 1, "empty".to_string()),
+        ]
+    );
+
+    let text_output = run_vne(["where", "SESSION_TOKEN", &project, "--text"]);
+    assert_eq!(text_output.status.code(), Some(0));
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    assert!(!text.contains(ORDINARY_SENTINEL), "{text}");
+    assert!(text.contains(".env:2  set"), "{text}");
+}
+
+#[test]
+fn where_searches_a_named_file_and_every_named_path() {
+    let project = tempdir().unwrap();
+    let keys = tempdir().unwrap();
+    write(&project.path().join(".env"), "PORT=1420\n");
+    let keys_file = keys.path().join("service.env");
+    write(&keys_file, &format!("SERVICE_TOKEN={ORDINARY_SENTINEL}\n"));
+
+    let output = run_vne([
+        "where",
+        "SERVICE_TOKEN",
+        &project.path().display().to_string(),
+        &keys_file.display().to_string(),
+        "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let json = assert_payload_absent(&output, &[ORDINARY_SENTINEL]);
+    assert_eq!(
+        where_match_summary(&json),
+        [("service.env".to_string(), 1, "set".to_string())]
+    );
+    assert_eq!(json["searched"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn where_miss_exits_one_and_names_the_searched_scope() {
+    let project = tempdir().unwrap();
+    let empty = tempdir().unwrap();
+    write(&project.path().join(".env"), "PORT=1420\n");
+
+    let output = run_vne([
+        "where",
+        "SESSION_TOKEN",
+        &project.path().display().to_string(),
+        &empty.path().display().to_string(),
+        "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["found"], false);
+    let searched_counts = json["searched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|search| search["files"].as_array().unwrap().len())
+        .collect::<Vec<_>>();
+    assert_eq!(searched_counts, [1, 0]);
+}
+
+#[test]
+fn where_refuses_a_missing_path() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("missing-project");
+
+    let output = run_vne(["where", "PORT", &missing.display().to_string(), "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn where_miss_beside_an_unreadable_file_is_an_error_not_a_miss() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    write(&dir.path().join(".env"), "PORT=1420\n");
+    let unreadable = dir.path().join(".env.local");
+    write(&unreadable, "SESSION_TOKEN=1\n");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(
+        fs::read(&unreadable).is_err(),
+        "this test needs a user whose file permissions block the read"
+    );
+    let project = dir.path().display().to_string();
+
+    let missed = run_vne(["where", "SESSION_TOKEN", &project, "--json"]);
+    assert_eq!(missed.status.code(), Some(2));
+    let json: Value = serde_json::from_slice(&missed.stdout).unwrap();
+    assert_eq!(json["searched"][0]["incomplete"][0]["reason"], "unreadable");
+
+    let found = run_vne(["where", "PORT", &project, "--json"]);
+    assert_eq!(found.status.code(), Some(0));
+}
+
+#[test]
+fn version_names_the_crate_version_and_build_commit() {
+    let output = run_vne(["--version"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with(&format!("vne {}", env!("CARGO_PKG_VERSION"))),
+        "{stdout}"
+    );
+    if let Some(commit) = option_env!("VNE_GIT_COMMIT") {
+        assert!(stdout.contains(commit), "{stdout}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn where_reports_a_symlinked_env_file_as_not_read_instead_of_missing() {
+    let outside = tempdir().unwrap();
+    let target = outside.path().join("shared.env");
+    write(&target, &format!("SESSION_TOKEN={ORDINARY_SENTINEL}\n"));
+    let project = tempdir().unwrap();
+    let link = project.path().join(".env");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let scanned = run_vne([
+        "where",
+        "SESSION_TOKEN",
+        &project.path().display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(scanned.status.code(), Some(2));
+    let json = assert_payload_absent(&scanned, &[ORDINARY_SENTINEL]);
+    assert_eq!(json["searched"][0]["incomplete"][0]["name"], ".env");
+    assert_eq!(
+        json["searched"][0]["incomplete"][0]["reason"],
+        "not-regular-file"
+    );
+
+    let named = run_vne(["where", "SESSION_TOKEN", &link.display().to_string(), "--json"]);
+    assert_eq!(named.status.code(), Some(0));
+    let json = assert_payload_absent(&named, &[ORDINARY_SENTINEL]);
+    assert_eq!(json["found"], true);
+
+    // The record comes from the shared scan, so `inspect` reports it too.
+    let inspected = run_vne(["inspect", &project.path().display().to_string(), "--json"]);
+    assert_eq!(inspected.status.code(), Some(1));
+    let json = assert_payload_absent(&inspected, &[ORDINARY_SENTINEL]);
+    assert_eq!(json["incomplete"][0]["reason"], "not-regular-file");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_with_an_env_name_is_not_reported() {
+    let outside = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    write(&project.path().join(".env.local"), "PORT=1420\n");
+    std::os::unix::fs::symlink(outside.path(), project.path().join(".env")).unwrap();
+
+    let output = run_vne(["where", "SESSION_TOKEN", &project.path().display().to_string(), "--json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["searched"][0]["incomplete"], serde_json::json!([]));
 }

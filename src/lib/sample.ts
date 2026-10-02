@@ -1,4 +1,4 @@
-import type { ProjectSnapshot } from './types';
+import type { EnvEntry, ProjectSnapshot } from './types';
 
 const basePath = '/demo/project/.env';
 const examplePath = '/demo/project/.env.example';
@@ -227,7 +227,7 @@ function entry(
   reasons: string[],
   diagnostics: string[] = [],
   comment: string | null = null
-) {
+): EnvEntry {
   const exposure = reasons.includes('frontend-exposed prefix') ? 'browser' : null;
 
   return {
@@ -235,6 +235,7 @@ function entry(
     key,
     value,
     displayValue: redacted ? '********' : value,
+    valueState: value.trim() === '' ? 'empty' : 'set',
     lineNumber,
     exported: false,
     quote: null,

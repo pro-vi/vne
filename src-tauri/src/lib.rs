@@ -36,6 +36,7 @@ pub struct ProjectSnapshot {
 pub struct IncompleteEnvFile {
     pub name: String,
     /// "unreadable" | "invalid-utf8" | "oversize" | "count-limit" | "scan-timeout"
+    /// | "not-regular-file"
     pub reason: &'static str,
 }
 
@@ -185,12 +186,39 @@ pub struct EnvEntry {
     pub key: String,
     pub value: String,
     pub display_value: String,
+    /// Judged from the stored value at parse time; an output policy that
+    /// withholds or redacts `value` must carry this through unchanged.
+    pub value_state: EnvValueState,
     pub line_number: usize,
     pub exported: bool,
     pub quote: Option<String>,
     pub comment: Option<String>,
     pub shape: KeyShape,
     pub diagnostics: Vec<String>,
+}
+
+/// Whether an entry's stored value is set, empty, or a template. Withheld
+/// output replaces every value with `ALL_VALUES_WITHHELD`, and `--values`
+/// output clears a redacted `value` and masks its `display_value`, so neither
+/// field can answer this.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnvValueState {
+    Set,
+    Empty,
+    /// A template value such as `changeme` or `<your-key>`.
+    Placeholder,
+}
+
+impl EnvValueState {
+    /// Short label for human text output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Empty => "empty",
+            Self::Placeholder => "placeholder",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1026,19 +1054,27 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     let scan_started = std::time::Instant::now();
     clear_discovery_seen();
     let mut discovered = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+    let mut not_regular = BTreeSet::new();
 
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
-        if entry.file_type()?.is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if is_env_file_name(&name) {
-                add_discovered_env_file(
-                    &root,
-                    entry.path(),
-                    format!("direct env filename `{name}`"),
-                    &mut discovered,
-                );
-            }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_env_file_name(&name) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_file() {
+            add_discovered_env_file(
+                &root,
+                entry.path(),
+                format!("direct env filename `{name}`"),
+                &mut discovered,
+            );
+        } else if !file_type.is_dir() && !(file_type.is_symlink() && entry.path().is_dir()) {
+            // A symlink, FIFO, or device with an env filename is not read,
+            // and is reported so that a scan never looks complete without it.
+            // A directory such as a virtualenv named `.env` holds no env text.
+            not_regular.insert(name);
         }
     }
 
@@ -1063,7 +1099,13 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
     // Every discovered candidate resolves to exactly one terminal outcome:
     // a parsed file or an explicit incomplete record (VNE-SEC-010).
     let mut files = Vec::new();
-    let mut incomplete = Vec::new();
+    let mut incomplete = not_regular
+        .into_iter()
+        .map(|name| IncompleteEnvFile {
+            name,
+            reason: "not-regular-file",
+        })
+        .collect::<Vec<_>>();
     // Harden F0009: discovery anomalies surface as typed incompletes.
     for note in discovery_notes {
         if let Some((name, reason)) = note.split_once(':') {
@@ -1286,6 +1328,7 @@ fn withhold_env_entry_context(entry: EnvEntry) -> EnvEntry {
         key,
         value,
         display_value,
+        value_state,
         line_number,
         exported,
         quote,
@@ -1299,6 +1342,7 @@ fn withhold_env_entry_context(entry: EnvEntry) -> EnvEntry {
         key,
         value,
         display_value,
+        value_state,
         line_number,
         exported,
         quote,
@@ -1314,6 +1358,7 @@ fn withhold_all_env_entry_payloads(entry: EnvEntry) -> EnvEntry {
         key,
         value: _,
         display_value: _,
+        value_state,
         line_number,
         exported,
         quote,
@@ -1327,6 +1372,7 @@ fn withhold_all_env_entry_payloads(entry: EnvEntry) -> EnvEntry {
         key,
         value: ALL_VALUES_WITHHELD.to_string(),
         display_value: ALL_VALUES_WITHHELD.to_string(),
+        value_state,
         line_number,
         exported,
         quote,
@@ -1431,6 +1477,7 @@ fn parse_env_file_with_reasons(
         entries.push(EnvEntry {
             id: entry_id(&parsed.key, parsed.line_number),
             key: parsed.key,
+            value_state: value_state(&parsed.value),
             value: parsed.value,
             display_value,
             line_number: parsed.line_number,
@@ -3081,7 +3128,7 @@ fn build_layer_report(files: &[EnvFile]) -> EnvLayerReport {
                 .entry(entry.key.clone())
                 .or_default()
                 .push((file, entry));
-            if is_placeholder_value(&entry.value) {
+            if entry.value_state != EnvValueState::Set {
                 placeholder_keys.insert(format!("{}:{}", file.name, entry.key));
             }
         }
@@ -3521,7 +3568,7 @@ fn find_placeholder_entry_target_by_name(
         .and_then(|file| {
             file.entries
                 .iter()
-                .find(|entry| entry.key == key && is_placeholder_value(&entry.value))
+                .find(|entry| entry.key == key && entry.value_state != EnvValueState::Set)
                 .map(|entry| entry_target(file, entry))
         })
 }
@@ -3581,16 +3628,21 @@ fn normalized_layer_value(value: &str) -> String {
     value.trim().trim_matches(['"', '\'']).to_string()
 }
 
-fn is_placeholder_value(value: &str) -> bool {
+fn value_state(value: &str) -> EnvValueState {
     let normalized = normalized_layer_value(value).to_ascii_lowercase();
-    normalized.is_empty()
-        || matches!(
-            normalized.as_str(),
-            "changeme" | "change-me" | "todo" | "tbd" | "replace-me" | "placeholder" | "your-value"
-        )
-        || normalized.starts_with("your_")
+    if normalized.is_empty() {
+        EnvValueState::Empty
+    } else if matches!(
+        normalized.as_str(),
+        "changeme" | "change-me" | "todo" | "tbd" | "replace-me" | "placeholder" | "your-value"
+    ) || normalized.starts_with("your_")
         || normalized.starts_with("your-")
         || (normalized.starts_with('<') && normalized.ends_with('>'))
+    {
+        EnvValueState::Placeholder
+    } else {
+        EnvValueState::Set
+    }
 }
 
 fn key_set(file: &EnvFile) -> BTreeSet<String> {

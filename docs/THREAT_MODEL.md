@@ -13,14 +13,14 @@
 - Rust parser and writer: trusted local code that reads and writes files selected by the user.
 - Svelte UI: trusted local code that renders parsed values and sends explicit commands to the Tauri backend. Default snapshots do not include raw secret-like values in parsed entries; Reveal fetches only one selected key occurrence into the local webview.
 - Tauri command boundary: only local UI invokes project scan, root-level env-file creation, value save, and value-required missing-key insertion.
-- CLI stdout and stderr: output may be retained by shells, CI, pipes, or agent transcripts. Structured JSON withholds env payloads by default; `--values` explicitly opts into classifier-approved entry values while comments and raw content remain withheld. `create` emits only a disposition and absolute path. `copy` emits only a disposition, normalized source and destination paths, and a key. `set`, `rm`, `rename`, and `example` emit only a disposition, normalized paths, key names, and line numbers.
+- CLI stdout and stderr: output may be retained by shells, CI, pipes, or agent transcripts. Structured JSON withholds env payloads by default; `--values` explicitly opts into classifier-approved entry values while comments and raw content remain withheld. `create` emits only a disposition and absolute path. `copy` emits only a disposition, normalized source and destination paths, and a key. `set`, `rm`, `rename`, and `example` emit only a disposition, normalized paths, key names, and line numbers. `where` emits only the key name, paths, line numbers, git status, value states, and the name and reason of each discovered file it did not read. Every JSON entry carries a `valueState` of `set`, `empty`, or `placeholder`.
 - Native dialog: used only to pick a local directory.
 - Network: not part of the product path for env contents.
 
 ## Current Controls
 
 - Exact provider profiles, shared secret-name evidence, boundary-aware credential value signatures, credential-bearing URLs/DSNs, and public-prefixed secret-looking names drive classified redaction before normal Tauri snapshots reach the webview. Strong secret evidence overrides a known-public key profile unless the value validates as that provider's public representation.
-- Default Tauri snapshots clear `entry.value`, mask `entry.displayValue`, withhold comments attached to redacted entries or containing secret-like text, and withhold raw preview payloads for files containing redacted entries or secret-like comments/malformed lines.
+- Default Tauri snapshots clear `entry.value`, mask `entry.displayValue`, leave `entry.valueState` as parsed, withhold comments attached to redacted entries or containing secret-like text, and withhold raw preview payloads for files containing redacted entries or secret-like comments/malformed lines.
 - `inspect`, `check`, and `add` JSON rebuild the serialized model with every env value, display value, comment, and raw preview withheld by default. `--values` restores classifier-approved entry values and display values while comments and raw previews remain policy-withheld, without changing findings, writes, or exit status.
 - The explicit Reveal command fetches one selected key occurrence by file, key, and line number. Frontend operation generations bind the response to that captured occurrence, and plaintext is retained as one target/value object only while it still matches the active selection. Hide, selection changes, reloads, and saves clear it.
 - Key-shape metadata separates sensitive-looking values from browser-exposed public prefixes, so names such as `NEXT_PUBLIC_API_KEY` are not treated as safe public values.
@@ -63,7 +63,7 @@
 
 ## Known Residual Risks
 
-- Dispositions disclose value equality. `alreadyPresent` on `set` or `copy` tells the caller that the value it supplied equals the stored one, and exit codes carry the same fact. vne's guarantee is that values never appear in its output, not that no value-derived fact is inferable; any local process with file access can read env files directly.
+- Dispositions and value states disclose value-derived facts. `alreadyPresent` on `set` or `copy` tells the caller that the value it supplied equals the stored one, and exit codes carry the same fact. Every JSON entry's `valueState` tells whether a stored value is empty or a template such as `changeme`; `inspect` already listed layer-file keys holding either in `layerReport.placeholderKeys`, without telling the two apart. vne's guarantee is that values never appear in its output, not that no value-derived fact is inferable; any local process with file access can read env files directly.
 - `rm --line <N>` protects against a stale line number that now holds a different entry, but not against two occurrences of the same key on adjacent lines: after the first is removed the second moves into line N, and an identical retry deletes it. File state cannot distinguish that retry from a fresh intent, which is the same limit that makes `rename` refuse to claim `alreadyRenamed`.
 - Example sync never prunes. A key retired from the real env file stays in the example file until someone removes it by hand; `vne example` will not report it.
 - Git exposure is a point-in-time read of git's index and ignore rules through a child process. It can be stale by the time a write happens, reports `unknown` when git is absent or a git invocation fails, and `tracked` means git holds the file now, not that a commit has already published it. A hung `git` is bounded: every invocation runs under a 5-second deadline and is killed to `unknown` (VNE-SEC-014, shipped this loop).
@@ -88,6 +88,6 @@
 - Re-check path-scope, symlink, idempotency, and no-clobber behavior around write commands after any command-surface change.
 - Re-review CSP after any asset, protocol, iframe, style, or network-surface change.
 - Verify raw values are absent from structured logs and error paths.
-- Verify `copy`, `set`, `rm`, `rename`, and `example` sentinel values are absent from stdout, stderr, errors, and child-process arguments on every success and failure path.
+- Verify `copy`, `set`, `rm`, `rename`, `example`, and `where` sentinel values are absent from stdout, stderr, errors, and child-process arguments on every success and failure path.
 - Verify macOS signing/notarization choices with explicit user approval.
 - Capture screenshots using a local browser-control surface.
