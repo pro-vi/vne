@@ -2187,32 +2187,111 @@ fn git_child_environment_is_scrubbed() {
 #[cfg(unix)]
 #[test]
 fn hanging_git_is_bounded_and_reports_unknown() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempdir().unwrap();
-    let shim = dir.path().join("shim");
-    fs::create_dir(&shim).unwrap();
-    fs::write(shim.join("git"), "#!/bin/sh\nsleep 60\n").unwrap();
-    fs::set_permissions(shim.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = fake_git_path(dir.path(), "sleep 60");
     fs::write(dir.path().join(".env"), "K=v\n").unwrap();
 
-    let started = std::time::Instant::now();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vne"))
-        .args(["check", dir.path().join(".env").to_str().unwrap(), "--json"])
-        .env_clear()
-        .env("PATH", format!("{}:{}", shim.display(), std::env::var("PATH").unwrap()))
-        .output()
-        .unwrap();
-    let elapsed = started.elapsed();
+    let (output, elapsed) =
+        run_vne_with_path(&["check", dir.path().join(".env").to_str().unwrap(), "--json"], &path);
     assert_eq!(output.status.code(), Some(0), "vne itself must complete");
     assert!(
         elapsed.as_secs() < 30,
-        "three bounded git calls must stay well under 30s, took {elapsed:?}"
+        "one killed git call (5 s) must leave vne well under 30s, took {elapsed:?}"
     );
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         json["file"]["gitStatus"], "unknown",
         "a killed git is Unknown, never a guess"
     );
+}
+
+/// A `PATH` whose first `git` runs `body` as a shell script. With `sleep 60`,
+/// killing the shell leaves `sleep` holding git's stdout pipe open, as a child
+/// of a real git could, and vne must not wait for it.
+#[cfg(unix)]
+fn fake_git_path(dir: &Path, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let shim = dir.join("shim");
+    fs::create_dir(&shim).unwrap();
+    fs::write(shim.join("git"), format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(shim.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", shim.display(), std::env::var("PATH").unwrap())
+}
+
+#[cfg(unix)]
+fn run_vne_with_path(args: &[&str], path: &str) -> (Output, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_vne"))
+        .args(args)
+        .env_clear()
+        .env("PATH", path)
+        .output()
+        .expect("vne process should run");
+    (output, started.elapsed())
+}
+
+fn match_git_statuses(json: &Value) -> Vec<String> {
+    json["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|found| found["gitStatus"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn git_output_vne_cannot_read_is_unknown_not_ignored() {
+    let dir = tempdir().unwrap();
+    let path = fake_git_path(dir.path(), "echo garbage");
+    fs::write(dir.path().join(".env"), "K=v\n").unwrap();
+
+    let (output, _) =
+        run_vne_with_path(&["check", dir.path().join(".env").to_str().unwrap(), "--json"], &path);
+
+    assert_eq!(output.status.code(), Some(0));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["file"]["gitStatus"], "unknown");
+}
+
+#[cfg(unix)]
+#[test]
+fn git_output_past_the_size_limit_is_unknown() {
+    let dir = tempdir().unwrap();
+    let path = fake_git_path(dir.path(), "head -c 2000000 /dev/zero");
+    fs::write(dir.path().join(".env"), "K=v\n").unwrap();
+
+    let (output, elapsed) =
+        run_vne_with_path(&["check", dir.path().join(".env").to_str().unwrap(), "--json"], &path);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(elapsed.as_secs() < 5, "took {elapsed:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["file"]["gitStatus"], "unknown");
+}
+
+#[cfg(unix)]
+#[test]
+fn where_asks_git_about_hits_in_one_directory_together() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("git.log");
+    // Logs each call, then runs the real git found after the shim on PATH.
+    let body = format!("echo call >> '{}'\nPATH=\"${{PATH#*:}}\" exec git \"$@\"", log.display());
+    let path = fake_git_path(dir.path(), &body);
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    git_in(&project, &["init", "--quiet"]);
+    for name in [".env", ".env.local", ".env.test", ".env.production"] {
+        fs::write(project.join(name), "K=v\n").unwrap();
+    }
+
+    let (output, _) = run_vne_with_path(&["where", "K", project.to_str().unwrap(), "--json"], &path);
+
+    assert_eq!(output.status.code(), Some(0));
+    // One listing answers the whole directory; asked once per file, four hits
+    // would take four.
+    let calls = fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(calls, 1);
 }
 
 #[test]
@@ -2762,4 +2841,24 @@ fn a_symlinked_directory_with_an_env_name_is_not_reported() {
     assert_eq!(output.status.code(), Some(1));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["searched"][0]["incomplete"], serde_json::json!([]));
+}
+
+#[test]
+fn where_reports_git_status_for_the_files_that_hold_the_key() {
+    let dir = tempdir().unwrap();
+    git_in(dir.path(), &["init", "--quiet"]);
+    write(&dir.path().join(".gitignore"), ".env.local\n");
+    write(&dir.path().join(".env"), "PORT=1420\n");
+    write(&dir.path().join(".env.local"), "PORT=1421\nSESSION_TOKEN=x\n");
+    git_in(dir.path(), &["add", ".gitignore", ".env"]);
+
+    let output = run_vne(["where", "PORT", &dir.path().display().to_string(), "--json"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(match_git_statuses(&json), ["tracked", "untrackedIgnored"]);
+
+    let named = run_vne(["where", "PORT", &dir.path().join(".env").display().to_string(), "--json"]);
+    let json: Value = serde_json::from_slice(&named.stdout).unwrap();
+    assert_eq!(json["matches"][0]["gitStatus"], "tracked");
 }

@@ -2,13 +2,17 @@
 //!
 //! This is deliberately dependency-free and read-only: it never stages,
 //! ignores, or edits anything, and it never reads an env file's contents. A
-//! missing or failing `git` is reported as [`EnvFileGitStatus::Unknown`] rather
+//! missing, failing, or too slow `git` is reported as [`EnvFileGitStatus::Unknown`] rather
 //! than hidden, because "we could not tell" is a different answer from "this
 //! file is safe".
 
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -19,7 +23,9 @@ pub enum EnvFileGitStatus {
     /// Untracked and unignored: one `git add .` away from being committed.
     UntrackedNotIgnored,
     OutsideRepository,
-    /// Git is absent, or a git invocation failed for a reason vne cannot read.
+    /// Git is absent, a git invocation failed for a reason vne cannot read, the
+    /// loader's `GitStatusScope` did not ask about this file, or the deadline
+    /// passed before git reached it.
     Unknown,
 }
 
@@ -36,52 +42,196 @@ impl EnvFileGitStatus {
     }
 }
 
-/// Classifies one env file's exposure to git. Runs at most three fast plumbing
-/// commands and never touches the file's contents.
-pub fn env_file_git_status(path: &Path) -> EnvFileGitStatus {
+/// Classifies env files' exposure to git, in the order given: one `ls-files`
+/// listing per parent directory, plus one for each name that is not ASCII, a
+/// second listing to confirm files the first one leaves out, and a `rev-parse`
+/// only when a listing is refused. Once `deadline` passes, no further git command
+/// starts and the files still waiting keep `Unknown`.
+pub fn env_file_git_statuses(
+    paths: &[&Path],
+    deadline: Option<Instant>,
+) -> Vec<EnvFileGitStatus> {
+    let mut statuses = vec![EnvFileGitStatus::Unknown; paths.len()];
+    let mut directories: Vec<(&Path, Vec<(usize, &str)>)> = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        let Some((directory, name)) = directory_and_name(path) else {
+            continue;
+        };
+        match directories.iter_mut().find(|(seen, _)| *seen == directory) {
+            Some((_, members)) => members.push((index, name)),
+            None => directories.push((directory, vec![(index, name)])),
+        }
+    }
+
+    for (directory, members) in directories {
+        let names = members.iter().map(|(_, name)| *name).collect::<Vec<_>>();
+        let found = directory_git_statuses(directory, &names, deadline);
+        for ((index, _), status) in members.iter().zip(found) {
+            statuses[*index] = status;
+        }
+    }
+    statuses
+}
+
+/// Whether git tracks this file, from one plumbing command. Anything short of
+/// a clear yes, including no repository and a failing git, is false.
+pub fn env_file_is_tracked(path: &Path) -> bool {
+    let Some((directory, name)) = directory_and_name(path) else {
+        return false;
+    };
+    let arguments = ["--literal-pathspecs", "ls-files", "--error-unmatch", "--", name];
+    matches!(
+        run_git(directory, &arguments, None),
+        GitInvocation::Exited { code: Some(0), .. }
+    )
+}
+
+fn directory_and_name(path: &Path) -> Option<(&Path, &str)> {
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return EnvFileGitStatus::Unknown;
-    };
+    Some((directory, path.file_name()?.to_str()?))
+}
 
-    match run_git(directory, &["rev-parse", "--is-inside-work-tree"]) {
-        // A signal-killed git answered nothing, which is not the same answer as
-        // "there is no repository here".
-        GitInvocation::Missing | GitInvocation::Status(None) => return EnvFileGitStatus::Unknown,
-        GitInvocation::Status(Some(0)) => {}
-        GitInvocation::Status(Some(_)) => return EnvFileGitStatus::OutsideRepository,
-    }
+fn directory_git_statuses(
+    directory: &Path,
+    names: &[&str],
+    deadline: Option<Instant>,
+) -> Vec<EnvFileGitStatus> {
+    // git prints an ASCII name back byte for byte, so one listing answers all
+    // of them. git 2.50.1 on macOS prints a non-ASCII name precomposed, which
+    // can differ from the bytes on disk, so each gets a listing of its own and
+    // is answered by whether anything was listed.
+    let (ascii, other): (Vec<usize>, Vec<usize>) =
+        (0..names.len()).partition(|index| names[*index].is_ascii());
+    let mut queries = vec![ascii];
+    queries.retain(|query| !query.is_empty());
+    queries.extend(other.into_iter().map(|index| vec![index]));
 
-    match run_git(directory, &["ls-files", "--error-unmatch", "--", name]) {
-        GitInvocation::Missing | GitInvocation::Status(None) => return EnvFileGitStatus::Unknown,
-        GitInvocation::Status(Some(0)) => return EnvFileGitStatus::Tracked,
-        GitInvocation::Status(Some(_)) => {}
-    }
+    let mut statuses = vec![EnvFileGitStatus::Unknown; names.len()];
+    for query in queries {
+        let by_bytes = names[query[0]].is_ascii();
+        let find = |listed: &BTreeMap<String, u8>, name: &str| {
+            if by_bytes {
+                listed.get(name).copied()
+            } else {
+                listed.values().next().copied()
+            }
+        };
+        let asked = query.iter().map(|index| names[*index]).collect::<Vec<_>>();
+        let listed = match list_files(directory, &asked, VISIBLE, deadline) {
+            GitInvocation::Exited {
+                code: Some(0),
+                stdout,
+            } => parse_listing(&stdout),
+            // `ls-files` refuses outside a repository, and also in one it
+            // cannot open; `rev-parse` exits 0 only in the second case.
+            GitInvocation::Exited { code: Some(_), .. } => {
+                let probe = ["rev-parse", "--is-inside-work-tree"];
+                if let GitInvocation::Exited { code: Some(1..), .. } =
+                    run_git(directory, &probe, deadline)
+                {
+                    return vec![EnvFileGitStatus::OutsideRepository; names.len()];
+                }
+                return statuses;
+            }
+            // A git that was killed, timed out, or had its output cut off
+            // answered nothing; its files stay `Unknown`.
+            _ => continue,
+        };
 
-    match run_git(directory, &["check-ignore", "-q", "--", name]) {
-        GitInvocation::Status(Some(0)) => EnvFileGitStatus::UntrackedIgnored,
-        GitInvocation::Status(Some(1)) => EnvFileGitStatus::UntrackedNotIgnored,
-        GitInvocation::Status(_) | GitInvocation::Missing => EnvFileGitStatus::Unknown,
+        let mut unlisted = Vec::new();
+        for index in query {
+            match find(&listed, names[index]) {
+                Some(b'?') => statuses[index] = EnvFileGitStatus::UntrackedNotIgnored,
+                Some(_) => statuses[index] = EnvFileGitStatus::Tracked,
+                None => unlisted.push(index),
+            }
+        }
+        // A file is also left out after a case-only rename or inside an
+        // uninitialized submodule, so it counts as ignored only when git lists
+        // it as ignored; otherwise it stays `Unknown`.
+        if unlisted.is_empty() {
+            continue;
+        }
+        let asked = unlisted.iter().map(|index| names[*index]).collect::<Vec<_>>();
+        if let GitInvocation::Exited {
+            code: Some(0),
+            stdout,
+        } = list_files(directory, &asked, IGNORED, deadline)
+        {
+            let ignored = parse_listing(&stdout);
+            for index in unlisted {
+                if find(&ignored, names[index]).is_some() {
+                    statuses[index] = EnvFileGitStatus::UntrackedIgnored;
+                }
+            }
+        }
     }
+    statuses
+}
+
+/// Tracked files, tagged by letter, and untracked files git does not ignore,
+/// tagged `?`.
+const VISIBLE: &[&str] = &["--cached", "--others", "--exclude-standard"];
+/// Untracked files git ignores.
+const IGNORED: &[&str] = &["--others", "--ignored", "--exclude-standard"];
+
+/// Lists the named files with their `ls-files -t` tag; `selection` chooses
+/// which files git lists.
+fn list_files(
+    directory: &Path,
+    names: &[&str],
+    selection: &[&str],
+    deadline: Option<Instant>,
+) -> GitInvocation {
+    let mut arguments = vec!["--literal-pathspecs", "ls-files", "-z", "-t"];
+    arguments.extend(selection);
+    arguments.push("--");
+    arguments.extend(names);
+    run_git(directory, &arguments, deadline)
+}
+
+fn parse_listing(stdout: &[u8]) -> BTreeMap<String, u8> {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let (tag, rest) = entry.split_first()?;
+            let name = rest.strip_prefix(b" ")?;
+            Some((String::from_utf8_lossy(name).into_owned(), *tag))
+        })
+        .collect()
 }
 
 enum GitInvocation {
     /// `git` could not be started at all.
     Missing,
-    /// `git` ran; `None` means it was killed by a signal.
-    Status(Option<i32>),
+    /// `git` ran, or was refused because the deadline had passed. `code` is
+    /// `None` when it was killed, missed a deadline, or its output could not be
+    /// read in full.
+    Exited { code: Option<i32>, stdout: Vec<u8> },
 }
 
 /// Per-invocation deadline for git children. A git that exceeds it is
-/// killed and reported as signal-death (`Status(None)` -> Unknown) — an
+/// killed and reported as `code: None` (-> Unknown) — an
 /// unobservable git is an honest Unknown, never a guess and never a hang
 /// (VNE-SEC-014).
-const GIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const GIT_DEADLINE: Duration = Duration::from_secs(5);
 
-fn run_git(directory: &Path, arguments: &[&str]) -> GitInvocation {
+/// Plumbing output for a directory's env files is a few kilobytes; more than
+/// this is not an answer vne can use.
+const GIT_OUTPUT_LIMIT: u64 = 1024 * 1024;
+
+/// Runs one git command unless `deadline` has already passed.
+fn run_git(directory: &Path, arguments: &[&str], deadline: Option<Instant>) -> GitInvocation {
+    let failed = GitInvocation::Exited {
+        code: None,
+        stdout: Vec::new(),
+    };
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return failed;
+    }
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -102,27 +252,48 @@ fn run_git(directory: &Path, arguments: &[&str]) -> GitInvocation {
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let Ok(mut child) = command.spawn() else {
         return GitInvocation::Missing;
     };
-    let started = std::time::Instant::now();
+
+    // Read on a thread that is never joined: a child of git that holds the
+    // pipe open after git is killed must not hold vne past the deadline.
+    let (sender, receiver) = mpsc::channel();
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let read = stdout.take(GIT_OUTPUT_LIMIT).read_to_end(&mut output);
+            let _ = sender.send(read.map(|_| output));
+        });
+    }
+
+    let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return GitInvocation::Status(status.code()),
-            Ok(None) => {
-                if started.elapsed() >= GIT_DEADLINE {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return GitInvocation::Status(None);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
+            Ok(Some(status)) => {
+                let remaining = GIT_DEADLINE.saturating_sub(started.elapsed());
+                return match receiver.recv_timeout(remaining) {
+                    Ok(Ok(stdout)) if (stdout.len() as u64) < GIT_OUTPUT_LIMIT => {
+                        GitInvocation::Exited {
+                            code: status.code(),
+                            stdout,
+                        }
+                    }
+                    _ => failed,
+                };
             }
-            Err(_) => {
+            // A plumbing call takes about 12 ms (git 2.50.1, M5 Max); in a
+            // 50-file scan, polling every 1 ms used the same CPU time as a
+            // blocking wait.
+            Ok(None) if started.elapsed() < GIT_DEADLINE => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return GitInvocation::Status(None);
+                return failed;
             }
         }
     }
@@ -146,6 +317,10 @@ mod tests {
         assert!(status.success(), "git {arguments:?} failed");
     }
 
+    fn env_file_git_status(path: &Path) -> EnvFileGitStatus {
+        env_file_git_statuses(&[path], None)[0]
+    }
+
     fn scratch_repository() -> tempfile::TempDir {
         let dir = tempdir().unwrap();
         git(dir.path(), &["init", "--quiet"]);
@@ -155,32 +330,6 @@ mod tests {
         );
         git(dir.path(), &["config", "user.name", "vne test"]);
         dir
-    }
-
-    #[test]
-    fn reports_each_git_exposure_state_from_a_scratch_repository() {
-        let repository = scratch_repository();
-        let root = repository.path();
-
-        fs::write(root.join(".gitignore"), ".env.local\n").unwrap();
-        fs::write(root.join(".env"), "PORT=1420\n").unwrap();
-        fs::write(root.join(".env.local"), "PORT=1421\n").unwrap();
-        fs::write(root.join(".env.production"), "PORT=1422\n").unwrap();
-        git(root, &["add", ".gitignore", ".env"]);
-        git(root, &["commit", "--quiet", "-m", "add env"]);
-
-        assert_eq!(
-            env_file_git_status(&root.join(".env")),
-            EnvFileGitStatus::Tracked
-        );
-        assert_eq!(
-            env_file_git_status(&root.join(".env.local")),
-            EnvFileGitStatus::UntrackedIgnored
-        );
-        assert_eq!(
-            env_file_git_status(&root.join(".env.production")),
-            EnvFileGitStatus::UntrackedNotIgnored
-        );
     }
 
     #[test]
@@ -199,6 +348,115 @@ mod tests {
         assert_eq!(
             env_file_git_status(&nested.join(".env")),
             EnvFileGitStatus::Tracked
+        );
+    }
+
+    #[test]
+    fn classifies_files_across_directories_in_batches() {
+        let repository = scratch_repository();
+        let root = repository.path();
+        let nested = root.join("services");
+        fs::create_dir(&nested).unwrap();
+        fs::write(root.join(".gitignore"), ".env.local\nignored \"q\".env\n").unwrap();
+        let names = [".env", ".env.local", ".env.production", "ignored \"q\".env", "tracked \u{e9}.env"];
+        for name in names {
+            fs::write(root.join(name), "K=v\n").unwrap();
+        }
+        fs::write(nested.join(".env"), "K=v\n").unwrap();
+        git(root, &["add", ".gitignore", ".env", "tracked \u{e9}.env"]);
+
+        let mut paths = names.iter().map(|name| root.join(name)).collect::<Vec<_>>();
+        paths.push(nested.join(".env"));
+        let paths = paths.iter().map(|path| path.as_path()).collect::<Vec<_>>();
+
+        assert_eq!(
+            env_file_git_statuses(&paths, None),
+            [
+                EnvFileGitStatus::Tracked,
+                EnvFileGitStatus::UntrackedIgnored,
+                EnvFileGitStatus::UntrackedNotIgnored,
+                EnvFileGitStatus::UntrackedIgnored,
+                EnvFileGitStatus::Tracked,
+                EnvFileGitStatus::UntrackedNotIgnored,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_passed_deadline_leaves_every_file_unknown() {
+        let repository = scratch_repository();
+        let env_file = repository.path().join(".env");
+        fs::write(&env_file, "K=v\n").unwrap();
+
+        assert_eq!(
+            env_file_git_statuses(&[env_file.as_path()], Some(Instant::now())),
+            [EnvFileGitStatus::Unknown]
+        );
+    }
+
+    #[test]
+    fn reports_tracking_with_one_command() {
+        let repository = scratch_repository();
+        let root = repository.path();
+        fs::write(root.join(".env"), "K=v\n").unwrap();
+        fs::write(root.join(".env.local"), "K=v\n").unwrap();
+        git(root, &["add", ".env"]);
+
+        assert!(env_file_is_tracked(&root.join(".env")));
+        assert!(!env_file_is_tracked(&root.join(".env.local")));
+    }
+
+    #[test]
+    fn pathspec_magic_names_neither_fail_nor_skew_their_directory() {
+        let repository = scratch_repository();
+        let root = repository.path();
+        fs::write(root.join(".gitignore"), "/prod.env\n").unwrap();
+        let names = ["plain.env", ":(bad)x.env", ":!neg.env", ":prod.env"];
+        for name in names {
+            fs::write(root.join(name), "K=v\n").unwrap();
+        }
+        let paths = names.iter().map(|name| root.join(name)).collect::<Vec<_>>();
+        let paths = paths.iter().map(|path| path.as_path()).collect::<Vec<_>>();
+
+        assert_eq!(
+            env_file_git_statuses(&paths, None),
+            [EnvFileGitStatus::UntrackedNotIgnored; 4]
+        );
+    }
+
+    /// git precomposes Unicode on macOS, so a name stored decomposed on disk
+    /// differs in bytes from the index path git prints.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decomposed_unicode_names_keep_their_git_status() {
+        let repository = scratch_repository();
+        let root = repository.path();
+        fs::write(root.join(".gitignore"), "na\u{ef}ve.env\n").unwrap();
+        let tracked = root.join("cafe\u{301}.env");
+        let ignored = root.join("nai\u{308}ve.env");
+        fs::write(&tracked, "K=v\n").unwrap();
+        fs::write(&ignored, "K=v\n").unwrap();
+        git(root, &["add", "--", "cafe\u{301}.env"]);
+
+        assert_eq!(
+            env_file_git_statuses(&[tracked.as_path(), ignored.as_path()], None),
+            [EnvFileGitStatus::Tracked, EnvFileGitStatus::UntrackedIgnored]
+        );
+    }
+
+    #[test]
+    fn a_file_left_out_of_the_listing_is_not_called_ignored_without_proof() {
+        let repository = scratch_repository();
+        let root = repository.path();
+        fs::write(root.join(".env.Local"), "K=v\n").unwrap();
+        git(root, &["add", ".env.Local"]);
+        // A case-only rename: git still tracks `.env.Local`, and on a
+        // case-insensitive filesystem the listing names neither spelling.
+        fs::rename(root.join(".env.Local"), root.join(".env.local")).unwrap();
+
+        assert_ne!(
+            env_file_git_status(&root.join(".env.local")),
+            EnvFileGitStatus::UntrackedIgnored
         );
     }
 

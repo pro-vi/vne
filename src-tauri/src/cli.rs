@@ -430,7 +430,7 @@ fn ensure_copy_target_within_source_project(
         return Ok(()); // interactive use: cross-project copy is a feature
     }
 
-    let source = load_env_file(source_file)?;
+    let source = parse_env_file(source_file, read_to_string_with_path(source_file)?);
     let Some(entry) = source.entries.iter().find(|entry| entry.key == key) else {
         return Ok(()); // copy_env_key reports the missing key itself
     };
@@ -612,8 +612,11 @@ fn run_check(
     output_format: OutputFormat,
     value_output: ValueOutput,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let file = load_env_file(file_path)?;
-    let example = example_path.map(load_env_file).transpose()?;
+    let mut paths = vec![file_path];
+    paths.extend(example_path);
+    let mut loaded = load_env_files(&paths, crate::GitStatusScope::AllFiles)?;
+    let example = example_path.and_then(|_| loaded.pop());
+    let file = loaded.remove(0);
     let comparison = example
         .as_ref()
         .map(|example| compare_env_files(&file, example));
@@ -682,9 +685,10 @@ fn run_where(
     let mut matches = Vec::new();
     let mut searched = Vec::new();
 
+    let git_scope = crate::GitStatusScope::FilesWithKey(key);
     for path in paths {
         let (root, files, incomplete) = if path.is_dir() {
-            let snapshot = crate::snapshot_project(path).map_err(|error| {
+            let snapshot = crate::scan_project(path, git_scope).map_err(|error| {
                 io::Error::new(
                     error.kind(),
                     format!("could not scan {}: {error}", path.display()),
@@ -692,7 +696,7 @@ fn run_where(
             })?;
             (snapshot.root, snapshot.files, snapshot.incomplete)
         } else {
-            let file = load_env_file(path)?;
+            let file = load_env_files(&[path], git_scope)?.remove(0);
             (file.path.clone(), vec![file], Vec::new())
         };
 
@@ -852,8 +856,8 @@ fn run_add(
     warn_when_tracked_by_git(file)?;
 
     if output.wants_json() {
-        let file = project_env_file_for_output(load_env_file(file)?, value_output);
-        print_json(&file, output)?;
+        let loaded = load_env_files(&[file], crate::GitStatusScope::AllFiles)?.remove(0);
+        print_json(&project_env_file_for_output(loaded, value_output), output)?;
     } else {
         stdout_line(format_args!("added `{key}` to {}", file.display()))?;
     }
@@ -1196,18 +1200,28 @@ fn project_env_file_for_output(file: EnvFile, value_output: ValueOutput) -> EnvF
     }
 }
 
-fn load_env_file(path: &Path) -> Result<EnvFile, Box<dyn std::error::Error>> {
-    let content = read_to_string_with_path(path)?;
-    let display_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut file = parse_env_file(&display_path, content);
-    file.git_status = crate::git::env_file_git_status(&display_path);
-    Ok(file)
+/// Loads env files in order, then asks git about the ones `git_scope` names in
+/// one batch, so files sharing a directory share its git processes.
+fn load_env_files(
+    paths: &[&Path],
+    git_scope: crate::GitStatusScope,
+) -> Result<Vec<EnvFile>, Box<dyn std::error::Error>> {
+    let mut files = Vec::with_capacity(paths.len());
+    let mut real_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        let content = read_to_string_with_path(path)?;
+        let real_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        files.push(parse_env_file(&real_path, content));
+        real_paths.push(real_path);
+    }
+    crate::fill_git_statuses(&mut files, &real_paths, git_scope, None);
+    Ok(files)
 }
 
 /// One stderr line when a mutation just landed in a file git already tracks.
 /// It never blocks the write and never names a value.
 fn warn_when_tracked_by_git(path: &Path) -> io::Result<()> {
-    if crate::git::env_file_git_status(path) != EnvFileGitStatus::Tracked {
+    if !crate::git::env_file_is_tracked(path) {
         return Ok(());
     }
 

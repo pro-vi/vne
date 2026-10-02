@@ -174,7 +174,8 @@ pub struct EnvFile {
     pub diagnostics: Vec<String>,
     pub duplicate_keys: Vec<String>,
     /// Exposure of this file to git. The pure parser cannot know it and leaves
-    /// `Unknown`; the filesystem-aware loaders fill it in.
+    /// `Unknown`; the filesystem-aware loaders fill it in for the files their
+    /// `GitStatusScope` names.
     pub git_status: EnvFileGitStatus,
     pub content: String,
 }
@@ -1045,6 +1046,47 @@ pub fn run_with_initial_project_path(initial_path: Option<String>) {
 }
 
 pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
+    scan_project(root, GitStatusScope::AllFiles)
+}
+
+/// Which loaded env files get a git status; a file left out keeps
+/// `EnvFileGitStatus::Unknown`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GitStatusScope<'a> {
+    AllFiles,
+    FilesWithKey(&'a str),
+}
+
+impl GitStatusScope<'_> {
+    fn wants(self, file: &EnvFile) -> bool {
+        match self {
+            Self::AllFiles => true,
+            Self::FilesWithKey(key) => file.entries.iter().any(|entry| entry.key == key),
+        }
+    }
+}
+
+/// Asks git about the files `git_scope` names and stores each answer.
+/// `real_paths[i]` is the real path of `files[i]`; `EnvFile::path` is a display
+/// string that can differ from it.
+pub(crate) fn fill_git_statuses(
+    files: &mut [EnvFile],
+    real_paths: &[PathBuf],
+    git_scope: GitStatusScope,
+    deadline: Option<std::time::Instant>,
+) {
+    let (asked, paths): (Vec<&mut EnvFile>, Vec<&Path>) = files
+        .iter_mut()
+        .zip(real_paths)
+        .filter(|(file, _)| git_scope.wants(file))
+        .map(|(file, path)| (file, path.as_path()))
+        .unzip();
+    for (file, status) in asked.into_iter().zip(git::env_file_git_statuses(&paths, deadline)) {
+        file.git_status = status;
+    }
+}
+
+pub(crate) fn scan_project(root: &Path, git_scope: GitStatusScope) -> io::Result<ProjectSnapshot> {
     let root = root.canonicalize()?;
     // Harden F0010 (2026-09-09): the deadline starts at the scan's first
     // filesystem work — the discovery phase (read_dir, package.json and
@@ -1115,6 +1157,7 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
             });
         }
     }
+    let mut real_paths = Vec::new();
     for (index, (path, reasons)) in env_paths.into_iter().enumerate() {
         let name = path
             .file_name()
@@ -1153,10 +1196,10 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
         }
         match read_discovery_file_bounded(&path) {
             Ok(content) => {
-                let mut file =
+                let file =
                     parse_env_file_with_reasons(&path, content, reasons.into_iter().collect());
-                file.git_status = git::env_file_git_status(&path);
                 files.push(file);
+                real_paths.push(path);
             }
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 incomplete.push(IncompleteEnvFile {
@@ -1172,6 +1215,10 @@ pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
             }
         }
     }
+
+    // Git runs after every file is read, so git time cannot push a read past
+    // the scan deadline into `scan-timeout`.
+    fill_git_statuses(&mut files, &real_paths, git_scope, Some(scan_started + SCAN_DEADLINE));
 
     let comparison = compare_actual_to_example(&files);
     let layer_report = build_layer_report(&files);
