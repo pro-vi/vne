@@ -13,9 +13,9 @@ Checkbox marks a lane consumed (plan written, or direct commit landed).
 - [ ] **named-file-read-bound** — `check` and `where` refuse a named path that is not a regular file and cap its read at the scan's size bound · verdict: defer · origin: /gate review of `vne where`, 2026-10-02
 - [x] **scan-git-latency** — `where` asks git only about files that hold the key, and a finished git call is noticed within 1 ms instead of 25 ms · verdict: direct · origin: /simplify review of `vne where`, 2026-10-02
 - [ ] **referenced-file-incomplete** — env files named by `package.json` or Compose that cannot be read are dropped without an incomplete record · verdict: pending · origin: /simplify review of `vne where`, 2026-10-02
-- [ ] **public-release** — the GitHub repository goes public · verdict: pending · blocked by: the "Release Checklist Before Public Distribution" in `docs/THREAT_MODEL.md` · origin: owner decision, 2026-10-02
+- [ ] **public-release** — the GitHub repository goes public · verdict: pending · blocked by: the "Release Checklist Before Public Distribution" in `docs/THREAT_MODEL.md` and the release-check findings below · origin: owner decision, 2026-10-02
 - [x] **git-status-batching** — scans run one or two git listings per directory instead of up to three commands per file · verdict: direct · origin: /gate review of the `where` latency fix, 2026-10-02
-- [ ] **git-status-per-repository** — scans ask git once per repository instead of once per directory holding env files · verdict: direct · origin: /gate review of the command performance pass, 2026-10-02
+- [ ] **git-status-per-repository** — scans ask git once per repository instead of once per directory holding env files · verdict: direct · origin: /gate review of commit a2a97ed, 2026-10-02
 
 ## agent-contract-docs
 
@@ -40,3 +40,15 @@ Env files named by `package.json` or Compose can sit in many directories, and ea
 
 - Needs a check for a nested repository between a file's directory and the top, so its files are asked in their own repository.
 - Done when `inspect` over env files in 50 directories of one repository takes under 200 ms.
+
+## public-release
+
+A read-only release check on 2026-10-02 found three things that block making the repository public, besides the threat model's checklist:
+
+- No license. A public repository without one is all rights reserved.
+- `docs/security-audit-2026-09-04.md` lists 15 findings: 8 marked `launch_blocker: true`, and 3 true under a condition (VNE-SEC-008 for Windows, 009 for Windows development and before public release, 011 for agent-safe claims). 14 read `status: confirmed`; 008 reads `platform-inferred`. Code or commit messages cite fixes for VNE-SEC-001, 002, 003, 005, 006, 007, 010, 012, 013, and 014; nothing cites 004, 008, 009, 011, or 015. Each needs a verified, recorded status before the audit is published; an open launch blocker blocks the release.
+- `PROMPT.md` and `loop/` are build-loop scaffolding at the root, and both `PROMPT.md` files contain local home-directory paths. `logs/audits/` holds two package-update audit reports from 2026-05-31 and 2026-06-01.
+
+The same check found no credentials: a pattern scan of every commit found credential-shaped strings only in test code, with fake values. No dedicated secret scanner was installed.
+
+- Owner decisions: the license; whether a release ships signed macOS binaries or source only; and whether `me@provi.me`, the author of every commit, goes public as is.
