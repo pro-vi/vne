@@ -2188,6 +2188,8 @@ fn git_child_environment_is_scrubbed() {
 #[test]
 fn hanging_git_is_bounded_and_reports_unknown() {
     let dir = tempdir().unwrap();
+    // Without `exec`, killing the shell leaves `sleep` holding git's stdout
+    // pipe open, as a child of a real git could; vne must not wait for it.
     let path = fake_git_path(dir.path(), "sleep 60");
     fs::write(dir.path().join(".env"), "K=v\n").unwrap();
 
@@ -2205,9 +2207,7 @@ fn hanging_git_is_bounded_and_reports_unknown() {
     );
 }
 
-/// A `PATH` whose first `git` runs `body` as a shell script. With `sleep 60`,
-/// killing the shell leaves `sleep` holding git's stdout pipe open, as a child
-/// of a real git could, and vne must not wait for it.
+/// A `PATH` whose first `git` runs `body` as a shell script.
 #[cfg(unix)]
 fn fake_git_path(dir: &Path, body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
@@ -2228,15 +2228,6 @@ fn run_vne_with_path(args: &[&str], path: &str) -> (Output, std::time::Duration)
         .output()
         .expect("vne process should run");
     (output, started.elapsed())
-}
-
-fn match_git_statuses(json: &Value) -> Vec<String> {
-    json["matches"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|found| found["gitStatus"].as_str().unwrap().to_string())
-        .collect()
 }
 
 #[cfg(unix)]
@@ -2856,7 +2847,9 @@ fn where_reports_git_status_for_the_files_that_hold_the_key() {
 
     assert_eq!(output.status.code(), Some(0));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(match_git_statuses(&json), ["tracked", "untrackedIgnored"]);
+    assert_eq!(json["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(json["matches"][0]["gitStatus"], "tracked");
+    assert_eq!(json["matches"][1]["gitStatus"], "untrackedIgnored");
 
     let named = run_vne(["where", "PORT", &dir.path().join(".env").display().to_string(), "--json"]);
     let json: Value = serde_json::from_slice(&named.stdout).unwrap();

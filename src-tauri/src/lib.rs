@@ -1196,9 +1196,11 @@ pub(crate) fn scan_project(root: &Path, git_scope: GitStatusScope) -> io::Result
         }
         match read_discovery_file_bounded(&path) {
             Ok(content) => {
-                let file =
-                    parse_env_file_with_reasons(&path, content, reasons.into_iter().collect());
-                files.push(file);
+                files.push(parse_env_file_with_reasons(
+                    &path,
+                    content,
+                    reasons.into_iter().collect(),
+                ));
                 real_paths.push(path);
             }
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {

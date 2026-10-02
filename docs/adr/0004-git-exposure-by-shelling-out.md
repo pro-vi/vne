@@ -26,9 +26,9 @@ in it: a `?` tag means untracked and not ignored, and any other tag means
 tracked. A file left out of that listing is ignored only if a second listing,
 `ls-files --others --ignored --exclude-standard`, names it; otherwise it is
 `unknown`, because a case-only rename or an uninitialized submodule also leaves
-a file out. Names are passed with `--literal-pathspecs`, so a name such as
-`:!x.env` is never read as pathspec magic. A name that is not ASCII gets a
-listing of its own and is judged by whether anything was listed, because git
+a file out (git 2.50.1). Names are passed with `--literal-pathspecs`, so a name
+such as `:!x.env` is never read as pathspec magic. A name that is not ASCII gets
+a listing of its own and is judged by whether anything was listed, because git
 2.50.1 on macOS prints such names precomposed, which can differ from the bytes
 on disk. It never reads an env file's contents and never stages, ignores, or
 edits anything.
@@ -48,10 +48,12 @@ new dependencies. `git2` or the `ignore` crate would each pull a substantial
 dependency tree to answer a question the `git` binary already answers exactly,
 including the ignore-precedence rules that are easy to reimplement subtly wrong.
 
-When a listing is refused, `rev-parse --is-inside-work-tree` decides between
-`outsideRepository` and `unknown` without parsing git's English: it exits 0 in a
-repository whose index is broken. A repository git refuses to open, such as one
-with dubious ownership, still reads as `outsideRepository`. `git status` would
+When a listing is refused, `rev-parse --is-inside-work-tree` decides without
+parsing git's English: it exits 0 in a repository whose index git cannot read,
+which is `unknown`. When it refuses too, a `.git` entry at or above the
+directory means git would not open a repository that is there, such as one with
+dubious ownership, which is also `unknown`; only without one is the file
+`outsideRepository` (git 2.50.1). `git status` would
 also classify in one command, but it runs a repository's clean filter on a file
 whose timestamp changed, which `ls-files` and `rev-parse` do not (both checked
 on git 2.50.1).
@@ -74,10 +76,10 @@ Positive:
 
 Negative:
 
-- One child process per directory holding env files at load time, a second
-  when some of its files are ignored, one or two per file whose name is not
-  ASCII, and a `rev-parse` where a listing is refused.
-  Env files spread over 50 directories still took 1.2 s for `inspect`.
+- Per directory holding env files, one child process for its ASCII names, a
+  second when that listing leaves some out, one or two per name that is not
+  ASCII, and a `rev-parse` where a listing is refused. Env files spread over
+  50 directories still took 1.2 s for `inspect` (M5 Max, git 2.50.1).
 - The status is a point-in-time read that can be stale by the time a write
   happens.
 - A hung `git` is killed after 5 s (`GIT_DEADLINE`) and the files it was asked
@@ -90,7 +92,9 @@ Negative:
 ## Revisit Triggers
 
 - Load time becomes noticeable on a project whose env files spread across many
-  directories, where per-directory listings add up again.
+  directories, where per-directory listings add up again. *(Fired 2026-10-02:
+  env files in 50 directories took 1.2 s; per-repository listing is queued in
+  `docs/BACKLOG.md`.)*
 - The desktop UI starts consuming `gitStatus`, which makes the hand-mirrored
   TypeScript type worth replacing with a generated one.
 - Someone wants `vne` to offer to add the file to `.gitignore`, which would turn
