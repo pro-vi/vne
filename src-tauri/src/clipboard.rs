@@ -1,6 +1,9 @@
 //! Puts one env value on a macOS pasteboard without passing it through the
 //! webview, and takes a secret back off when its time is up.
 
+use std::hash::BuildHasher;
+use std::sync::OnceLock;
+
 use objc2_app_kit::{NSPasteboard, NSPasteboardContentsOptions, NSPasteboardTypeString};
 use objc2_foundation::{NSData, NSString};
 
@@ -11,10 +14,24 @@ const MARKER_TYPES: [&str; 2] = ["org.nspasteboard.ConcealedType", "org.nspasteb
 /// Seconds a concealed value stays on the clipboard before vne clears it.
 pub const CONCEALED_SECONDS: u64 = 30;
 
-/// The change count of the concealed value vne last wrote, so a delayed or
-/// exit-time clear never removes something copied after it.
+/// The concealed value vne last wrote, kept only as a write's change count
+/// and a fingerprint of its text, so a delayed or exit-time clear removes
+/// that value and nothing copied after it.
 #[derive(Debug, Default)]
-pub struct ConcealedClipboard(pub std::sync::Mutex<Option<isize>>);
+pub struct ConcealedClipboard(pub std::sync::Mutex<Option<Concealed>>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Concealed {
+    pub change_count: isize,
+    pub fingerprint: u64,
+}
+
+/// A keyed hash, with keys drawn once per process, so the copied value can be
+/// recognized later without being kept.
+pub fn fingerprint(text: &str) -> u64 {
+    static KEYS: OnceLock<std::hash::RandomState> = OnceLock::new();
+    KEYS.get_or_init(std::hash::RandomState::new).hash_one(text)
+}
 
 /// Writes `text` and returns the change count that identifies this write.
 /// A concealed write stays on this Mac (no Universal Clipboard) and carries
@@ -37,16 +54,23 @@ pub fn write(pasteboard: &NSPasteboard, text: &str, conceal: bool) -> isize {
     pasteboard.changeCount()
 }
 
-/// Clears the concealed value written at `change_count`, unless anything was
-/// written to the pasteboard since or a newer concealed write replaced it.
-/// Returns whether it cleared.
-pub fn clear_concealed(state: &ConcealedClipboard, pasteboard: &NSPasteboard, change_count: isize) -> bool {
+/// Clears `written` while the pasteboard still holds that value, whether as
+/// vne's own write or as a copy another process re-posted without the
+/// markers. Anything else on the pasteboard, or a newer concealed write,
+/// is left alone. Returns whether it cleared.
+pub fn clear_concealed(state: &ConcealedClipboard, pasteboard: &NSPasteboard, written: Concealed) -> bool {
     let mut last = state.0.lock().unwrap();
-    if *last != Some(change_count) {
+    if *last != Some(written) {
         return false;
     }
     *last = None;
-    if pasteboard.changeCount() != change_count {
+    // SAFETY: see `write`.
+    let string_type = unsafe { NSPasteboardTypeString };
+    let still_holds_it = pasteboard.changeCount() == written.change_count
+        || pasteboard
+            .stringForType(string_type)
+            .is_some_and(|text| fingerprint(&text.to_string()) == written.fingerprint);
+    if !still_holds_it {
         return false;
     }
     pasteboard.clearContents();
@@ -110,29 +134,48 @@ mod tests {
         assert!(!types(&scratch.0).iter().any(|kind| kind.starts_with("org.nspasteboard.")));
     }
 
+    fn concealed(scratch: &Scratch, state: &ConcealedClipboard, value: &str) -> Concealed {
+        let written = Concealed { change_count: write(&scratch.0, value, true), fingerprint: fingerprint(value) };
+        *state.0.lock().unwrap() = Some(written);
+        written
+    }
+
+    fn post_plain(scratch: &Scratch, value: &str) {
+        scratch.0.clearContents();
+        // SAFETY: see `write`.
+        scratch.0.setString_forType(&NSString::from_str(value), unsafe { NSPasteboardTypeString });
+    }
+
     #[test]
     fn clearing_removes_the_value_vne_wrote() {
         let scratch = Scratch::new();
         let state = ConcealedClipboard::default();
-        let change = write(&scratch.0, "sk_test_fake", true);
-        *state.0.lock().unwrap() = Some(change);
+        let written = concealed(&scratch, &state, "sk_test_fake");
 
-        assert!(clear_concealed(&state, &scratch.0, change));
+        assert!(clear_concealed(&state, &scratch.0, written));
         assert_eq!(text(&scratch.0), None);
         assert_eq!(*state.0.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn clearing_removes_the_value_when_another_process_reposted_it() {
+        let scratch = Scratch::new();
+        let state = ConcealedClipboard::default();
+        let written = concealed(&scratch, &state, "sk_test_fake");
+        post_plain(&scratch, "sk_test_fake");
+
+        assert!(clear_concealed(&state, &scratch.0, written));
+        assert_eq!(text(&scratch.0), None);
     }
 
     #[test]
     fn clearing_leaves_what_was_copied_afterwards() {
         let scratch = Scratch::new();
         let state = ConcealedClipboard::default();
-        let change = write(&scratch.0, "sk_test_fake", true);
-        *state.0.lock().unwrap() = Some(change);
-        scratch.0.clearContents();
-        // SAFETY: see `write`.
-        scratch.0.setString_forType(&NSString::from_str("copied later"), unsafe { NSPasteboardTypeString });
+        let written = concealed(&scratch, &state, "sk_test_fake");
+        post_plain(&scratch, "copied later");
 
-        assert!(!clear_concealed(&state, &scratch.0, change));
+        assert!(!clear_concealed(&state, &scratch.0, written));
         assert_eq!(text(&scratch.0).as_deref(), Some("copied later"));
     }
 
@@ -140,9 +183,8 @@ mod tests {
     fn an_older_timer_leaves_a_newer_concealed_value() {
         let scratch = Scratch::new();
         let state = ConcealedClipboard::default();
-        let first = write(&scratch.0, "first", true);
-        let second = write(&scratch.0, "second", true);
-        *state.0.lock().unwrap() = Some(second);
+        let first = concealed(&scratch, &state, "first");
+        let second = concealed(&scratch, &state, "second");
 
         assert!(!clear_concealed(&state, &scratch.0, first));
         assert_eq!(text(&scratch.0).as_deref(), Some("second"));

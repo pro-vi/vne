@@ -1133,7 +1133,8 @@ fn copy_env_value(
         copy_source_authorized(root_state.0.lock().unwrap().as_deref(), &path, &key, line_number)?;
     let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
     let change_count = clipboard::write(&pasteboard, &value, conceal);
-    *clipboard_state.0.lock().unwrap() = conceal.then_some(change_count);
+    let written = clipboard::Concealed { change_count, fingerprint: clipboard::fingerprint(&value) };
+    *clipboard_state.0.lock().unwrap() = conceal.then_some(written);
     if !conceal {
         return Ok(CopyOutcome { key, clears_in_seconds: None });
     }
@@ -1146,7 +1147,7 @@ fn copy_env_value(
         let _ = main.run_on_main_thread(move || {
             let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
             let state = handle.state::<clipboard::ConcealedClipboard>();
-            let cleared = clipboard::clear_concealed(&state, &pasteboard, change_count);
+            let cleared = clipboard::clear_concealed(&state, &pasteboard, written);
             let _ = handle.emit("clipboard-cleared", ClipboardCleared { key: cleared_key, cleared });
         });
     });
@@ -1203,9 +1204,9 @@ pub fn run_with_initial_project_path(initial_path: Option<String>) {
             use tauri::Manager;
             let state = _handle.state::<clipboard::ConcealedClipboard>();
             let last = *state.0.lock().unwrap();
-            if let Some(change_count) = last {
+            if let Some(written) = last {
                 let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
-                clipboard::clear_concealed(&state, &pasteboard, change_count);
+                clipboard::clear_concealed(&state, &pasteboard, written);
             }
         }
     });
