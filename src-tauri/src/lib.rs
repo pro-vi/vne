@@ -1039,6 +1039,44 @@ fn ensure_env_file(
     ensure_env_file_authorized(root_state.0.lock().unwrap().as_deref(), &name)
 }
 
+/// Creates `.env` in the project root as a byte copy of the first example
+/// file found, so a fresh clone starts from the template's defaults. Never
+/// replaces an existing `.env`.
+pub fn create_env_from_example_authorized(root: Option<&Path>) -> Result<ProjectSnapshot, String> {
+    let authorized = root.ok_or("no authorized project root is active")?;
+    let canonical_root = authorized.canonicalize().map_err(|error| error.to_string())?;
+    let example = EXAMPLE_ENV_FILE_NAMES
+        .iter()
+        .map(|name| canonical_root.join(name))
+        .find(|path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file()))
+        .ok_or_else(|| format!("no {} in the project root", EXAMPLE_ENV_FILE_NAMES.join(", ")))?;
+    let content = read_regular_file_bounded(&example).map_err(|error| error.to_string())?;
+
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".env.vne-")
+        .tempfile_in(&canonical_root)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .write_all(content.as_bytes())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist_noclobber(canonical_root.join(".env"))
+        .map_err(|error| match error.error.kind() {
+            io::ErrorKind::AlreadyExists => ".env already exists; it is never replaced".to_string(),
+            _ => error.error.to_string(),
+        })?;
+
+    snapshot_project(authorized)
+        .map(redact_snapshot)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn create_env_from_example(root_state: tauri::State<'_, AuthorizedRoot>) -> Result<ProjectSnapshot, String> {
+    create_env_from_example_authorized(root_state.0.lock().unwrap().as_deref())
+}
+
 use tauri_plugin_dialog::DialogExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1060,6 +1098,7 @@ pub fn run_with_initial_project_path(initial_path: Option<String>) {
             save_env_value,
             add_env_key,
             ensure_env_file,
+            create_env_from_example,
             choose_authorized_root
         ]);
     // Harden F0009 (2026-09-05): the webdriver plugin starts an
@@ -3191,14 +3230,15 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
     })
 }
 
+/// Names of the committed template `.env` is compared against and can be
+/// created from.
+const EXAMPLE_ENV_FILE_NAMES: [&str; 4] = [".env.example", ".env.sample", ".env.template", ".env.defaults"];
+
 fn compare_actual_to_example(files: &[EnvFile]) -> Option<EnvComparison> {
     let base = files.iter().find(|file| file.name == ".env")?;
-    let example = files.iter().find(|file| {
-        matches!(
-            file.name.as_str(),
-            ".env.example" | ".env.sample" | ".env.template" | ".env.defaults"
-        )
-    })?;
+    let example = files
+        .iter()
+        .find(|file| EXAMPLE_ENV_FILE_NAMES.contains(&file.name.as_str()))?;
 
     Some(compare_env_files(base, example))
 }
@@ -6755,6 +6795,56 @@ mod tests {
         let revealed =
             reveal_env_value_authorized(Some(dir.path()), ".env", "API_TOKEN", 1).unwrap();
         assert_eq!(revealed, "sk-updated");
+    }
+
+    #[test]
+    fn create_env_from_example_copies_the_template_bytes() {
+        let dir = tempdir().unwrap();
+        let template = "# app\nPORT=3000\nAPI_TOKEN=\nNEXTAUTH_SECRET=changeme\n";
+        fs::write(dir.path().join(".env.example"), template).unwrap();
+
+        let snapshot = create_env_from_example_authorized(Some(dir.path())).unwrap();
+
+        let env_path = dir.path().join(".env");
+        assert_eq!(fs::read_to_string(&env_path).unwrap(), template);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&env_path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let env = snapshot.files.iter().find(|file| file.name == ".env").unwrap();
+        assert_eq!(env.entries.len(), 3);
+        assert!(snapshot.comparison.is_some());
+    }
+
+    #[test]
+    fn create_env_from_example_never_replaces_an_existing_env() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "PORT=1\n").unwrap();
+        fs::write(dir.path().join(".env.example"), "PORT=3000\n").unwrap();
+
+        let error = create_env_from_example_authorized(Some(dir.path())).unwrap_err();
+
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(fs::read_to_string(dir.path().join(".env")).unwrap(), "PORT=1\n");
+        let leftovers = fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().starts_with(".env.vne-"))
+            .count();
+        assert_eq!(leftovers, 0, "the refused copy leaves no temporary file");
+    }
+
+    #[test]
+    fn create_env_from_example_needs_a_template_and_a_root() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("worker.env"), "PORT=1\n").unwrap();
+
+        let error = create_env_from_example_authorized(Some(dir.path())).unwrap_err();
+        assert!(error.contains(".env.example"), "{error}");
+        assert!(!dir.path().join(".env").exists());
+
+        let error = create_env_from_example_authorized(None).unwrap_err();
+        assert_eq!(error, "no authorized project root is active");
     }
 
     #[test]

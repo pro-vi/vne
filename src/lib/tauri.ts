@@ -76,6 +76,15 @@ export async function ensureEnvFile(root: string, name: string): Promise<EnsureE
   return parseEnsureEnvFileOutcome(outcome);
 }
 
+export async function createEnvFromExample(): Promise<ProjectSnapshot> {
+  if (!isTauriRuntime()) {
+    await delay(180);
+    throw new Error('Creating .env is available in the Tauri desktop app. Browser preview uses read-only sample data.');
+  }
+
+  return invoke<ProjectSnapshot>('create_env_from_example');
+}
+
 export async function pickProjectDirectory(defaultPath: string): Promise<string | null> {
   void defaultPath;
   if (!isTauriRuntime()) {
