@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-28
 - **Deciders:** Provi, Codex
+- **Amended by:** ADR 0006 (drafts, duplicate-save confirmations and raw preview are gone; target-bound entry refs, operation generations and fail-closed input masking remain)
 
 ## Context
 
