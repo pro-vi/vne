@@ -18,7 +18,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
         duplicateKeys: ['FEATURE_ENABLED'],
         gitStatus: 'untrackedIgnored',
         content:
-          '# local development\nDATABASE_URL="postgres://localhost/vne"\nREDIS_URL=redis://localhost:6379\nOPENAI_API_KEY=sk-local-redacted\nPRIVATE_KEY="-----BEGIN KEY-----\nabc123\n-----END KEY-----"\nNEXT_PUBLIC_SITE_URL=http://localhost:1420\nNEXT_PUBLIC_API_KEY=sk-browser-leak\nPORT=1420 # dev server\nFEATURE_ENABLED=true\nFEATURE_ENABLED=false\n',
+          '# local development\nDATABASE_URL="postgres://localhost/vne"\nREDIS_URL=redis://localhost:6379\nOPENAI_API_KEY=sk-local-redacted\nPRIVATE_KEY="-----BEGIN KEY-----\nabc123\n-----END KEY-----"\nNEXT_PUBLIC_SITE_URL=http://localhost:1420\nNEXT_PUBLIC_API_KEY=sk-browser-leak\nPORT=1420 # dev server\nFEATURE_ENABLED=true\nFEATURE_ENABLED=false\nNEXTAUTH_SECRET=changeme\nSTRIPE_WEBHOOK_SECRET=\n',
         entries: [
           entry('DATABASE_URL', 'postgres://localhost/vne', 'Credential URL / DSN', 'credential-url', true, 2, [
             'credential-bearing URL key name',
@@ -41,7 +41,9 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
           ]),
           entry('PORT', '1420', 'Port', 'port', false, 10, ['port-like key or numeric port value'], [], '# dev server'),
           entry('FEATURE_ENABLED', 'true', 'Boolean', 'bool', false, 11, ['boolean-like value'], ['Duplicate key']),
-          entry('FEATURE_ENABLED', 'false', 'Boolean', 'bool', false, 12, ['boolean-like value'], ['Duplicate key'])
+          entry('FEATURE_ENABLED', 'false', 'Boolean', 'bool', false, 12, ['boolean-like value'], ['Duplicate key']),
+          entry('NEXTAUTH_SECRET', 'changeme', 'Secret', 'secret', true, 13, ['secret-like key name']),
+          entry('STRIPE_WEBHOOK_SECRET', '', 'Secret', 'secret', true, 14, ['Stripe convention', 'secret-like key name'])
         ]
       },
       {
@@ -210,7 +212,7 @@ export function sampleProject(root = '/demo/project'): ProjectSnapshot {
       basePath,
       examplePath,
       missingKeys: ['STRIPE_SECRET_KEY'],
-      extraKeys: ['OPENAI_API_KEY', 'PRIVATE_KEY', 'NEXT_PUBLIC_API_KEY', 'FEATURE_ENABLED'],
+      extraKeys: ['OPENAI_API_KEY', 'PRIVATE_KEY', 'NEXT_PUBLIC_API_KEY', 'FEATURE_ENABLED', 'NEXTAUTH_SECRET', 'STRIPE_WEBHOOK_SECRET'],
       sharedKeys: ['DATABASE_URL', 'NEXT_PUBLIC_SITE_URL', 'PORT', 'REDIS_URL'],
       duplicateKeys: ['.env:FEATURE_ENABLED']
     }
@@ -235,7 +237,7 @@ function entry(
     key,
     value,
     displayValue: redacted ? '********' : value,
-    valueState: value.trim() === '' ? 'empty' : 'set',
+    valueState: value.trim() === '' ? 'empty' : value === 'changeme' ? 'placeholder' : 'set',
     lineNumber,
     exported: false,
     quote: null,

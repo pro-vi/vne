@@ -1,12 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { sampleProject } from './sample';
-import { isEntryValueHidden, keyStatus, totalIssueCount } from './summary';
+import { isEntryValueHidden, keyStatus } from './summary';
 
 describe('env summary helpers', () => {
-  it('counts comparison and diagnostic issues', () => {
-    expect(totalIssueCount(sampleProject())).toBe(9);
-  });
-
   it('marks extra and missing comparison keys in the relevant files', () => {
     const snapshot = sampleProject();
     const actual = snapshot.files[0];

@@ -1,22 +1,7 @@
-import type { EnvComparison, EnvEntry, EnvFile, KeyStatus, ProjectSnapshot } from './types';
+import type { EnvComparison, EnvEntry, EnvFile, KeyStatus } from './types';
 
 export function isEntryValueHidden(entry: EnvEntry, revealed: boolean): boolean {
   return entry.shape.redactedByDefault && !revealed;
-}
-
-export function totalIssueCount(snapshot: ProjectSnapshot | null): number {
-  if (!snapshot) {
-    return 0;
-  }
-
-  const comparisonIssues = snapshot.comparison
-    ? snapshot.comparison.missingKeys.length + snapshot.comparison.extraKeys.length + snapshot.comparison.duplicateKeys.length
-    : 0;
-  const layerIssues =
-    snapshot.layerReport.overrides.filter((override) => override.conflict).length + snapshot.layerReport.placeholderKeys.length;
-  const fileDiagnostics = snapshot.files.reduce((total, file) => total + file.diagnostics.length, 0);
-
-  return comparisonIssues + layerIssues + fileDiagnostics;
 }
 
 export function keyStatus(file: EnvFile, entry: EnvEntry, comparison: EnvComparison | null): KeyStatus {
