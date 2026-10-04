@@ -18,7 +18,15 @@ vne add .env OPENAI_API_KEY --prompt          # for you: type the secret, hidden
 
 ## Install
 
-Requires Rust 1.90 or newer, Node matching `^20.19.0 || >=22.12.0` (the engine range for Vite 8.2.2), and the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/).
+macOS on Apple Silicon:
+
+```sh
+brew install pro-vi/de/vne
+```
+
+Use the full name. As of Homebrew 7.0, installing a formula by its full name trusts it, and Homebrew ignores formulae from a third-party tap it has not been told to trust.
+
+From source, which needs Rust 1.90 or newer, Node matching `^20.19.0 || >=22.12.0` (the engine range for Vite 8.2.2), and the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/):
 
 ```sh
 npm install
@@ -231,7 +239,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- inspect fixtures/dem
 
 ## Status
 
-Version 0.1.0, pre-release. Source-only; no packaged installer yet. Native behavior is tested on macOS with Apple Silicon; other platforms are unverified.
+Version 0.1.0, pre-release. Prebuilt for macOS on Apple Silicon, where native behavior is tested. Other platforms build from source and are unverified.
 
 ## License
 
