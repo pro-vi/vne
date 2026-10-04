@@ -1,5 +1,7 @@
 # ADR 0002: Copy Exact Env Value Tokens
 
+Implementation scope: the metadata limitation below describes the original writer. The shared writer now preserves captured extended attributes and, on macOS, copies ACLs before replacement. See [the current metadata contract](../THREAT_MODEL.md#known-residual-risks).
+
 - **Status:** Accepted
 - **Date:** 2026-08-12
 - **Deciders:** Provi, Codex
@@ -67,8 +69,6 @@ Negative:
 
 ## References
 
-- `docs/plans/2026-08-12-001-feat-secret-safe-env-key-copy-plan.md`
 - `src-tauri/src/lib.rs`
 - `src-tauri/src/cli.rs`
 - `src-tauri/tests/cli_output.rs`
-- `.inbox/.read/2026-08-12-secret-safe-env-key-copy.md` (local archived request)

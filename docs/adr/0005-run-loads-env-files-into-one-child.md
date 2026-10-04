@@ -1,5 +1,7 @@
 # ADR 0005: `vne run` Loads Env Files Into One Child Process
 
+Output scope: default CLI inspection withholds stored values. Human value-display modes and the program launched by `run` can expose values; that program can also pass its environment to its children. See [the current threat model](../THREAT_MODEL.md#known-residual-risks).
+
 - **Status:** Accepted
 - **Date:** 2026-09-23
 - **Deciders:** Provi, Claude

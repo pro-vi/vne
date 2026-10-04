@@ -2855,3 +2855,330 @@ fn where_reports_git_status_for_the_files_that_hold_the_key() {
     let json: Value = serde_json::from_slice(&named.stdout).unwrap();
     assert_eq!(json["matches"][0]["gitStatus"], "tracked");
 }
+
+#[cfg(unix)]
+fn run_vne_with_deadline(args: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vne"))
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("vne did not finish reading the named path within the test deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(unix)]
+fn named_fifo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempdir().unwrap();
+    let fifo = directory.path().join(".env");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    (directory, fifo)
+}
+
+#[cfg(unix)]
+#[test]
+fn check_rejects_named_fifo() {
+    let (_directory, fifo) = named_fifo();
+    let output = run_vne_with_deadline(&["check", fifo.to_str().unwrap(), "--json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr).unwrap().contains("regular file"));
+}
+
+#[cfg(unix)]
+#[test]
+fn where_rejects_named_fifo() {
+    let (_directory, fifo) = named_fifo();
+    let output = run_vne_with_deadline(&["where", "PORT", fifo.to_str().unwrap(), "--json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr).unwrap().contains("regular file"));
+}
+
+#[cfg(unix)]
+#[test]
+fn named_character_device_is_refused_instead_of_read_as_empty() {
+    for args in [
+        vec!["check", "/dev/null", "--json"],
+        vec!["where", "PORT", "/dev/null", "--json"],
+    ] {
+        let output = run_vne_with_deadline(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8(output.stderr).unwrap().contains("regular file"));
+    }
+}
+
+#[test]
+fn named_oversized_file_is_refused_before_parsing() {
+    let directory = tempdir().unwrap();
+    let file = directory.path().join(".env");
+    let created = fs::File::create(&file).unwrap();
+    created.set_len(vne_lib::SCAN_MAX_FILE_BYTES + 1).unwrap();
+    for args in [
+        vec!["check", file.to_str().unwrap(), "--json"],
+        vec!["where", "PORT", file.to_str().unwrap(), "--json"],
+    ] {
+        let output = run_vne(args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8(output.stderr).unwrap().contains("byte read bound"));
+    }
+}
+
+#[test]
+fn named_regular_file_at_the_read_bound_still_works() {
+    use std::io::Write;
+    let directory = tempdir().unwrap();
+    let file = directory.path().join(".env");
+    let prefix = b"PORT=1420\n#";
+    let mut created = fs::File::create(&file).unwrap();
+    created.write_all(prefix).unwrap();
+    let padding = vec![b' '; vne_lib::SCAN_MAX_FILE_BYTES as usize - prefix.len()];
+    created.write_all(&padding).unwrap();
+    for args in [
+        vec!["check", file.to_str().unwrap(), "--json"],
+        vec!["where", "PORT", file.to_str().unwrap(), "--json"],
+    ] {
+        let output = run_vne(args);
+        assert_eq!(output.status.code(), Some(0));
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if json.get("matches").is_some() {
+            assert_eq!(json["matches"][0]["valueState"], "set");
+        } else {
+            assert_eq!(json["file"]["entries"][0]["valueState"], "set");
+        }
+    }
+}
+
+#[test]
+fn mutation_refuses_to_create_a_file_larger_than_the_read_bound() {
+    use std::io::Write;
+    let directory = tempdir().unwrap();
+    let file = directory.path().join(".env");
+    let prefix = b"PORT=1420\n#";
+    let mut created = fs::File::create(&file).unwrap();
+    created.write_all(prefix).unwrap();
+    created.write_all(&vec![b' '; vne_lib::SCAN_MAX_FILE_BYTES as usize - prefix.len()]).unwrap();
+    let before = fs::read(&file).unwrap();
+
+    let output = run_vne(["add", file.to_str().unwrap(), "NEW_FLAG", "true", "--json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr).unwrap().contains("read bound"));
+    assert!(fs::read(&file).unwrap() == before, "refusal must not change the destination");
+}
+
+#[test]
+fn rejected_command_options_and_extra_arguments_are_not_echoed() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source.env");
+    let destination = directory.path().join("destination.env");
+    let created = directory.path().join("created.env");
+    write(&source, "PORT=1420\n");
+    write(&destination, "OTHER=1\n");
+    let source = source.to_str().unwrap();
+    let destination = destination.to_str().unwrap();
+    let created = created.to_str().unwrap();
+    let root = directory.path().to_str().unwrap();
+    let option = "--OpaqueRejectedOptionP7Q8R9";
+    let extra = "OpaqueRejectedArgumentS1T2U3";
+    let invalid_value = "PORT=OpaqueRejectedValueV4W5X6";
+    let cases = [
+        ("launcher option", vec![option], "unknown option"),
+        ("check option", vec!["check", source, option], "unknown check option"),
+        ("check argument", vec!["check", source, extra], "unexpected check argument"),
+        ("inspect option", vec!["inspect", root, option], "unknown inspect option"),
+        ("inspect argument", vec!["inspect", root, extra], "unexpected inspect argument"),
+        ("format option", vec!["format", source, "--dry-run", option], "unknown format option"),
+        ("format argument", vec!["format", source, "--dry-run", extra], "unexpected format argument"),
+        ("set option", vec!["set", source, "PORT", "--stdin", option], "unknown set option"),
+        ("rm option", vec!["rm", source, "PORT", option], "unknown rm option"),
+        ("rm line value", vec!["rm", source, "PORT", "--line", invalid_value], "--line requires a positive line number"),
+        ("rm expectation value", vec!["rm", source, "PORT", "--expect", invalid_value], "--expect accepts `present` or `absent`"),
+        ("rename option", vec!["rename", source, "PORT", "NEW_PORT", option], "unknown rename option"),
+        ("example option", vec!["example", source, option], "unknown example option"),
+        ("example argument", vec!["example", source, extra], "unexpected example argument"),
+        ("create option", vec!["create", created, option], "unknown create option"),
+        ("create argument", vec!["create", created, extra], "unexpected create argument"),
+        ("run option", vec!["run", source, option, "--", "node"], "unknown run option"),
+        ("where option", vec!["where", "PORT", source, option], "unknown where option"),
+        ("copy option", vec!["copy", source, "PORT", destination, option], "unknown copy option"),
+    ];
+    let mut failures = Vec::new();
+    for (label, args, expected) in cases {
+        let output = run_vne(args);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if output.status.code() != Some(2)
+            || !stdout.is_empty()
+            || !stderr.contains(expected)
+            || stderr.contains(option)
+            || stderr.contains(extra)
+            || stderr.contains(invalid_value)
+        {
+            failures.push(label);
+        }
+    }
+    assert!(failures.is_empty(), "rejected-input cases failed: {failures:?}");
+}
+
+#[test]
+fn oversized_example_output_does_not_create_or_change_destination() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join(".env");
+    let destination = directory.path().join(".env.example");
+    write(&source, &format!("{}=", "A".repeat(10 * 1024 * 1024 - 1)));
+    let output = run_vne(["example", source.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!destination.exists(), "size refusal must precede destination creation");
+
+    write(&destination, "PORT=\n");
+    let output = run_vne(["example", source.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "PORT=\n");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn set_preserves_macos_access_control_list() {
+    let directory = tempdir().unwrap();
+    let file = directory.path().join(".env");
+    write(&file, "PORT=1420\n");
+    let output = Command::new("/bin/chmod")
+        .args(["+a", "user:_www deny read"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "fixture ACL must be installed");
+    let acl = |file: &Path| {
+        let output = Command::new("/bin/ls").arg("-le").arg(file).output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().lines()
+            .filter(|line| line.trim_start().starts_with("0:"))
+            .map(str::to_owned).collect::<Vec<_>>()
+    };
+    let before = acl(&file);
+    assert_eq!(before.len(), 1, "fixture must have an ACL entry");
+    let output = run_vne_with_stdin(["set", file.to_str().unwrap(), "PORT", "--stdin"], "1421\n");
+    assert!(output.status.success(), "set must succeed");
+    assert_eq!(acl(&file), before, "replacement must retain the deny-read ACL");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "PORT=1421\n");
+}
+
+#[test]
+fn missing_references_are_reported_without_changing_scan_or_lookup_exit_codes() {
+    let directory = tempdir().unwrap();
+    write(&directory.path().join(".env"), "PORT=1420\n");
+    write(&directory.path().join("package.json"), r#"{"scripts":{"start":"node --env-file=.env.production app.js"}}"#);
+    write(&directory.path().join("compose.yaml"), "services:\n  app:\n    env_file:\n      - .env.production\n      - deploy/runtime.env\n");
+    let root = directory.path().to_str().unwrap();
+    let inspected = run_vne(["inspect", root, "--json"]);
+    assert_eq!(inspected.status.code(), Some(0));
+    let snapshot: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert!(snapshot["incomplete"].as_array().unwrap().is_empty());
+    let notices: Vec<&Value> = snapshot["findings"].as_array().unwrap().iter()
+        .filter(|finding| finding["actionKind"] == "missingReference").collect();
+    assert_eq!(notices.len(), 2, "one notice per missing path, even when two sources refer to it");
+    assert!(notices.iter().all(|finding| finding["severity"] == "info"));
+    let production = notices.iter().find(|finding| finding["title"].as_str().unwrap().contains(".env.production")).unwrap();
+    assert!(production["evidence"].as_array().unwrap().iter().any(|value| value.as_str().unwrap().contains("package.json")));
+    assert!(production["evidence"].as_array().unwrap().iter().any(|value| value.as_str().unwrap().contains("compose.yaml")));
+
+    for (key, expected_exit) in [("PORT", 0), ("ABSENT_KEY", 1)] {
+        let output = run_vne(["where", key, root, "--json"]);
+        assert_eq!(output.status.code(), Some(expected_exit));
+        let lookup: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(lookup["searched"][0]["missingReferences"].as_array().unwrap().len(), 2);
+        assert!(lookup["searched"][0]["incomplete"].as_array().unwrap().is_empty());
+    }
+    for args in [vec!["inspect", root, "--text"], vec!["where", "PORT", root, "--text"]] {
+        let output = run_vne(args);
+        assert_eq!(output.status.code(), Some(0));
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(".env.production") && text.contains("deploy/runtime.env"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn referenced_fifo_is_incomplete_without_blocking() {
+    let directory = tempdir().unwrap();
+    let nested = directory.path().join("deploy");
+    fs::create_dir(&nested).unwrap();
+    let (_fifo_directory, source_fifo) = named_fifo();
+    let fifo = nested.join("runtime.env");
+    fs::rename(source_fifo, &fifo).unwrap();
+    let reference = format!("deploy/{}", fifo.file_name().unwrap().to_str().unwrap());
+    write(&directory.path().join("compose.yaml"), &format!("services:\n  app:\n    env_file: {reference}\n"));
+    let output = run_vne_with_deadline(&["inspect", directory.path().to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(snapshot["incomplete"].as_array().unwrap().iter().any(|file| file["name"] == reference && file["reason"] == "not-regular-file"));
+    let output = run_vne_with_deadline(&["where", "ABSENT_KEY", directory.path().to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn missing_reference_report_limit_is_visible_and_nonfatal() {
+    let directory = tempdir().unwrap();
+    let mut compose = String::from("services:\n  app:\n    env_file:\n");
+    for index in 0..=vne_lib::SCAN_MAX_DISCOVERY_REFS {
+        compose.push_str(&format!("      - missing-{index}.env\n"));
+    }
+    write(&directory.path().join("compose.yaml"), &compose);
+    let output = run_vne(["inspect", directory.path().to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let notices = snapshot["findings"].as_array().unwrap();
+    assert_eq!(notices.iter().filter(|finding| finding["filePath"].is_string()).count(), vne_lib::SCAN_MAX_DISCOVERY_REFS);
+    assert_eq!(notices.iter().filter(|finding| finding["filePath"].is_null() && finding["title"].as_str().unwrap().contains("omitted")).count(), 1);
+    assert!(snapshot["incomplete"].as_array().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn repeated_references_do_not_duplicate_a_direct_fifo_outcome() {
+    let (directory, fifo) = named_fifo();
+    write(&directory.path().join("package.json"), r#"{"scripts":{"start":"node --env-file=.env app.js"}}"#);
+    write(&directory.path().join("compose.yaml"), "services:\n  app:\n    env_file: [.env, .env]\n");
+    let output = run_vne_with_deadline(&["inspect", directory.path().to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(snapshot["incomplete"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["findings"].as_array().unwrap().iter().filter(|finding| finding["actionKind"] == "incompleteScan").count(), 1);
+    assert!(fifo.exists());
+}
+
+#[test]
+fn present_reference_after_discovery_limit_is_reported_incomplete() {
+    let directory = tempdir().unwrap();
+    let nested = directory.path().join("deploy");
+    fs::create_dir(&nested).unwrap();
+    write(&nested.join("runtime.env"), "PORT=1420\n");
+    let mut compose = String::from("services:\n  app:\n    env_file:\n");
+    for index in 0..vne_lib::SCAN_MAX_DISCOVERY_REFS {
+        compose.push_str(&format!("      - missing-{index}.env\n"));
+    }
+    compose.push_str("      - deploy/runtime.env\n      - deploy/runtime.env\n");
+    write(&directory.path().join("compose.yaml"), &compose);
+    let output = run_vne(["inspect", directory.path().to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(snapshot["files"].as_array().unwrap().len(), 0);
+    assert_eq!(snapshot["incomplete"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["incomplete"][0]["name"], "deploy/runtime.env");
+    assert_eq!(snapshot["incomplete"][0]["reason"], "count-limit");
+}

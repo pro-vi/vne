@@ -1,10 +1,11 @@
 [package]
 name = "vne"
 version = "0.1.0"
+license = "MIT"
 description = "A local private .env viewer and editor"
 authors = ["vne contributors"]
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.90"
 default-run = "vne"
 
 [features]
@@ -28,3 +29,6 @@ xattr = "1"
 tempfile = "3.27.0"
 
 [dev-dependencies]
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }

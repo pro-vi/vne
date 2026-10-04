@@ -243,6 +243,7 @@ struct WhereSearch {
     path: String,
     files: Vec<String>,
     incomplete: Vec<IncompleteEnvFile>,
+    missing_references: Vec<crate::EnvFinding>,
 }
 
 pub fn is_cli_invocation(args: &[String]) -> bool {
@@ -665,6 +666,9 @@ fn run_inspect(
         for file in &snapshot.files {
             print_file_summary(file)?;
         }
+        for notice in snapshot.findings.iter().filter(|finding| finding.action_kind == crate::MISSING_REFERENCE_ACTION) {
+            stdout_line(format_args!("  {}", notice.title))?;
+        }
         if let Some(comparison) = &snapshot.comparison {
             print_comparison(comparison)?;
         }
@@ -687,17 +691,20 @@ fn run_where(
 
     let git_scope = crate::GitStatusScope::FilesWithKey(key);
     for path in paths {
-        let (root, files, incomplete) = if path.is_dir() {
+        let (root, files, incomplete, missing_references) = if path.is_dir() {
             let snapshot = crate::scan_project(path, git_scope).map_err(|error| {
                 io::Error::new(
                     error.kind(),
                     format!("could not scan {}: {error}", path.display()),
                 )
             })?;
-            (snapshot.root, snapshot.files, snapshot.incomplete)
+            let missing = snapshot.findings.into_iter()
+                .filter(|finding| finding.action_kind == crate::MISSING_REFERENCE_ACTION)
+                .collect();
+            (snapshot.root, snapshot.files, snapshot.incomplete, missing)
         } else {
             let file = load_env_files(&[path], git_scope)?.remove(0);
-            (file.path.clone(), vec![file], Vec::new())
+            (file.path.clone(), vec![file], Vec::new(), Vec::new())
         };
 
         for file in &files {
@@ -717,6 +724,7 @@ fn run_where(
             path: root,
             files: files.into_iter().map(|file| file.path).collect(),
             incomplete,
+            missing_references,
         });
     }
 
@@ -778,6 +786,9 @@ fn print_where_text(output: &WhereOutput) -> io::Result<()> {
                 "  {}: not read: {} ({})",
                 search.path, skipped.name, skipped.reason
             ))?;
+        }
+        for notice in &search.missing_references {
+            stdout_line(format_args!("  {}: {}", search.path, notice.title))?;
         }
     }
 
@@ -1232,7 +1243,7 @@ fn warn_when_tracked_by_git(path: &Path) -> io::Result<()> {
 }
 
 fn read_to_string_with_path(path: &Path) -> io::Result<String> {
-    fs::read_to_string(path).map_err(|error| {
+    crate::read_regular_file_bounded(path).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("could not read {}: {error}", path.display()),
@@ -1307,7 +1318,8 @@ fn print_comparison(comparison: &EnvComparison) -> io::Result<()> {
 }
 
 fn has_snapshot_findings(snapshot: &ProjectSnapshot) -> bool {
-    !snapshot.findings.is_empty() || snapshot.files.iter().any(has_file_findings)
+    snapshot.findings.iter().any(|finding| finding.action_kind != crate::MISSING_REFERENCE_ACTION)
+        || snapshot.files.iter().any(has_file_findings)
 }
 
 fn has_file_findings(file: &EnvFile) -> bool {
@@ -1336,7 +1348,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, ParseEr
     let Some(entry) = cli_command(&command) else {
         return Err(ParseError::new(
             HelpTopic::General,
-            format!("unknown command `{command}`"),
+            "unknown command",
         ));
     };
 
@@ -1371,14 +1383,14 @@ fn parse_check_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Check,
-                    format!("unknown check option `{}`", argument_label(&arg)),
+                    "unknown check option",
                 ));
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Check,
-                    format!("unexpected check argument `{}`", argument_label(&arg)),
+                    "unexpected check argument",
                 ));
             }
         }
@@ -1411,14 +1423,14 @@ fn parse_inspect_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Inspect,
-                    format!("unknown inspect option `{}`", argument_label(&arg)),
+                    "unknown inspect option",
                 ));
             }
             _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Inspect,
-                    format!("unexpected inspect argument `{}`", argument_label(&arg)),
+                    "unexpected inspect argument",
                 ));
             }
         }
@@ -1445,14 +1457,14 @@ fn parse_format_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Format,
-                    format!("unknown format option `{}`", argument_label(&arg)),
+                    "unknown format option",
                 ));
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Format,
-                    format!("unexpected format argument `{}`", argument_label(&arg)),
+                    "unexpected format argument",
                 ));
             }
         }
@@ -1555,10 +1567,7 @@ fn parse_set_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Set,
-                    format!(
-                        "unknown set option `{}`; {SET_VALUE_SOURCE_RULE}",
-                        argument_label(&arg)
-                    ),
+                    format!("unknown set option; {SET_VALUE_SOURCE_RULE}"),
                 ));
             }
             _ => positionals.push(arg),
@@ -1615,7 +1624,7 @@ fn parse_rm_args(args: ArgIter) -> Result<Command, ParseError> {
                 let Some(line_number) = value.parse::<usize>().ok().filter(|line| *line > 0) else {
                     return Err(ParseError::new(
                         HelpTopic::Remove,
-                        format!("--line requires a positive line number, not `{value}`"),
+                        "--line requires a positive line number",
                     ));
                 };
                 set_remove_selector(&mut selector, EnvKeyRemoveSelector::Line(line_number))?;
@@ -1633,7 +1642,7 @@ fn parse_rm_args(args: ArgIter) -> Result<Command, ParseError> {
                     _ => {
                         return Err(ParseError::new(
                             HelpTopic::Remove,
-                            format!("--expect accepts `present` or `absent`, not `{value}`"),
+                            "--expect accepts `present` or `absent`",
                         ))
                     }
                 };
@@ -1649,7 +1658,7 @@ fn parse_rm_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Remove,
-                    format!("unknown rm option `{}`", argument_label(&arg)),
+                    "unknown rm option",
                 ));
             }
             _ => positionals.push(arg),
@@ -1710,7 +1719,7 @@ fn parse_rename_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Rename,
-                    format!("unknown rename option `{}`", argument_label(&arg)),
+                    "unknown rename option",
                 ));
             }
             _ => positionals.push(arg),
@@ -1773,14 +1782,14 @@ fn parse_example_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Example,
-                    format!("unknown example option `{}`", argument_label(&arg)),
+                    "unknown example option",
                 ));
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Example,
-                    format!("unexpected example argument `{}`", argument_label(&arg)),
+                    "unexpected example argument",
                 ));
             }
         }
@@ -1810,14 +1819,14 @@ fn parse_create_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Create,
-                    format!("unknown create option `{}`", argument_label(&arg)),
+                    "unknown create option",
                 ));
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => {
                 return Err(ParseError::new(
                     HelpTopic::Create,
-                    format!("unexpected create argument `{}`", argument_label(&arg)),
+                    "unexpected create argument",
                 ));
             }
         }
@@ -1843,7 +1852,7 @@ fn parse_run_args(mut args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Run,
-                    format!("unknown run option `{}`", argument_label(&arg)),
+                    "unknown run option",
                 ));
             }
             _ => files.push(PathBuf::from(arg)),
@@ -1881,7 +1890,7 @@ fn parse_where_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Where,
-                    format!("unknown where option `{}`", argument_label(&arg)),
+                    "unknown where option",
                 ));
             }
             _ => positionals.push(arg),
@@ -1926,7 +1935,7 @@ fn parse_copy_args(args: ArgIter) -> Result<Command, ParseError> {
             _ if arg.starts_with('-') => {
                 return Err(ParseError::new(
                     HelpTopic::Copy,
-                    format!("unknown copy option `{}`", argument_label(&arg)),
+                    "unknown copy option",
                 ));
             }
             _ => positionals.push(arg),
@@ -2037,15 +2046,15 @@ fn print_usage_to_stderr(topic: HelpTopic) -> io::Result<()> {
 fn usage_text(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::General => {
-            "vne - local private .env viewer and editor\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--allow-empty] [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--allow-empty] [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n  vne run <file>... -- <command> [args...]\n  vne where <KEY> [path...] [--text|--json|--pretty]\n  vne --version\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  Each entry's valueState says whether the stored value is set, empty, or a\n  placeholder such as changeme, with or without --values.\n  copy, set, rm, rename, and example output contains only state, paths, keys, and lines.
+            "vne - local private .env viewer and editor\n\nAGENTS:\n  Start with where <KEY> [path...] before saying a key is unavailable.\n  Use inspect, check and where without --values for metadata without stored values.\n  Read valueState for set/empty/placeholder; value, displayValue and content\n  may contain withheld markers instead of data.\n  Hand secret entry to the user with add --prompt or set --prompt.\n  Only pass known non-secret values as arguments or agent-provided stdin.\n  Run create, add, set, rm, rename, example and copy when the user requests\n  the mutation; copy transfers values internally without returning them.\n  run gives values to the chosen command, whose output can expose them;\n  use it only for authorized commands that do not print their environment.\n  The desktop, --values and format --dry-run are local human surfaces.\n\nUSAGE:\n  vne [project-dir]\n  vne create <file> [--text|--json|--pretty]\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n  vne set <file> <KEY> --stdin [--allow-empty] [--text|--json|--pretty]\n  vne set <file> <KEY> --prompt [--allow-empty] [--text|--json|--pretty]\n  vne rm <file> <KEY> [--all|--line <N>] [--expect present|absent] [--text|--json|--pretty]\n  vne rename <file> <OLD_KEY> <NEW_KEY> [--text|--json|--pretty]\n  vne example <file> [--example <file>] [--text|--json|--pretty]\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n  vne format <file> --dry-run\n  vne run <file>... -- <command> [args...]\n  vne where <KEY> [path...] [--text|--json|--pretty]\n  vne --version\n\nOUTPUT:\n  Human text is used on a terminal. Piped output is JSON unless --text is set.\n  JSON withholds all env values, comments, and raw content by default.\n  Each entry's valueState says whether the stored value is set, empty, or a\n  placeholder such as changeme, with or without --values.\n  copy, set, rm, rename, and example output contains only state, paths, keys, and lines.
   example additions are key-only placeholders; comments never travel from real files.\n  where output contains only the key, paths, lines, value states, git status,\n  and the name and reason of each discovered file it did not read.\n  --values includes classifier-approved values; comments and raw content stay withheld.\n  --json emits compact JSON; --pretty emits formatted JSON.\n  format --dry-run is a human-terminal command: it refuses piped stdout and
-  asks for confirmation before printing raw values.\n  A disposition can reveal whether a value you supplied equals the stored one,\n  and valueState whether a value is empty or a template; vne keeps values out of\n  its output, not every fact derived from them.\n  run prints nothing itself; the command it starts receives the values.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne where OPENAI_API_KEY . ~/.config/keys\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne example .env\n  vne copy ../other/.env DATABASE_URL .env\n  vne run ~/.config/keys/fal.env -- falgen image \"a lighthouse\"\n"
+  asks for confirmation before printing raw values.\n  A disposition can reveal whether a value you supplied equals the stored one,\n  and valueState whether a value is empty or a template. Default CLI inspection\n  withholds stored values, not every fact derived from them.\n  run does not print loaded env values; the command it starts receives them.\n\nEXAMPLES:\n  vne .\n  vne create .env --json\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n  vne where OPENAI_API_KEY . ~/.config/keys\n  vne check fixtures/demo/.env --example fixtures/demo/.env.example --json\n  vne add .env FEATURE_FLAG=true --json\n  vne add .env OPENAI_API_KEY --prompt\n  vne set .env OPENAI_API_KEY --prompt\n  vne rm .env STALE_FLAG\n  vne rename .env OLD_NAME NEW_NAME\n  vne example .env\n  vne copy ../other/.env DATABASE_URL .env\n  vne run ~/.config/keys/fal.env -- falgen image \"a lighthouse\"\n"
         }
         HelpTopic::Check => {
-            "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
+            "vne check - inspect one env file and optionally compare it with an example contract\n\nUSAGE:\n  vne check <file> [--example <file>] [--text|--json|--pretty] [--values]\n\nBEHAVIOR:\n  Named files must be regular UTF-8 files within the 10 MiB read bound.\n  An explicitly named symlink may point to a regular file.\n\nOPTIONS:\n  --example <file>  Compare actual keys against an example env file\n  --text            Force human text output\n  --json            Emit compact one-line JSON; payloads are withheld by default\n  --pretty          Emit formatted JSON; payloads are withheld by default\n  --values          Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne check .env\n  vne check .env --example .env.example --json\n  vne check .env --json --values\n"
         }
         HelpTopic::Inspect => {
-            "vne inspect - scan a project directory for env files and findings\n\nUSAGE:\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit compact one-line JSON; payloads are withheld by default\n  --pretty  Emit formatted JSON; payloads are withheld by default\n  --values  Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne inspect .\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n"
+            "vne inspect - scan a project directory for env files and findings\n\nBEHAVIOR:\n  Missing package-script and Compose env references are informational and do\n  not change exit codes. Unreadable project references are incomplete;\n  references resolved outside the project are excluded.\n  Missing-reference notices retain at most 10,000 paths; omissions are reported.\n\nUSAGE:\n  vne inspect <dir> [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit compact one-line JSON; payloads are withheld by default\n  --pretty  Emit formatted JSON; payloads are withheld by default\n  --values  Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne inspect .\n  vne inspect fixtures/demo --json\n  vne inspect fixtures/demo --json --values\n"
         }
         HelpTopic::Add => {
             "vne add - append one non-duplicate env key while preserving file formatting\n\nUSAGE:\n  vne add <file> <KEY> <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY=VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --value <VALUE> [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --stdin [--text|--json|--pretty] [--values]\n  vne add <file> <KEY> --prompt [--text|--json|--pretty] [--values]\n\nOPTIONS:\n  --value <VALUE>  Read the new value from a flag\n  --stdin          Read the new value from stdin\n  --prompt         Offer to create a missing env file, then read a hidden value\n  --text           Force human text output\n  --json           Emit compact one-line JSON; payloads are withheld by default\n  --pretty         Emit formatted JSON; payloads are withheld by default\n  --values         Include classifier-approved values; comments and raw content stay withheld\n\nEXAMPLES:\n  vne add .env FEATURE_FLAG=true --json\n  printf '%s' 'sk-local' | vne add .env OPENAI_API_KEY --stdin --json\n  vne add .env OPENAI_API_KEY --prompt\n"
@@ -2069,10 +2078,10 @@ fn usage_text(topic: HelpTopic) -> &'static str {
             "vne copy - copy one env key between existing files without exposing its value\n\nUSAGE:\n  vne copy <source-file> <KEY> <destination-file> [--overwrite] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Source and destination must be distinct existing regular files.\n  The source key must occur exactly once and be well formed.\n  An absent destination key is added. An identical value reports alreadyPresent without writing.\n  That disposition tells the caller the two values are equal.\n  A different destination value requires --overwrite. Duplicate destination keys are refused.\n  The value stays inside vne; output contains only state, normalized paths, and key.\n\nOPTIONS:\n  --overwrite  Replace one different existing destination value\n  --text       Force human text output\n  --json       Emit a compact payload-free copy receipt\n  --pretty     Emit a formatted payload-free copy receipt\n\nEXAMPLE:\n  vne copy ../other/.env DATABASE_URL .env\n  vne copy ../other/.env DATABASE_URL .env --overwrite --json\n"
         }
         HelpTopic::Run => {
-            "vne run - start one command with env files loaded into its environment only\n\nUSAGE:\n  vne run <file>... -- <command> [args...]\n\nBEHAVIOR:\n  Keys from the files reach the command and nothing else; the calling shell never\n  holds them. A key from a file replaces an inherited variable of the same name.\n  Files are read as data. Values are literal: nothing is expanded or executed.\n  Inside quotes, only \\\\ and an escaped quote are read; any other escape refuses.\n  A line that is not an entry, a comment, or blank refuses the run, as do a\n  malformed entry, a key repeated in one file, and a key defined in two files.\n  `env`, `printenv`, and shell -c scripts that list the environment are refused.\n  That check catches a slip; any command you choose can still print what it gets.\n  vne prints nothing when the command starts. Refusals exit 2; a command that\n  cannot start exits 127 (not found) or 126, as a shell would; otherwise the\n  exit status is the command's own.\n\nEXAMPLES:\n  vne run ~/.config/keys/fal.env -- falgen image \"a lighthouse\"\n  vne run .env .env.local -- npm run dev\n  vne run keys.env -- sh -c 'printf \"Authorization: Bearer %s\\n\" \"$API_KEY\" | curl -H @- https://api.example.com'\n"
+            "vne run - start one command with env files loaded into its environment only\n\nUSAGE:\n  vne run <file>... -- <command> [args...]\n\nBEHAVIOR:\n  Keys reach the command, which can pass them to its child processes.\n  The calling shell does not receive them. A key from a file replaces an inherited variable of the same name.\n  Files are read as data. Values are literal: nothing is expanded or executed.\n  Inside quotes, only \\\\ and an escaped quote are read; any other escape refuses.\n  A line that is not an entry, a comment, or blank refuses the run, as do a\n  malformed entry, a key repeated in one file, and a key defined in two files.\n  `env`, `printenv`, and shell -c scripts that list the environment are refused.\n  That check catches a slip; any command you choose can still print what it gets.\n  vne prints nothing when the command starts. Refusals exit 2; a command that\n  cannot start exits 127 (not found) or 126, as a shell would; otherwise the\n  exit status is the command's own.\n\nEXAMPLES:\n  vne run ~/.config/keys/fal.env -- falgen image \"a lighthouse\"\n  vne run .env .env.local -- npm run dev\n  vne run keys.env -- sh -c 'printf \"Authorization: Bearer %s\\n\" \"$API_KEY\" | curl -H @- https://api.example.com'\n"
         }
         HelpTopic::Where => {
-            "vne where - find which env files hold a key, without printing its value\n\nUSAGE:\n  vne where <KEY> [path...] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Each path is a project directory, scanned the way `vne inspect` scans one, or a\n  single env file. With no path, the current directory is scanned. Directories\n  are not searched recursively, and no other location is searched unless named.\n  A symlink with an env filename is not followed and is reported as not read;\n  name the symlink as a path to read the file it points to.\n  Each match reports its file, line, value state, and git status. Values never\n  appear. A value of only whitespace or quote characters counts as empty; a\n  template such as changeme, todo, tbd, your_..., or <...> (any case) counts as\n  placeholder.\n  Exit 2 when a named path cannot be read, even if another path holds the key,\n  or when the key is not found and a discovered file was not read. Otherwise\n  exit 0 when the key is found and 1 when it is not.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit compact one-line JSON\n  --pretty  Emit formatted JSON\n\nEXAMPLES:\n  vne where OPENAI_API_KEY\n  vne where FAL_KEY . ~/.config/keys\n  vne where DATABASE_URL .env.local --json\n"
+            "vne where - find which env files hold a key, without printing its value\n\nUSAGE:\n  vne where <KEY> [path...] [--text|--json|--pretty]\n\nBEHAVIOR:\n  Each path is a project directory, scanned the way `vne inspect` scans one, or a\n  single env file. Named files must be regular UTF-8 files within the\n  10 MiB read bound. With no path, the current directory is scanned. Directories\n  are not searched recursively, and no other location is searched unless named.\n  A symlink with an env filename is not followed and is reported as not read;\n  name the symlink as a path to read the file it points to.\n  Missing package-script and Compose references appear in missingReferences\n  as nonfatal notices. Unreadable project references remain incomplete;\n  references resolved outside the project are excluded.\n  Each match reports its file, line, value state, and git status. Values never\n  appear. A value of only whitespace or quote characters counts as empty; a\n  template such as changeme, todo, tbd, your_..., or <...> (any case) counts as\n  placeholder.\n  Exit 2 when a named path cannot be read, even if another path holds the key,\n  or when the key is not found and a discovered file was not read. Otherwise\n  exit 0 when the key is found and 1 when it is not.\n\nOPTIONS:\n  --text    Force human text output\n  --json    Emit compact one-line JSON\n  --pretty  Emit formatted JSON\n\nEXAMPLES:\n  vne where OPENAI_API_KEY\n  vne where FAL_KEY . ~/.config/keys\n  vne where DATABASE_URL .env.local --json\n"
         }
         HelpTopic::Format => {
             "vne format - print the parsed env file without rewriting it\n\nWARNING:\n  This command emits raw env content. It does not apply JSON payload withholding or classified redaction.\n\nUSAGE:\n  vne format <file> --dry-run\n\nOPTIONS:\n  --dry-run  Required; print the current raw file content instead of writing\n\nEXAMPLE:\n  vne format .env --dry-run\n"
@@ -2451,7 +2460,7 @@ mod tests {
             let parsed = parse(&[name]);
             assert_ne!(
                 parsed,
-                Err(format!("unknown command `{name}`")),
+                Err("unknown command".to_string()),
                 "`{name}` is registered but not dispatched"
             );
 
@@ -2780,7 +2789,7 @@ mod tests {
             (&["run", "a.env", "--"][..], "a command after `--`"),
             (
                 &["run", "--values", "a.env", "--", "node"][..],
-                "unknown run option `--values`",
+                "unknown run option",
             ),
         ] {
             let message = parse(input).unwrap_err();

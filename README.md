@@ -1,6 +1,6 @@
 # vne
 
-A local `.env` editor and CLI that keeps secret values out of your terminal, your logs, and your AI agent's context.
+A local `.env` editor and CLI for finding keys and editing configuration. `inspect`, `check`, and `where` return metadata without stored values by default.
 
 `vne` treats an env file as structured configuration, not text. You find a key, see what kind of value it wants, change it, and go back to the app. Comments, order, quoting, and multiline values stay as they were. An agent can hand you a `vne` command to run, and you type the secret yourself.
 
@@ -12,7 +12,7 @@ A local `.env` editor and CLI that keeps secret values out of your terminal, you
 
 ## Install
 
-Requires Node, Rust 1.82 or newer, and the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/).
+Requires Rust 1.90 or newer, Node matching `^20.19.0 || >=22.12.0` (the engine range for Vite 8.2.2), and the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/).
 
 ```sh
 npm install
@@ -61,9 +61,23 @@ vne run ~/.config/keys/fal.env -- falgen image "a lighthouse"
 vne run .env .env.local -- npm run dev
 ```
 
-`run` loads the files into that one command's environment. Your shell, and every other process, never holds the keys. This replaces `set -a; source keys.env`, which puts every key into every process, where `env`, `ps eww`, or a crash dump can print them.
+`run` loads the files into that one command's environment. Your calling shell does not receive the loaded keys. The command can pass them to its own child processes. This replaces `set -a; source keys.env`, which puts every key into every process, where `env`, `ps eww`, or a crash dump can print them.
 
 Files are read as data, not shell code. `run` refuses to start if a line is not an entry, an entry is malformed or repeated, a key is defined in two files, or a quoted value uses an escape other than `\\` and an escaped quote. It also refuses `env`, `printenv`, and `sh -c` scripts that list the environment. That check catches a slip, not a caller who wants the value: any program you run can print what it receives. Reasoning: [ADR 0005](docs/adr/0005-run-loads-env-files-into-one-child.md).
+
+## For agents
+
+Project scans report missing package-script and Compose env references as informational notices. They do not change exit codes. Project-contained unreadable or non-regular references, and unresolved reference locations, produce incomplete records. References resolved outside the project are excluded. Missing-path notices retain up to 10,000 paths and disclose when additional notices were omitted.
+
+Start with `vne where <KEY> [path...]` before saying a key is unavailable. Name each directory to search; the default is the current project only. Use `inspect`, `check`, and `where` without `--values` to inspect metadata.
+
+Read `valueState` (`set`, `empty`, or `placeholder`) for the stored value's state. The strings `[value withheld by output policy]` and `[raw content withheld by output policy]` are markers, not stored values; do not test `value`, `displayValue`, or `content` for presence.
+
+Run mutations only when the user requests them. Known non-secret values can be added as arguments or set through stdin. For secret entry, give the user `vne add <file> <KEY> --prompt` or `vne set <file> <KEY> --prompt` to run locally. Agents must not obtain or pass real secret values as arguments or stdin. `copy` transfers an existing value internally and returns only a receipt.
+
+`run` gives values to the program it starts. Use it only for authorized commands whose output does not print the environment; any program can print what it receives. Use the desktop, `--values`, and `format --dry-run` for local human inspection, rather than putting real env contents into an agent's context.
+
+Named file reads require a regular UTF-8 file of at most 10 MiB. An explicitly named symlink may point to a regular file. Mutations refuse an update that would make the file exceed that read limit.
 
 ## What the editor and CLI understand
 
@@ -77,7 +91,7 @@ Files are read as data, not shell code. `run` refuses to start if a line is not 
 
 ## Privacy
 
-Env values never appear in vne's output.
+The CLI withholds stored values from default inspection output. The desktop and explicit value modes use the output policy shown below.
 
 | Surface | What it shows |
 | --- | --- |
@@ -85,10 +99,12 @@ Env values never appear in vne's output.
 | CLI JSON (piped output) | No values, comments, or raw previews. Each entry's `valueState` says `set`, `empty`, or `placeholder`. `--values` adds values the classifier judges non-secret; detected secrets stay redacted. |
 | `create`, `copy`, `set`, `rm`, `rename`, `example` | Receipts only: disposition, paths, key names, line numbers. |
 | `where` | Key name, paths, line numbers, git status, each value's state, and which discovered files it did not read. |
-| `run` | Prints nothing. The command it starts receives the values and can print them. |
+| `run` | Does not print loaded env values. The command it starts receives them and can print them. |
 | `format --dry-run` | Prints raw values. Refuses piped stdout and asks for an interactive `y`. |
 
-Two limits. Some facts about values do appear: a disposition such as `alreadyPresent` tells the caller that the value it supplied equals the stored one, and `valueState` tells whether a value is empty or a template such as `changeme`. And any local process with file access can read env files directly. Threat model and release checklist: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+Classification is heuristic: a sensitive value that matches an allowed format can appear in the desktop or under `--values`. Default CLI inspection output withholds values regardless of classification.
+
+Some facts about values do appear: a disposition such as `alreadyPresent` tells the caller that the value it supplied equals the stored one, and `valueState` tells whether a value is empty or a template such as `changeme`. And any local process with file access can read env files directly. Threat model and release checklist: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 ## Development
 
@@ -114,4 +130,10 @@ Design decisions are recorded in [docs/adr](docs/adr).
 
 ## Status
 
+The first public distribution is source-only. Native behavior is tested on macOS with Apple Silicon; other platforms are unverified.
+
 Version 0.1.0, pre-release. No packaged installer yet; install from source as above.
+
+## License
+
+[MIT](LICENSE).

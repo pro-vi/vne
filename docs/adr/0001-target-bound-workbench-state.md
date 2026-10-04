@@ -63,7 +63,6 @@ Negative:
 
 ## References
 
-- `docs/plans/2026-07-28-001-fix-ui-state-safety-plan.md`
 - `src/lib/workbench-state.ts`
 - `src/lib/workbench-state.test.ts`
 - `docs/THREAT_MODEL.md`

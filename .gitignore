@@ -14,3 +14,18 @@ oracle/target/
 .inbox/
 .claude/
 .prov/
+
+# Local implementation plans and security-loop working records
+/PROMPT.md
+/loop/
+/logs/audits/
+/docs/plans/
+/.research/
+
+# Local security-loop runner, campaign scripts, and review records
+/oracle/
+/scripts/security-oracle.sh
+/scripts/campaign-setup.sh
+/scripts/campaign-verdict.sh
+/docs/security-oracle.md
+/docs/security-audit-2026-09-04.md

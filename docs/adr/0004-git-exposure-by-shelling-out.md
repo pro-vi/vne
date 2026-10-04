@@ -102,6 +102,5 @@ Negative:
 
 ## References
 
-- `docs/plans/2026-08-18-001-feat-cli-secret-gesture-verbs-plan.md`
 - `src-tauri/src/git.rs`, `src-tauri/src/lib.rs`, `src/lib/types.ts`
 - `docs/THREAT_MODEL.md` (Current Controls, Known Residual Risks)

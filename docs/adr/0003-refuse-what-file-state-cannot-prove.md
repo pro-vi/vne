@@ -1,5 +1,7 @@
 # ADR 0003: Refuse What File State Cannot Prove
 
+Output scope: withholding applies to default CLI inspection and mutation receipts. Desktop display, CLI `--values`, confirmed raw formatting, and a `run` child have the limits described in [the current threat model](../THREAT_MODEL.md#known-residual-risks). The value-derived facts described below remain visible.
+
 - **Status:** Accepted
 - **Date:** 2026-08-19
 - **Deciders:** Provi, Claude
@@ -123,7 +125,6 @@ Negative:
 
 ## References
 
-- `docs/plans/2026-08-18-001-feat-cli-secret-gesture-verbs-plan.md`
 - `docs/adr/0002-copy-exact-env-value-tokens.md` (its rename revisit trigger)
 - `src-tauri/src/lib.rs`, `src-tauri/src/cli.rs`, `src-tauri/tests/cli_output.rs`
 - `docs/THREAT_MODEL.md` (Known Residual Risks)

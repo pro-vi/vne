@@ -308,6 +308,34 @@ pub struct EnvFinding {
     pub entry_id: Option<String>,
 }
 
+pub(crate) const MISSING_REFERENCE_ACTION: &str = "missingReference";
+
+#[derive(Default)]
+struct ReferenceNotices {
+    paths: BTreeMap<PathBuf, BTreeSet<String>>,
+    truncated: bool,
+    unreadable: BTreeMap<PathBuf, &'static str>,
+    unreadable_truncated: bool,
+}
+
+impl ReferenceNotices {
+    fn record(&mut self, path: PathBuf, source: &str) {
+        if self.paths.len() >= SCAN_MAX_DISCOVERY_REFS && !self.paths.contains_key(&path) {
+            self.truncated = true;
+            return;
+        }
+        self.paths.entry(path).or_default().insert(source.to_string());
+    }
+
+    fn record_unreadable(&mut self, path: PathBuf, reason: &'static str) {
+        if self.unreadable.len() >= SCAN_MAX_DISCOVERY_REFS && !self.unreadable.contains_key(&path) {
+            self.unreadable_truncated = true;
+            return;
+        }
+        self.unreadable.insert(path, reason);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedLine {
     key: String,
@@ -918,7 +946,7 @@ pub fn reveal_env_value_authorized(
     line_number: usize,
 ) -> Result<String, String> {
     let path = resolve_authorized(root, identifier)?;
-    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let content = read_regular_file_bounded(&path).map_err(|error| error.to_string())?;
 
     parse_env_entries(&content)
         .into_iter()
@@ -946,7 +974,7 @@ pub fn save_env_value_authorized(
 ) -> Result<ProjectSnapshot, String> {
     let authorized = root.ok_or("no authorized project root is active")?;
     let path = resolve_authorized(root, identifier)?;
-    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let content = read_regular_file_bounded(&path).map_err(|error| error.to_string())?;
     let updated = replace_env_value_at(&content, key, line_number, value)
         .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))?;
 
@@ -975,7 +1003,7 @@ pub fn add_env_key_authorized(
 ) -> Result<ProjectSnapshot, String> {
     let authorized = root.ok_or("no authorized project root is active")?;
     let path = resolve_authorized(root, identifier)?;
-    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let content = read_regular_file_bounded(&path).map_err(|error| error.to_string())?;
     let updated =
         append_env_key_result(&content, key, value).map_err(|error| error.message(key))?;
 
@@ -1097,6 +1125,7 @@ pub(crate) fn scan_project(root: &Path, git_scope: GitStatusScope) -> io::Result
     clear_discovery_seen();
     let mut discovered = BTreeMap::<PathBuf, BTreeSet<String>>::new();
     let mut not_regular = BTreeSet::new();
+    let mut missing_references = ReferenceNotices::default();
 
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
@@ -1111,6 +1140,8 @@ pub(crate) fn scan_project(root: &Path, git_scope: GitStatusScope) -> io::Result
                 entry.path(),
                 format!("direct env filename `{name}`"),
                 &mut discovered,
+                None,
+                &mut missing_references,
             );
         } else if !file_type.is_dir() && !(file_type.is_symlink() && entry.path().is_dir()) {
             // A symlink, FIFO, or device with an env filename is not read,
@@ -1121,8 +1152,8 @@ pub(crate) fn scan_project(root: &Path, git_scope: GitStatusScope) -> io::Result
     }
 
     let mut discovery_notes: Vec<String> = Vec::new();
-    discover_package_json_env_files(&root, &mut discovered, &mut discovery_notes);
-    discover_compose_env_files(&root, &mut discovered, &mut discovery_notes);
+    discover_package_json_env_files(&root, &mut discovered, &mut discovery_notes, &mut missing_references);
+    discover_compose_env_files(&root, &mut discovered, &mut discovery_notes, &mut missing_references);
 
     let mut env_paths = discovered.into_iter().collect::<Vec<_>>();
     env_paths.sort_by_key(|(path, _)| {
@@ -1142,12 +1173,29 @@ pub(crate) fn scan_project(root: &Path, git_scope: GitStatusScope) -> io::Result
     // a parsed file or an explicit incomplete record (VNE-SEC-010).
     let mut files = Vec::new();
     let mut incomplete = not_regular
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|name| IncompleteEnvFile {
             name,
             reason: "not-regular-file",
         })
         .collect::<Vec<_>>();
+    for (path, reason) in missing_references.unreadable {
+        let name = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().to_string();
+        if not_regular.contains(&name) {
+            continue;
+        }
+        incomplete.push(IncompleteEnvFile {
+            name,
+            reason,
+        });
+    }
+    if missing_references.unreadable_truncated {
+        incomplete.push(IncompleteEnvFile {
+            name: "additional referenced env files".into(),
+            reason: "count-limit",
+        });
+    }
     // Harden F0009: discovery anomalies surface as typed incompletes.
     for note in discovery_notes {
         if let Some((name, reason)) = note.split_once(':') {
@@ -1194,7 +1242,7 @@ pub(crate) fn scan_project(root: &Path, git_scope: GitStatusScope) -> io::Result
             });
             continue;
         }
-        match read_discovery_file_bounded(&path) {
+        match read_regular_file_bounded(&path) {
             Ok(content) => {
                 files.push(parse_env_file_with_reasons(
                     &path,
@@ -1203,16 +1251,10 @@ pub(crate) fn scan_project(root: &Path, git_scope: GitStatusScope) -> io::Result
                 ));
                 real_paths.push(path);
             }
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            Err(error) => {
                 incomplete.push(IncompleteEnvFile {
                     name,
-                    reason: "invalid-utf8",
-                });
-            }
-            Err(_) => {
-                incomplete.push(IncompleteEnvFile {
-                    name,
-                    reason: "unreadable",
+                    reason: discovery_reason(&error),
                 });
             }
         }
@@ -1231,6 +1273,35 @@ pub(crate) fn scan_project(root: &Path, git_scope: GitStatusScope) -> io::Result
         &framework_profiles,
         &files,
     );
+    for (path, sources) in missing_references.paths {
+        let name = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().to_string();
+        findings.push(EnvFinding {
+            severity: "info".into(),
+            action_kind: MISSING_REFERENCE_ACTION.into(),
+            title: format!("Referenced env file `{name}` is missing"),
+            detail: "Project configuration refers to this file, but the file could not be found.".into(),
+            evidence: sources.into_iter().collect(),
+            mutation_preview: None,
+            file_path: Some(path.to_string_lossy().to_string()),
+            key: None,
+            line_number: None,
+            entry_id: None,
+        });
+    }
+    if missing_references.truncated {
+        findings.push(EnvFinding {
+            severity: "info".into(),
+            action_kind: MISSING_REFERENCE_ACTION.into(),
+            title: "Additional missing env references were omitted".into(),
+            detail: format!("The report retains at most {SCAN_MAX_DISCOVERY_REFS} missing paths."),
+            evidence: Vec::new(),
+            mutation_preview: None,
+            file_path: None,
+            key: None,
+            line_number: None,
+            entry_id: None,
+        });
+    }
     for record in &incomplete {
         findings.push(EnvFinding {
             severity: "warning".into(),
@@ -1696,14 +1767,6 @@ pub fn copy_env_key(
     })
 }
 
-/// O_NOFOLLOW constant by platform (std does not export it; adding libc for
-/// one constant is not worth the dependency). Verified against macOS
-/// /usr/include/sys/fcntl.h and Linux include/uapi/asm-generic/fcntl.h.
-#[cfg(target_os = "macos")]
-const O_NOFOLLOW: i32 = 0x0040_0000;
-#[cfg(target_os = "linux")]
-const O_NOFOLLOW: i32 = 0o400_000;
-
 /// Mutation-target guard (VNE-SEC-005): refuse a symlinked final
 /// component for every mutation, then verify identity with a no-follow
 /// open whose descriptor (dev, ino) must match the pre-check stat
@@ -1716,7 +1779,8 @@ const O_NOFOLLOW: i32 = 0o400_000;
 pub fn ensure_mutation_target(path: &Path, role: &'static str) -> Result<(), EnvFileAccessError> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use rustix::fs::{open, Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
         let stat = fs::symlink_metadata(path).map_err(|source| EnvFileAccessError::Io {
             action: "inspect",
             path: path.to_path_buf(),
@@ -1734,15 +1798,17 @@ pub fn ensure_mutation_target(path: &Path, role: &'static str) -> Result<(), Env
                 path: path.to_path_buf(),
             });
         }
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NOFOLLOW)
-            .open(path)
+        let opened: fs::File = open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
             .map_err(|source| EnvFileAccessError::Io {
                 action: "open",
                 path: path.to_path_buf(),
-                source,
-            })?;
+                source: source.into(),
+            })?
+            .into();
         let fd_meta = opened.metadata().map_err(|source| EnvFileAccessError::Io {
             action: "inspect",
             path: path.to_path_buf(),
@@ -1782,7 +1848,7 @@ fn canonical_regular_file(path: &Path, role: &'static str) -> Result<PathBuf, En
 }
 
 fn read_env_file_at(path: &Path) -> Result<String, EnvFileAccessError> {
-    fs::read_to_string(path).map_err(|source| EnvFileAccessError::Io {
+    read_regular_file_bounded(path).map_err(|source| EnvFileAccessError::Io {
         action: "read",
         path: path.to_path_buf(),
         source,
@@ -2182,10 +2248,16 @@ pub fn sync_example_file(
     };
     // `created` comes from what the creation primitive actually did, not from an
     // existence check taken before it ran.
-    let created = if example_path.exists() {
-        false
+    let (created, initial_example) = if example_path.exists() {
+        (false, None)
     } else {
-        create_example_file(&example_path)? == EnvFileCreationDisposition::Created
+        let initial = append_missing_example_keys(&source_content, "");
+        check_updated_file_size(&initial.0).map_err(|source| ExampleSyncError::Io {
+            action: "write",
+            path: example_path.clone(),
+            source,
+        })?;
+        (create_example_file(&example_path)? == EnvFileCreationDisposition::Created, Some(initial))
     };
 
     let example_path = canonical_regular_file(&example_path, "example")?;
@@ -2194,7 +2266,10 @@ pub fn sync_example_file(
     }
 
     let example_content = read_env_file_at(&example_path)?;
-    let (updated, added_keys) = append_missing_example_keys(&source_content, &example_content);
+    let (updated, added_keys) = match initial_example {
+        Some(initial) if example_content.is_empty() => initial,
+        _ => append_missing_example_keys(&source_content, &example_content),
+    };
 
     if !added_keys.is_empty() {
         atomic_write_metadata_if_unchanged(&example_path, &updated, Some(&example_content)).map_err(|source| {
@@ -2845,7 +2920,7 @@ impl RuntimeEnvError {
 pub fn load_runtime_env(paths: &[PathBuf]) -> Result<Vec<RuntimeEnvVar>, RuntimeEnvError> {
     let mut loaded: Vec<RuntimeEnvVar> = Vec::new();
     for path in paths {
-        let content = fs::read_to_string(path).map_err(|source| RuntimeEnvError::Io {
+        let content = read_regular_file_bounded(path).map_err(|source| RuntimeEnvError::Io {
             path: path.clone(),
             source,
         })?;
@@ -3287,7 +3362,7 @@ fn read_package_json(root: &Path) -> Option<serde_json::Value> {
     // Harden F0042 (2026-09-06): the same SCAN_MAX_FILE_BYTES bound that
     // governs the other discovery reads — read_package_json is a second
     // reader of the same attacker-shapeable file.
-    let content = read_discovery_file_bounded(&root.join("package.json")).ok()?;
+    let content = read_regular_file_bounded(&root.join("package.json")).ok()?;
     serde_json::from_str(&content).ok()
 }
 
@@ -3739,6 +3814,8 @@ fn add_discovered_env_file(
     candidate: impl AsRef<Path>,
     reason: String,
     discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>,
+    reference_source: Option<&str>,
+    missing: &mut ReferenceNotices,
 ) {
     let candidate = candidate.as_ref();
     let path = if candidate.is_absolute() {
@@ -3759,30 +3836,55 @@ fn add_discovered_env_file(
         let canonical = DISCOVERY_CANONICAL.with(|s| s.borrow().get(&path).cloned());
         if let Some(canonical) = canonical {
             discovered.entry(canonical).or_default().insert(reason);
+        } else if let Some(source) = reference_source {
+            if let Some(sources) = missing.paths.get_mut(&path) {
+                sources.insert(source.to_string());
+            }
         }
         return;
     }
 
-    let Ok(metadata) = fs::metadata(&path) else {
-        return;
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if error.kind() == io::ErrorKind::NotFound {
+                if let Some(source) = reference_source {
+                    missing.record(path, source);
+                }
+            } else if reference_source.is_some() {
+                missing.record_unreadable(path, discovery_reason(&error));
+            }
+            return;
+        }
     };
-    if !metadata.is_file() {
-        return;
-    }
-
-    let Ok(canonical) = path.canonicalize() else {
-        return;
+    let canonical = match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            if error.kind() == io::ErrorKind::NotFound {
+                if let Some(source) = reference_source {
+                    missing.record(path, source);
+                } else {
+                    missing.record_unreadable(path, "unreadable");
+                }
+            } else {
+                missing.record_unreadable(path, discovery_reason(&error));
+            }
+            return;
+        }
     };
     if !canonical.starts_with(root) {
         return;
     }
-    DISCOVERY_CANONICAL.with(|s| s.borrow_mut().insert(path, canonical.clone()));
-
-    // F0035: past the reference cap, stop bookkeeping — the scan's typed
-    // accounting (count-limit) covers the overflow at the file layer.
-    if DISCOVERY_SEEN.with(|s| s.borrow().len()) > SCAN_MAX_DISCOVERY_REFS {
+    if !metadata.is_file() {
+        missing.record_unreadable(canonical, "not-regular-file");
         return;
     }
+
+    if !discovered.contains_key(&canonical) && DISCOVERY_SEEN.with(|s| s.borrow().len()) > SCAN_MAX_DISCOVERY_REFS {
+        missing.record_unreadable(canonical, "count-limit");
+        return;
+    }
+    DISCOVERY_CANONICAL.with(|s| s.borrow_mut().insert(path, canonical.clone()));
 
     discovered.entry(canonical).or_default().insert(reason);
 }
@@ -3809,16 +3911,36 @@ fn resolve_project_file(root: &str, path: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Harden F0012 (2026-09-05), F0026 (2026-09-06): discovery reads
-/// (package.json / compose files) sit inside the scanned project and are
-/// attacker-shapeable, so the READ itself — not the stat — is bounded.
-/// File::open + take() caps memory at SCAN_MAX_FILE_BYTES + 1 regardless
-/// of what the file becomes after the open (symlinks to character devices
-/// included); an oversized or infinite source skips (discovery is
-/// best-effort), never a scan failure.
-fn read_discovery_file_bounded(path: &Path) -> Result<String, io::Error> {
+/// Reads a regular UTF-8 file within the project's byte limit. The opened
+/// file's metadata rejects a path swapped to a special file, and the limited
+/// read refuses a file that grows past the bound after its size check.
+pub(crate) fn read_regular_file_bounded(path: &Path) -> Result<String, io::Error> {
     use std::io::Read as _;
-    let file = fs::File::open(path)?;
+
+    #[cfg(unix)]
+    let file: fs::File = {
+        use rustix::fs::{open, Mode, OFlags};
+        // A substituted FIFO must not wait for a writer before its metadata
+        // can be checked.
+        open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?.into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if !fs::metadata(path)?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path is not a regular file"));
+        }
+        fs::File::open(path)?
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path is not a regular file"));
+    }
+    if metadata.len() > SCAN_MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("file exceeds the {SCAN_MAX_FILE_BYTES} byte read bound"),
+        ));
+    }
     let mut buf = String::new();
     let mut limited = file.take(SCAN_MAX_FILE_BYTES + 1);
     limited.read_to_string(&mut buf)?;
@@ -3826,8 +3948,7 @@ fn read_discovery_file_bounded(path: &Path) -> Result<String, io::Error> {
         return Err(io::Error::new(
             io::ErrorKind::FileTooLarge,
             format!(
-                "discovery file {} exceeds the {} byte scan bound; skipping",
-                path.display(),
+                "file exceeds the {} byte read bound",
                 SCAN_MAX_FILE_BYTES
             ),
         ));
@@ -3839,9 +3960,10 @@ fn discover_package_json_env_files(
     root: &Path,
     discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>,
     notes: &mut Vec<String>,
+    missing: &mut ReferenceNotices,
 ) {
     let path = root.join("package.json");
-    let Ok(content) = read_discovery_file_bounded(&path).map_err(|e| {
+    let Ok(content) = read_regular_file_bounded(&path).map_err(|e| {
         // Harden F0009 (2026-09-09): discovery anomalies are TYPED, never
         // silent — but ABSENCE is the normal state for a discovery file
         // and stays silent. Only real anomalies (oversize, unreadable,
@@ -3873,6 +3995,8 @@ fn discover_package_json_env_files(
                 reference,
                 format!("package.json script `{script_name}`"),
                 discovered,
+                Some("package.json"),
+                missing,
             );
         }
     }
@@ -3882,6 +4006,7 @@ fn discover_compose_env_files(
     root: &Path,
     discovered: &mut BTreeMap<PathBuf, BTreeSet<String>>,
     notes: &mut Vec<String>,
+    missing: &mut ReferenceNotices,
 ) {
     for compose_name in [
         "compose.yaml",
@@ -3890,7 +4015,7 @@ fn discover_compose_env_files(
         "docker-compose.yml",
     ] {
         let path = root.join(compose_name);
-        let Ok(content) = read_discovery_file_bounded(&path).map_err(|e| {
+        let Ok(content) = read_regular_file_bounded(&path).map_err(|e| {
             if e.kind() != io::ErrorKind::NotFound {
                 notes.push(format!("{compose_name}:{}", discovery_reason(&e)));
             }
@@ -3905,6 +4030,8 @@ fn discover_compose_env_files(
                 reference,
                 format!("{compose_name} env_file"),
                 discovered,
+                Some(compose_name),
+                missing,
             );
         }
     }
@@ -4215,15 +4342,24 @@ pub fn atomic_write_preserving_metadata(path: &Path, content: &str) -> io::Resul
     atomic_write_metadata_if_unchanged(path, content, None)
 }
 
-/// VNE-SEC-013 overwrite precondition: when `unchanged` carries the bytes
-/// the edit was computed from, the file on disk must still hold exactly
-/// those bytes at persist time. A concurrent edit or identity swap refuses
-/// (exit 2) instead of clobbering or writing through a stale identity.
+fn check_updated_file_size(content: &str) -> io::Result<()> {
+    if content.len() as u64 > SCAN_MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("updated file would exceed the {SCAN_MAX_FILE_BYTES} byte read bound"),
+        ));
+    }
+    Ok(())
+}
+
+/// When `unchanged` carries the bytes the edit was computed from, refuse
+/// replacement if the file no longer holds those bytes or has changed identity.
 pub fn atomic_write_metadata_if_unchanged(
     path: &Path,
     content: &str,
     unchanged: Option<&str>,
 ) -> io::Result<()> {
+    check_updated_file_size(content)?;
     // Identity at entry: the persist-time re-check requires the SAME inode
     // that was on the path when the write began (VNE-SEC-013).
     #[cfg(unix)]
@@ -4240,6 +4376,27 @@ pub fn atomic_write_metadata_if_unchanged(
         ));
     }
     let permissions = original.permissions();
+    #[cfg(target_os = "macos")]
+    let acl_source = {
+        use std::os::unix::fs::MetadataExt;
+        let descriptor = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let file = fs::File::from(descriptor);
+        let opened = file.metadata()?;
+        if !opened.is_file() || (opened.dev(), opened.ino()) != identity_at_entry {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file identity changed while opening its metadata; refusing to replace",
+            ));
+        }
+        file
+    };
     // Security metadata travels with the rewrite (VNE-SEC-012): the full
     // xattr set is copied onto the replacement before it takes the name.
     // Listing failure fails closed — writing metadata-blind is worse.
@@ -4262,8 +4419,8 @@ pub fn atomic_write_metadata_if_unchanged(
         .permissions(permissions.clone());
     let mut temporary = builder.tempfile_in(parent)?;
     if let Some(expected) = unchanged {
-        let current = fs::read(path)?;
-        if current != expected.as_bytes() {
+        let current = read_regular_file_bounded(path)?;
+        if current.as_bytes() != expected.as_bytes() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "file changed since it was read; refusing to overwrite (rerun the command)",
@@ -4293,6 +4450,22 @@ pub fn atomic_write_metadata_if_unchanged(
             )
         })?;
         xattr::set(temporary.path(), name, &value)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let state = rustix::fs::copyfile_state_alloc()?;
+        // Both calls use the allocated live state; free it even if copying fails.
+        let copied = unsafe {
+            rustix::fs::fcopyfile(
+                &acl_source,
+                temporary.as_file(),
+                state,
+                rustix::fs::CopyfileFlags::ACL,
+            )
+        };
+        let freed = unsafe { rustix::fs::copyfile_state_free(state) };
+        copied?;
+        freed?;
     }
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())

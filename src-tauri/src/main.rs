@@ -51,8 +51,8 @@ fn desktop_project_path(args: &[String]) -> Result<Option<String>, String> {
     match args {
         [] => Ok(None),
         [path] if is_desktop_path_argument(path) => project_path_for(path).map(Some),
-        [arg] if arg.starts_with('-') => Err(format!("unknown option `{arg}`")),
-        [arg] => Err(format!("unknown command or project path `{arg}`")),
+        [arg] if arg.starts_with('-') => Err("unknown option; use vne --help".to_string()),
+        [_] => Err("unknown command or project path; use vne --help".to_string()),
         _ => Err("desktop launch accepts at most one project path".to_string()),
     }
 }
@@ -64,7 +64,7 @@ fn is_desktop_path_argument(arg: &str) -> bool {
 fn project_path_for(arg: &str) -> Result<String, String> {
     let path = PathBuf::from(arg)
         .canonicalize()
-        .map_err(|error| format!("could not open project path `{arg}`: {error}"))?;
+        .map_err(|error| format!("could not open project path: {error}"))?;
     let project_path = if path.is_file() {
         path.parent()
             .unwrap_or_else(|| Path::new("."))
@@ -72,7 +72,7 @@ fn project_path_for(arg: &str) -> Result<String, String> {
     } else if path.is_dir() {
         path
     } else {
-        return Err(format!("project path `{arg}` is not a file or directory"));
+        return Err("project path is not a file or directory".to_string());
     };
 
     Ok(project_path.to_string_lossy().to_string())
