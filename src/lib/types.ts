@@ -141,4 +141,3 @@ export interface EnvFinding {
   entryId: string | null;
 }
 
-export type KeyStatus = 'ok' | 'missing' | 'extra' | 'duplicate';
