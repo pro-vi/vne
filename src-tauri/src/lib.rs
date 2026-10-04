@@ -11,6 +11,8 @@ use std::path::{Component, Path, PathBuf};
 use std::os::unix::fs::OpenOptionsExt;
 
 pub mod cli;
+#[cfg(target_os = "macos")]
+pub mod clipboard;
 pub mod git;
 
 pub use git::EnvFileGitStatus;
@@ -1077,6 +1079,87 @@ fn create_env_from_example(root_state: tauri::State<'_, AuthorizedRoot>) -> Resu
     create_env_from_example_authorized(root_state.0.lock().unwrap().as_deref())
 }
 
+/// The value to copy for one occurrence, and whether it must be concealed:
+/// any key the shape check calls sensitive or redacts by default.
+pub fn copy_source_authorized(
+    root: Option<&Path>,
+    identifier: &str,
+    key: &str,
+    line_number: usize,
+) -> Result<(String, bool), String> {
+    let path = resolve_authorized(root, identifier)?;
+    let content = read_regular_file_bounded(&path).map_err(|error| error.to_string())?;
+    parse_env_file(&path, content)
+        .entries
+        .into_iter()
+        .find(|entry| entry.key == key && entry.line_number == line_number)
+        .map(|entry| {
+            let conceal = entry.shape.sensitive || entry.shape.redacted_by_default;
+            (entry.value, conceal)
+        })
+        .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyOutcome {
+    pub key: String,
+    /// Set when the value was concealed and will be cleared.
+    pub clears_in_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardCleared {
+    key: String,
+    cleared: bool,
+}
+
+/// The value goes from the file to the pasteboard and never reaches the
+/// webview; the window learns only the key and when it will be cleared.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn copy_env_value(
+    app: tauri::AppHandle,
+    root_state: tauri::State<'_, AuthorizedRoot>,
+    clipboard_state: tauri::State<'_, clipboard::ConcealedClipboard>,
+    path: String,
+    key: String,
+    line_number: usize,
+) -> Result<CopyOutcome, String> {
+    use tauri::{Emitter, Manager};
+
+    let (value, conceal) =
+        copy_source_authorized(root_state.0.lock().unwrap().as_deref(), &path, &key, line_number)?;
+    let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+    let change_count = clipboard::write(&pasteboard, &value, conceal);
+    *clipboard_state.0.lock().unwrap() = conceal.then_some(change_count);
+    if !conceal {
+        return Ok(CopyOutcome { key, clears_in_seconds: None });
+    }
+
+    let handle = app.clone();
+    let cleared_key = key.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(clipboard::CONCEALED_SECONDS));
+        let main = handle.clone();
+        let _ = main.run_on_main_thread(move || {
+            let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+            let state = handle.state::<clipboard::ConcealedClipboard>();
+            let cleared = clipboard::clear_concealed(&state, &pasteboard, change_count);
+            let _ = handle.emit("clipboard-cleared", ClipboardCleared { key: cleared_key, cleared });
+        });
+    });
+    Ok(CopyOutcome { key, clears_in_seconds: Some(clipboard::CONCEALED_SECONDS) })
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn copy_env_value(path: String, key: String, line_number: usize) -> Result<CopyOutcome, String> {
+    let _ = (path, key, line_number);
+    Err("copying is available on macOS only".into())
+}
+
 use tauri_plugin_dialog::DialogExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1095,21 +1178,37 @@ pub fn run_with_initial_project_path(initial_path: Option<String>) {
             initial_project_path,
             load_project,
             reveal_env_value,
+            copy_env_value,
             save_env_value,
             add_env_key,
             ensure_env_file,
             create_env_from_example,
             choose_authorized_root
         ]);
+    #[cfg(target_os = "macos")]
+    let builder = builder.manage(clipboard::ConcealedClipboard::default());
     // Harden F0009 (2026-09-05): the webdriver plugin starts an
     // UNAUTHENTICATED W3C server on 127.0.0.1:4445 the moment the app
     // launches — acceptable for the oracle's debug-build lanes, never for a
     // shipped release. Debug builds only.
     #[cfg(debug_assertions)]
     let builder = builder.plugin(tauri_plugin_webdriver::init());
-    builder
-        .run(tauri::generate_context!())
+    let app = builder
+        .build(tauri::generate_context!())
         .expect("error while running vne");
+    app.run(|_handle, _event| {
+        // A concealed value must not outlive the app that put it there.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Exit = _event {
+            use tauri::Manager;
+            let state = _handle.state::<clipboard::ConcealedClipboard>();
+            let last = *state.0.lock().unwrap();
+            if let Some(change_count) = last {
+                let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+                clipboard::clear_concealed(&state, &pasteboard, change_count);
+            }
+        }
+    });
 }
 
 pub fn snapshot_project(root: &Path) -> io::Result<ProjectSnapshot> {
@@ -6845,6 +6944,23 @@ mod tests {
 
         let error = create_env_from_example_authorized(None).unwrap_err();
         assert_eq!(error, "no authorized project root is active");
+    }
+
+    #[test]
+    fn copy_source_conceals_secrets_and_not_plain_values() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "PORT=3000\nAPI_TOKEN=sk-live-fake\n").unwrap();
+
+        let (value, conceal) = copy_source_authorized(Some(dir.path()), ".env", "API_TOKEN", 2).unwrap();
+        assert_eq!((value.as_str(), conceal), ("sk-live-fake", true));
+
+        let (value, conceal) = copy_source_authorized(Some(dir.path()), ".env", "PORT", 1).unwrap();
+        assert_eq!((value.as_str(), conceal), ("3000", false));
+
+        let error = copy_source_authorized(Some(dir.path()), ".env", "PORT", 2).unwrap_err();
+        assert_eq!(error, "Key `PORT` at line 2 was not found");
+        let error = copy_source_authorized(Some(dir.path()), "../.env", "PORT", 1).unwrap_err();
+        assert!(error.contains(".."), "{error}");
     }
 
     #[test]

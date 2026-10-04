@@ -19,6 +19,19 @@ export interface IncompleteEnvFile {
 
 export type EnvFileCreationDisposition = 'created' | 'alreadyExists';
 
+/** The window never receives the copied value, only when it will be cleared. */
+export interface CopyOutcome {
+  key: string;
+  clearsInSeconds: number | null;
+}
+
+/** Sent when a concealed copy's time is up; `cleared` is false when something
+ * else was copied in the meantime and the clipboard was left alone. */
+export interface ClipboardCleared {
+  key: string;
+  cleared: boolean;
+}
+
 export interface EnsureEnvFileOutcome {
   disposition: EnvFileCreationDisposition;
   path: string;

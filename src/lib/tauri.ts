@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { sampleProject } from './sample';
-import type { EnsureEnvFileOutcome, ProjectSnapshot } from './types';
+import type { ClipboardCleared, CopyOutcome, EnsureEnvFileOutcome, ProjectSnapshot } from './types';
 
 export function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
@@ -40,6 +41,23 @@ export async function revealEnvValue(root: string, path: string, key: string, li
   }
 
   return invoke<string>('reveal_env_value', { path: relativeIdentifier(root, path), key, lineNumber });
+}
+
+export async function copyEnvValue(root: string, path: string, key: string, lineNumber: number): Promise<CopyOutcome> {
+  if (!isTauriRuntime()) {
+    await delay(180);
+    throw new Error('Copying is available in the Tauri desktop app. Browser preview uses read-only sample data.');
+  }
+
+  return invoke<CopyOutcome>('copy_env_value', { path: relativeIdentifier(root, path), key, lineNumber });
+}
+
+export async function onClipboardCleared(handler: (event: ClipboardCleared) => void): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) {
+    return () => {};
+  }
+
+  return listen<ClipboardCleared>('clipboard-cleared', (event) => handler(event.payload));
 }
 
 export async function saveEnvValue(
