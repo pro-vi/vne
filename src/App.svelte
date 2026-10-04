@@ -433,7 +433,9 @@
     if (rows.length === 0) {
       return;
     }
-    const from = selectedIndex < 0 ? 0 : selectedIndex;
+    // Read the id, not the reactive index, which can lag a selection set
+    // earlier in the same task.
+    const from = Math.max(0, rows.findIndex((row) => row.id === selectedRowId));
     select(rows[Math.min(Math.max(from + delta, 0), rows.length - 1)].id);
   }
 
@@ -448,14 +450,23 @@
     input?.focus({ preventScroll: true });
   }
 
-  async function afterQuietLoad(): Promise<void> {
-    if (quietLoad) {
-      await quietLoad;
+  /** Waits out a focus-regain reload. False when the reload moved the
+   * selection, so a key pressed before it never acts on a different row. */
+  async function afterQuietLoad(): Promise<boolean> {
+    if (!quietLoad) {
+      return true;
     }
+    const path = selectedPath;
+    const rowId = selectedRowId;
+    await quietLoad;
+    await tick();
+    return selectedPath === path && selectedRowId === rowId;
   }
 
   async function primaryAction(): Promise<void> {
-    await afterQuietLoad();
+    if (!(await afterQuietLoad())) {
+      return;
+    }
     if (!snapshot || edit || pendingOperation) {
       return;
     }
@@ -517,7 +528,9 @@
   }
 
   async function startAdd(): Promise<void> {
-    await afterQuietLoad();
+    if (!(await afterQuietLoad())) {
+      return;
+    }
     if (!selectedFile || edit || pendingOperation) {
       return;
     }
@@ -702,7 +715,9 @@
       return;
     }
     optionHeld = true;
-    await afterQuietLoad();
+    if (!(await afterQuietLoad())) {
+      return;
+    }
     const row = selectedRow;
     const target = selectedTarget;
     if (edit || !target || row?.kind !== 'entry' || !row.entry.shape.redactedByDefault || row.entry.valueState === 'empty') {
@@ -732,7 +747,9 @@
   }
 
   async function copySelected(): Promise<void> {
-    await afterQuietLoad();
+    if (!(await afterQuietLoad())) {
+      return;
+    }
     if (edit || pendingOperation || !selectedRow || selectedRow.kind === 'add') {
       return;
     }
@@ -818,7 +835,7 @@
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
       const delta = event.key === 'ArrowDown' ? 1 : -1;
-      void afterQuietLoad().then(() => moveSelection(delta));
+      void afterQuietLoad().then((unmoved) => unmoved && moveSelection(delta));
     } else if (event.key === 'Enter' && !(event.target instanceof HTMLButtonElement)) {
       event.preventDefault();
       void primaryAction();

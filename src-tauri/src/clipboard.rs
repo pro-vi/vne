@@ -14,6 +14,23 @@ const MARKER_TYPES: [&str; 2] = ["org.nspasteboard.ConcealedType", "org.nspasteb
 /// Seconds a concealed value stays on the clipboard before vne clears it.
 pub const CLEAR_AFTER_SECONDS: u64 = 30;
 
+/// Blocks for CLEAR_AFTER_SECONDS on CLOCK_MONOTONIC, which on macOS keeps
+/// counting while the Mac sleeps and is not moved by clock changes, so
+/// neither can stretch the time a secret stays on the clipboard.
+pub fn wait_out_clear_delay() {
+    fn now() -> std::time::Duration {
+        let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: clock_gettime fills the timespec it is given.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+        std::time::Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+    }
+
+    let deadline = now() + std::time::Duration::from_secs(CLEAR_AFTER_SECONDS);
+    while let Some(left) = deadline.checked_sub(now()).filter(|left| !left.is_zero()) {
+        std::thread::sleep(left.min(std::time::Duration::from_secs(1)));
+    }
+}
+
 /// The concealed value vne last wrote, kept only as a write's change count
 /// and a fingerprint of its text, so a delayed or exit-time clear removes
 /// that value and nothing copied after it.

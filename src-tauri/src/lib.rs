@@ -1133,7 +1133,6 @@ fn copy_env_value(
     key: String,
     line_number: usize,
 ) -> Result<ClipboardCopyOutcome, String> {
-    use std::time::{Duration, SystemTime};
     use tauri::{Emitter, Manager};
 
     let (value, conceal) =
@@ -1149,11 +1148,7 @@ fn copy_env_value(
 
     let handle = app.clone();
     std::thread::spawn(move || {
-        // Wall-clock deadline: a sleeping Mac must not stretch the 30 s.
-        let deadline = SystemTime::now() + Duration::from_secs(clipboard::CLEAR_AFTER_SECONDS);
-        while let Ok(left) = deadline.duration_since(SystemTime::now()) {
-            std::thread::sleep(left.min(Duration::from_secs(1)));
-        }
+        clipboard::wait_out_clear_delay();
         let main = handle.clone();
         let _ = main.run_on_main_thread(move || {
             let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
@@ -1184,30 +1179,62 @@ pub fn run() {
 
 /// `vne .` runs the window in the terminal's foreground process, so Ctrl-C,
 /// a closed terminal, or `kill` would end it without the exit-time clipboard
-/// clear. These signals are blocked on every thread and turned into a normal
-/// exit once the app handle arrives on the returned channel.
+/// clear. A handler turns the first such signal into a normal exit once the
+/// app handle arrives on the returned channel; a second one exits at once.
+/// A signal already ignored (as under `nohup`) stays ignored, and child
+/// processes start with the default handling because exec resets handlers.
 #[cfg(target_os = "macos")]
 fn exit_on_termination_signals() -> std::sync::mpsc::Sender<tauri::AppHandle> {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static WAKE: AtomicI32 = AtomicI32::new(-1);
+    extern "C" fn on_signal(signal: libc::c_int) {
+        let byte = signal as u8;
+        // SAFETY: write(2) is async-signal-safe and the descriptor stays open.
+        unsafe { libc::write(WAKE.load(Ordering::Relaxed), (&byte as *const u8).cast(), 1) };
+    }
+
     let (sender, receiver) = std::sync::mpsc::channel::<tauri::AppHandle>();
-    // SAFETY: sigset_t is plain data; the calls only fill a set and install it
-    // as this thread's mask before the app starts its threads, which inherit it.
-    let signals = unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            libc::sigaddset(&mut set, signal);
+    let mut pipe = [0; 2];
+    // SAFETY: pipe(2) fills the two descriptors it is given.
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return sender;
+    }
+    WAKE.store(pipe[1], Ordering::Relaxed);
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: a zeroed sigaction is a valid out-parameter; querying with a
+        // null new action changes nothing, and the handler only calls write(2).
+        unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut current);
+            if current.sa_sigaction != libc::SIG_IGN {
+                libc::signal(signal, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+            }
         }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        set
-    };
+    }
+
     std::thread::spawn(move || {
-        let mut received = 0;
-        // SAFETY: waits for one of the signals blocked above.
-        unsafe { libc::sigwait(&signals, &mut received) };
-        match receiver.try_recv() {
-            Ok(handle) => handle.exit(0),
-            // Before the window exists nothing can have been copied.
-            Err(_) => std::process::exit(128 + received),
+        let mut handle: Option<tauri::AppHandle> = None;
+        let mut asked_to_exit = false;
+        loop {
+            let mut byte = 0u8;
+            // SAFETY: reads one byte into a local buffer.
+            if unsafe { libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1) } != 1 {
+                continue;
+            }
+            let code = 128 + i32::from(byte);
+            if handle.is_none() {
+                handle = receiver.try_recv().ok();
+            }
+            match (&handle, asked_to_exit) {
+                (Some(app), false) => {
+                    asked_to_exit = true;
+                    app.exit(code);
+                }
+                // No window yet, so nothing was copied; or a second signal
+                // while the first exit is still pending.
+                _ => std::process::exit(code),
+            }
         }
     });
     sender
