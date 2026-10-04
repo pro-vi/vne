@@ -1,7 +1,8 @@
+import { baseName, relativePath } from './paths';
 import type { EnvEntry, EnvFile, ProjectSnapshot } from './types';
 
 /** Same list as `EXAMPLE_ENV_FILE_NAMES` in src-tauri/src/lib.rs. */
-export const EXAMPLE_FILE_NAMES = ['.env.example', '.env.sample', '.env.template', '.env.defaults'];
+export const EXAMPLE_ENV_FILE_NAMES = ['.env.example', '.env.sample', '.env.template', '.env.defaults'];
 
 /** Why a row still needs a value typed into it. */
 export type Need = 'empty' | 'placeholder' | 'missing';
@@ -20,7 +21,7 @@ export type Row =
 export const ADD_ROW_ID = 'add';
 
 export function isExampleFile(file: EnvFile): boolean {
-  return EXAMPLE_FILE_NAMES.includes(file.name);
+  return EXAMPLE_ENV_FILE_NAMES.includes(file.name);
 }
 
 /** A template's empty and placeholder values are its purpose, not gaps. */
@@ -122,12 +123,12 @@ export function duplicateHint(root: string, file: EnvFile, entry: EnvEntry): str
 
 /** The root example file to start `.env` from, when the project has an
  * example but no root `.env`. */
-export function freshCloneExample(snapshot: ProjectSnapshot): EnvFile | null {
+export function findExampleToCopy(snapshot: ProjectSnapshot): EnvFile | null {
   const rootFiles = snapshot.files.filter((file) => file.path === joinRoot(snapshot.root, file.name));
   if (rootFiles.some((file) => file.name === '.env')) {
     return null;
   }
-  return EXAMPLE_FILE_NAMES.map((name) => rootFiles.find((file) => file.name === name)).find(Boolean) ?? null;
+  return EXAMPLE_ENV_FILE_NAMES.map((name) => rootFiles.find((file) => file.name === name)).find(Boolean) ?? null;
 }
 
 /** Where the window opens: the first row needing a value, preferring the
@@ -149,15 +150,6 @@ export function initialSelection(snapshot: ProjectSnapshot): { path: string; row
   return first ? { path: first.path, rowId: buildRows(snapshot, first)[0].id } : null;
 }
 
-export function relativePath(root: string, path: string): string {
-  const prefix = root.endsWith('/') ? root : `${root}/`;
-  return path.startsWith(prefix) ? path.slice(prefix.length) : path;
-}
-
 function joinRoot(root: string, name: string): string {
   return `${root.replace(/[\\/]+$/, '')}/${name}`;
-}
-
-function baseName(path: string): string {
-  return path.split(/[\\/]/).pop() ?? path;
 }

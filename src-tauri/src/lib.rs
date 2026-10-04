@@ -941,20 +941,31 @@ async fn choose_authorized_root(
     }
 }
 
+/// One occurrence of a key, read fresh from disk, for the commands that act on
+/// its stored value.
+fn entry_at_authorized(
+    root: Option<&Path>,
+    identifier: &str,
+    key: &str,
+    line_number: usize,
+) -> Result<EnvEntry, String> {
+    let path = resolve_authorized(root, identifier)?;
+    let content = read_regular_file_bounded(&path).map_err(|error| error.to_string())?;
+
+    parse_env_file(&path, content)
+        .entries
+        .into_iter()
+        .find(|entry| entry.key == key && entry.line_number == line_number)
+        .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))
+}
+
 pub fn reveal_env_value_authorized(
     root: Option<&Path>,
     identifier: &str,
     key: &str,
     line_number: usize,
 ) -> Result<String, String> {
-    let path = resolve_authorized(root, identifier)?;
-    let content = read_regular_file_bounded(&path).map_err(|error| error.to_string())?;
-
-    parse_env_entries(&content)
-        .into_iter()
-        .find(|entry| entry.key == key && entry.line_number == line_number)
-        .map(|entry| entry.value)
-        .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))
+    entry_at_authorized(root, identifier, key, line_number).map(|entry| entry.value)
 }
 
 #[tauri::command]
@@ -1079,39 +1090,34 @@ fn create_env_from_example(root_state: tauri::State<'_, AuthorizedRoot>) -> Resu
     create_env_from_example_authorized(root_state.0.lock().unwrap().as_deref())
 }
 
-/// The value to copy for one occurrence, and whether it must be concealed:
-/// any key the shape check calls sensitive or redacts by default.
-pub fn copy_source_authorized(
+/// The value to put on the clipboard for one occurrence, and whether it must
+/// be concealed: any key the shape check calls sensitive or redacts by default.
+pub fn clipboard_value_authorized(
     root: Option<&Path>,
     identifier: &str,
     key: &str,
     line_number: usize,
 ) -> Result<(String, bool), String> {
-    let path = resolve_authorized(root, identifier)?;
-    let content = read_regular_file_bounded(&path).map_err(|error| error.to_string())?;
-    parse_env_file(&path, content)
-        .entries
-        .into_iter()
-        .find(|entry| entry.key == key && entry.line_number == line_number)
-        .map(|entry| {
-            let conceal = entry.shape.sensitive || entry.shape.redacted_by_default;
-            (entry.value, conceal)
-        })
-        .ok_or_else(|| format!("Key `{key}` at line {line_number} was not found"))
+    let entry = entry_at_authorized(root, identifier, key, line_number)?;
+    let conceal = entry.shape.sensitive || entry.shape.redacted_by_default;
+    Ok((entry.value, conceal))
 }
 
+/// Both fields are set for a concealed copy and empty for a plain one.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CopyOutcome {
-    pub key: String,
-    /// Set when the value was concealed and will be cleared.
+pub struct ClipboardCopyOutcome {
+    /// Names this copy in the later `concealed-copy-expired` event.
+    pub copy_id: Option<isize>,
     pub clears_in_seconds: Option<u64>,
 }
 
+/// Sent when a concealed copy's time is up; `cleared` is false when the
+/// clipboard no longer held the value.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ClipboardCleared {
-    key: String,
+struct ConcealedCopyExpired {
+    copy_id: isize,
     cleared: bool,
 }
 
@@ -1122,41 +1128,49 @@ struct ClipboardCleared {
 fn copy_env_value(
     app: tauri::AppHandle,
     root_state: tauri::State<'_, AuthorizedRoot>,
-    clipboard_state: tauri::State<'_, clipboard::ConcealedClipboard>,
+    clipboard_state: tauri::State<'_, clipboard::LastConcealedWrite>,
     path: String,
     key: String,
     line_number: usize,
-) -> Result<CopyOutcome, String> {
+) -> Result<ClipboardCopyOutcome, String> {
+    use std::time::{Duration, SystemTime};
     use tauri::{Emitter, Manager};
 
     let (value, conceal) =
-        copy_source_authorized(root_state.0.lock().unwrap().as_deref(), &path, &key, line_number)?;
+        clipboard_value_authorized(root_state.0.lock().unwrap().as_deref(), &path, &key, line_number)?;
     let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
-    let change_count = clipboard::write(&pasteboard, &value, conceal);
-    let written = clipboard::Concealed { change_count, fingerprint: clipboard::fingerprint(&value) };
+    let change_count = clipboard::write(&pasteboard, &value, conceal)
+        .ok_or_else(|| format!("the clipboard refused `{key}`; nothing was copied"))?;
+    let written = clipboard::ConcealedWrite { change_count, fingerprint: clipboard::fingerprint(&value) };
     *clipboard_state.0.lock().unwrap() = conceal.then_some(written);
     if !conceal {
-        return Ok(CopyOutcome { key, clears_in_seconds: None });
+        return Ok(ClipboardCopyOutcome { copy_id: None, clears_in_seconds: None });
     }
 
     let handle = app.clone();
-    let cleared_key = key.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(clipboard::CONCEALED_SECONDS));
+        // Wall-clock deadline: a sleeping Mac must not stretch the 30 s.
+        let deadline = SystemTime::now() + Duration::from_secs(clipboard::CLEAR_AFTER_SECONDS);
+        while let Ok(left) = deadline.duration_since(SystemTime::now()) {
+            std::thread::sleep(left.min(Duration::from_secs(1)));
+        }
         let main = handle.clone();
         let _ = main.run_on_main_thread(move || {
             let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
-            let state = handle.state::<clipboard::ConcealedClipboard>();
+            let state = handle.state::<clipboard::LastConcealedWrite>();
             let cleared = clipboard::clear_concealed(&state, &pasteboard, written);
-            let _ = handle.emit("clipboard-cleared", ClipboardCleared { key: cleared_key, cleared });
+            let _ = handle.emit("concealed-copy-expired", ConcealedCopyExpired { copy_id: change_count, cleared });
         });
     });
-    Ok(CopyOutcome { key, clears_in_seconds: Some(clipboard::CONCEALED_SECONDS) })
+    Ok(ClipboardCopyOutcome {
+        copy_id: Some(change_count),
+        clears_in_seconds: Some(clipboard::CLEAR_AFTER_SECONDS),
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
-fn copy_env_value(path: String, key: String, line_number: usize) -> Result<CopyOutcome, String> {
+fn copy_env_value(path: String, key: String, line_number: usize) -> Result<ClipboardCopyOutcome, String> {
     let _ = (path, key, line_number);
     Err("copying is available on macOS only".into())
 }
@@ -1166,6 +1180,37 @@ use tauri_plugin_dialog::DialogExt;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     run_with_initial_project_path(None);
+}
+
+/// `vne .` runs the window in the terminal's foreground process, so Ctrl-C,
+/// a closed terminal, or `kill` would end it without the exit-time clipboard
+/// clear. These signals are blocked on every thread and turned into a normal
+/// exit once the app handle arrives on the returned channel.
+#[cfg(target_os = "macos")]
+fn exit_on_termination_signals() -> std::sync::mpsc::Sender<tauri::AppHandle> {
+    let (sender, receiver) = std::sync::mpsc::channel::<tauri::AppHandle>();
+    // SAFETY: sigset_t is plain data; the calls only fill a set and install it
+    // as this thread's mask before the app starts its threads, which inherit it.
+    let signals = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaddset(&mut set, signal);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        set
+    };
+    std::thread::spawn(move || {
+        let mut received = 0;
+        // SAFETY: waits for one of the signals blocked above.
+        unsafe { libc::sigwait(&signals, &mut received) };
+        match receiver.try_recv() {
+            Ok(handle) => handle.exit(0),
+            // Before the window exists nothing can have been copied.
+            Err(_) => std::process::exit(128 + received),
+        }
+    });
+    sender
 }
 
 pub fn run_with_initial_project_path(initial_path: Option<String>) {
@@ -1187,7 +1232,9 @@ pub fn run_with_initial_project_path(initial_path: Option<String>) {
             choose_authorized_root
         ]);
     #[cfg(target_os = "macos")]
-    let builder = builder.manage(clipboard::ConcealedClipboard::default());
+    let builder = builder.manage(clipboard::LastConcealedWrite::default());
+    #[cfg(target_os = "macos")]
+    let exit_handle = exit_on_termination_signals();
     // Harden F0009 (2026-09-05): the webdriver plugin starts an
     // UNAUTHENTICATED W3C server on 127.0.0.1:4445 the moment the app
     // launches — acceptable for the oracle's debug-build lanes, never for a
@@ -1197,12 +1244,14 @@ pub fn run_with_initial_project_path(initial_path: Option<String>) {
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while running vne");
+    #[cfg(target_os = "macos")]
+    let _ = exit_handle.send(app.handle().clone());
     app.run(|_handle, _event| {
         // A concealed value must not outlive the app that put it there.
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Exit = _event {
             use tauri::Manager;
-            let state = _handle.state::<clipboard::ConcealedClipboard>();
+            let state = _handle.state::<clipboard::LastConcealedWrite>();
             let last = *state.0.lock().unwrap();
             if let Some(written) = last {
                 let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
@@ -6948,19 +6997,19 @@ mod tests {
     }
 
     #[test]
-    fn copy_source_conceals_secrets_and_not_plain_values() {
+    fn clipboard_value_conceals_secrets_and_not_plain_values() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join(".env"), "PORT=3000\nAPI_TOKEN=sk-live-fake\n").unwrap();
 
-        let (value, conceal) = copy_source_authorized(Some(dir.path()), ".env", "API_TOKEN", 2).unwrap();
+        let (value, conceal) = clipboard_value_authorized(Some(dir.path()), ".env", "API_TOKEN", 2).unwrap();
         assert_eq!((value.as_str(), conceal), ("sk-live-fake", true));
 
-        let (value, conceal) = copy_source_authorized(Some(dir.path()), ".env", "PORT", 1).unwrap();
+        let (value, conceal) = clipboard_value_authorized(Some(dir.path()), ".env", "PORT", 1).unwrap();
         assert_eq!((value.as_str(), conceal), ("3000", false));
 
-        let error = copy_source_authorized(Some(dir.path()), ".env", "PORT", 2).unwrap_err();
+        let error = clipboard_value_authorized(Some(dir.path()), ".env", "PORT", 2).unwrap_err();
         assert_eq!(error, "Key `PORT` at line 2 was not found");
-        let error = copy_source_authorized(Some(dir.path()), "../.env", "PORT", 1).unwrap_err();
+        let error = clipboard_value_authorized(Some(dir.path()), "../.env", "PORT", 1).unwrap_err();
         assert!(error.contains(".."), "{error}");
     }
 

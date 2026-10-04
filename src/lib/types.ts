@@ -19,16 +19,17 @@ export interface IncompleteEnvFile {
 
 export type EnvFileCreationDisposition = 'created' | 'alreadyExists';
 
-/** The window never receives the copied value, only when it will be cleared. */
-export interface CopyOutcome {
-  key: string;
+/** The window never receives the copied value. Both fields are set for a
+ * concealed copy, which is cleared later, and null for a plain one. */
+export interface ClipboardCopyOutcome {
+  copyId: number | null;
   clearsInSeconds: number | null;
 }
 
-/** Sent when a concealed copy's time is up; `cleared` is false when something
- * else was copied in the meantime and the clipboard was left alone. */
-export interface ClipboardCleared {
-  key: string;
+/** Sent when a concealed copy's time is up; `cleared` is false when the
+ * clipboard no longer held the value and was left alone. */
+export interface ConcealedCopyExpired {
+  copyId: number;
   cleared: boolean;
 }
 

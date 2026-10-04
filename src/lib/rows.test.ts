@@ -4,7 +4,7 @@ import {
   ADD_ROW_ID,
   buildRows,
   duplicateHint,
-  freshCloneExample,
+  findExampleToCopy,
   initialSelection,
   missingKeysFor,
   needCount,
@@ -94,8 +94,20 @@ describe('window rows', () => {
     expect(nextNeedingIndex(rows, missing)).toBe(placeholder);
     expect(nextNeedingIndex(rows, 0)).toBe(placeholder);
 
-    const onlyOne = rows.map((candidate, index) => (index === empty ? candidate : { ...candidate, need: null })) as Row[];
-    expect(nextNeedingIndex(onlyOne, empty)).toBeNull();
+    const onlyEmpty: ProjectSnapshot = {
+      ...snapshot,
+      comparison: snapshot.comparison && { ...snapshot.comparison, missingKeys: [] },
+      files: snapshot.files.map((candidate) => ({
+        ...candidate,
+        entries: candidate.entries.map((entry) =>
+          entry.key === 'STRIPE_WEBHOOK_SECRET' ? entry : { ...entry, valueState: 'set' as const }
+        )
+      }))
+    };
+    const onlyEmptyRows = buildRows(onlyEmpty, file(onlyEmpty, '.env'));
+    const onlyIndex = onlyEmptyRows.findIndex((candidate) => candidate.key === 'STRIPE_WEBHOOK_SECRET');
+    expect(needCount(onlyEmptyRows)).toBe(1);
+    expect(nextNeedingIndex(onlyEmptyRows, onlyIndex)).toBeNull();
   });
 
   it('gives the terminal command that keeps a duplicated line', () => {
@@ -117,10 +129,10 @@ describe('window rows', () => {
 
   it('offers to start .env from the root example only when .env is absent', () => {
     const snapshot = sampleProject();
-    expect(freshCloneExample(snapshot)).toBeNull();
+    expect(findExampleToCopy(snapshot)).toBeNull();
 
     const fresh = { ...snapshot, comparison: null, files: snapshot.files.filter((candidate) => candidate.name !== '.env') };
-    expect(freshCloneExample(fresh)?.name).toBe('.env.example');
+    expect(findExampleToCopy(fresh)?.name).toBe('.env.example');
 
     const nestedOnly = {
       ...fresh,
@@ -128,7 +140,7 @@ describe('window rows', () => {
         candidate.name === '.env.example' ? { ...candidate, path: '/demo/project/config/.env.example' } : candidate
       )
     };
-    expect(freshCloneExample(nestedOnly)).toBeNull();
+    expect(findExampleToCopy(nestedOnly)).toBeNull();
   });
 
   it('opens on the first row needing a value in the compared file', () => {

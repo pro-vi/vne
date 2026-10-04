@@ -8,17 +8,18 @@
     initialProjectPath,
     isTauriRuntime,
     loadProject,
-    onClipboardCleared,
+    onConcealedCopyExpired,
     pickProjectDirectory,
     revealEnvValue,
     saveEnvValue
   } from './lib/tauri';
-  import type { EnvFile, ProjectSnapshot } from './lib/types';
+  import { baseName } from './lib/paths';
+  import type { EnvEntry, EnvFile, ProjectSnapshot } from './lib/types';
   import {
     ADD_ROW_ID,
     buildRows,
     duplicateHint,
-    freshCloneExample,
+    findExampleToCopy,
     initialSelection,
     isExampleFile,
     needCount,
@@ -39,9 +40,9 @@
     type RevealedEntry
   } from './lib/workbench-state';
 
-  type Tone = 'ok' | 'warning' | 'danger' | 'info';
-  type Message = { tone: Tone; text: string };
-  type Verb = { keys: string; label: string; run: () => void; hold?: boolean };
+  type MessageTone = 'ok' | 'warning' | 'danger' | 'info';
+  type Message = { tone: MessageTone; text: string };
+  type Verb = { shortcut: string; label: string; run: () => void; hold?: boolean };
   type Tab = { id: string; label: string; count: number | null; badge: string; badgeTone: 'danger' | 'warning' | ''; ghost: boolean };
   type Selection = { path: string; rowId: string };
 
@@ -61,10 +62,10 @@
     refused: boolean;
   };
 
-  const FRESH_TAB = '\u0000fresh';
-  const UNREAD_TAB = '\u0000unread:';
+  const NEW_ENV_TAB = '\u0000fresh';
+  const UNREADABLE_TAB = '\u0000unread:';
   /** Same rule as `is_valid_env_key` in src-tauri/src/lib.rs. */
-  const KEY_NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+  const VALID_KEY_NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 
   let projectPath = '';
   let snapshot: ProjectSnapshot | null = null;
@@ -73,11 +74,16 @@
   let selectedPath = '';
   let selectedRowId = '';
   let edit: Edit | null = null;
-  let shown: RevealedEntry | null = null;
+  let revealed: RevealedEntry | null = null;
   let optionHeld = false;
   let message: Message | null = null;
   let savedRowId = '';
-  let copyClock: { key: string; endsAt: number } | null = null;
+  /** The concealed copy whose clear the window is counting down to. */
+  let pendingClear: { key: string; copyId: number; endsAt: number } | null = null;
+  /** The reload started when the window regains focus; actions wait for it
+   * instead of being dropped while it holds the pending operation. */
+  let quietLoad: Promise<void> | null = null;
+  let promptMessage: Message | null = null;
   let now = Date.now();
   let pendingOperation: PendingOperation | null = null;
   let operationGeneration = 0;
@@ -85,8 +91,8 @@
   let valueInput: HTMLInputElement | null = null;
   let buffer: HTMLElement | null = null;
 
-  $: fresh = snapshot ? freshCloneExample(snapshot) : null;
-  $: tabs = buildTabs(snapshot, fresh);
+  $: exampleToCopy = snapshot ? findExampleToCopy(snapshot) : null;
+  $: tabs = buildTabs(snapshot, exampleToCopy);
   $: selectedFile = snapshot?.files.find((file) => file.path === selectedPath) ?? null;
   $: rows = snapshot && selectedFile ? buildRows(snapshot, selectedFile) : [];
   $: selectedIndex = rows.findIndex((row) => row.id === selectedRowId);
@@ -97,14 +103,14 @@
   // Template only: inside handlers the reactive copy can lag a just-settled
   // operation, so they read pendingOperation directly.
   $: isBusy = pendingOperation !== null;
-  $: unread = selectedPath.startsWith(UNREAD_TAB)
-    ? snapshot?.incomplete.find((item) => UNREAD_TAB + item.name === selectedPath) ?? null
+  $: unreadable = selectedPath.startsWith(UNREADABLE_TAB)
+    ? snapshot?.incomplete.find((item) => UNREADABLE_TAB + item.name === selectedPath) ?? null
     : null;
-  $: freshNeeds = fresh ? fresh.entries.filter((entry) => entry.valueState !== 'set').length : 0;
-  $: copySeconds = copyClock ? Math.max(0, Math.ceil((copyClock.endsAt - now) / 1000)) : 0;
-  $: promptMessage = message ?? (copyClock ? { tone: 'ok' as Tone, text: `✓ copied ${copyClock.key} · clipboard clears in ${copySeconds} s` } : null);
-  $: verbs = verbsFor(snapshot, selectedPath, selectedRow, rows, edit, tracked, fresh, loadError);
-  $: hint = hintFor(snapshot, selectedFile, selectedRow, edit, shown);
+  $: newEnvNeeds = exampleToCopy ? exampleToCopy.entries.filter((entry) => entry.valueState !== 'set').length : 0;
+  $: secondsUntilClear = pendingClear ? Math.max(0, Math.ceil((pendingClear.endsAt - now) / 1000)) : 0;
+  $: promptMessage = message ?? (pendingClear ? { tone: 'ok', text: `✓ copied ${pendingClear.key} · clipboard clears in ${secondsUntilClear} s` } : null);
+  $: verbs = verbsFor(snapshot, selectedPath, selectedRow, rows, edit, tracked, exampleToCopy, loadError);
+  $: hint = hintFor(snapshot, selectedFile, selectedRow, edit, revealed);
   $: if (selectedRowId && buffer) void scrollSelectedIntoView();
 
   function buildTabs(current: ProjectSnapshot | null, example: EnvFile | null): Tab[] {
@@ -112,7 +118,7 @@
       return [];
     }
     const freshTab: Tab[] = example
-      ? [{ id: FRESH_TAB, label: '.env', count: null, badge: 'new', badgeTone: 'warning', ghost: true }]
+      ? [{ id: NEW_ENV_TAB, label: '.env', count: null, badge: 'new', badgeTone: 'warning', ghost: true }]
       : [];
     const fileTabs: Tab[] = current.files.map((file) => ({
       id: file.path,
@@ -124,7 +130,7 @@
       ghost: false
     }));
     const unreadTabs: Tab[] = current.incomplete.map((item) => ({
-      id: UNREAD_TAB + item.name,
+      id: UNREADABLE_TAB + item.name,
       label: item.name,
       count: null,
       badge: 'not read',
@@ -150,60 +156,60 @@
   ): Verb[] {
     if (!current) {
       return error
-        ? [{ keys: '⌘O', label: 'choose folder', run: browse }, { keys: '⌘R', label: 'try again', run: reload }]
-        : [{ keys: '⌘O', label: 'choose folder', run: browse }];
+        ? [{ shortcut: '⌘O', label: 'choose folder', run: browse }, { shortcut: '⌘R', label: 'try again', run: reload }]
+        : [{ shortcut: '⌘O', label: 'choose folder', run: browse }];
     }
     if (active) {
       if (active.refused) {
         return [
-          { keys: '⌘R', label: 'reload, keep what you typed', run: reload },
-          { keys: 'esc', label: 'cancel', run: cancelEdit }
+          { shortcut: '⌘R', label: 'reload, keep what you typed', run: reload },
+          { shortcut: 'esc', label: 'cancel', run: cancelEdit }
         ];
       }
       if (active.takenRowId) {
         const line = allRows.find((candidate) => candidate.id === active.takenRowId);
         const lineNumber = line?.kind === 'entry' ? line.entry.lineNumber : '';
         return [
-          { keys: '⏎', label: `edit line ${lineNumber}`, run: commitEdit },
-          { keys: 'esc', label: 'cancel', run: cancelEdit }
+          { shortcut: '⏎', label: `edit line ${lineNumber}`, run: commitEdit },
+          { shortcut: 'esc', label: 'cancel', run: cancelEdit }
         ];
       }
       if (active.phase === 'name') {
         return [
-          { keys: '⏎', label: 'next', run: commitEdit },
-          { keys: 'esc', label: 'cancel', run: cancelEdit }
+          { shortcut: '⏎', label: 'next', run: commitEdit },
+          { shortcut: 'esc', label: 'cancel', run: cancelEdit }
         ];
       }
-      const list: Verb[] = [{ keys: '⏎', label: commitLabel(active, allRows, inTrackedFile), run: commitEdit }];
+      const list: Verb[] = [{ shortcut: '⏎', label: commitLabel(active, allRows, inTrackedFile), run: commitEdit }];
       if (requiresProtectedInput(current, active.key)) {
-        list.push({ keys: '⌥', label: 'hold to show', run: () => {}, hold: true });
+        list.push({ shortcut: '⌥', label: 'hold to show', run: () => {}, hold: true });
       }
-      list.push({ keys: 'esc', label: 'cancel', run: cancelEdit });
+      list.push({ shortcut: 'esc', label: 'cancel', run: cancelEdit });
       return list;
     }
-    if (path === FRESH_TAB && example) {
-      return [{ keys: '⏎', label: `create .env from ${example.name}`, run: primaryAction }];
+    if (path === NEW_ENV_TAB && example) {
+      return [{ shortcut: '⏎', label: `create .env from ${example.name}`, run: () => void primaryAction() }];
     }
     if (current.files.length === 0 && current.incomplete.length === 0) {
       return [
-        { keys: '⏎', label: 'create .env', run: primaryAction },
-        { keys: '⌘O', label: 'choose another folder', run: browse }
+        { shortcut: '⏎', label: 'create .env', run: () => void primaryAction() },
+        { shortcut: '⌘O', label: 'choose another folder', run: browse }
       ];
     }
     if (!row) {
       return [];
     }
     if (row.kind === 'add') {
-      return [{ keys: '⏎', label: 'add', run: primaryAction }];
+      return [{ shortcut: '⏎', label: 'add', run: () => void primaryAction() }];
     }
-    const list: Verb[] = [{ keys: '⏎', label: 'edit', run: primaryAction }];
+    const list: Verb[] = [{ shortcut: '⏎', label: 'edit', run: () => void primaryAction() }];
     if (row.need === null) {
       if (row.kind === 'entry' && row.entry.shape.redactedByDefault) {
-        list.push({ keys: '⌥', label: 'hold to show', run: () => {}, hold: true });
+        list.push({ shortcut: '⌥', label: 'hold to show', run: () => {}, hold: true });
       }
-      list.push({ keys: '⌘C', label: 'copy', run: () => void copySelected() });
+      list.push({ shortcut: '⌘C', label: 'copy', run: () => void copySelected() });
     }
-    list.push({ keys: '⌘N', label: 'new key', run: () => void startAdd() });
+    list.push({ shortcut: '⌘N', label: 'new key', run: () => void startAdd() });
     return list;
   }
 
@@ -227,14 +233,14 @@
     if (!current || !file || !row || active || row.kind !== 'entry') {
       return null;
     }
-    if (revealed && revealed.target.entryId === row.entry.id && revealed.target.filePath === file.path) {
+    if (isRevealed(row, revealed, file)) {
       return { tone: 'quiet', text: 'let go, or leave the window, and it hides' };
     }
     const duplicate = duplicateHint(current.root, file, row.entry);
     return duplicate ? { tone: 'danger', text: duplicate } : null;
   }
 
-  function begin(kind: OperationKind, target: EntryRef | null = null): PendingOperation | null {
+  function beginOperation(kind: OperationKind, target: EntryRef | null = null): PendingOperation | null {
     if (pendingOperation) {
       return null;
     }
@@ -243,7 +249,7 @@
     return operation;
   }
 
-  function settle(operation: PendingOperation): boolean {
+  function settleOperation(operation: PendingOperation): boolean {
     if (!isCurrentOperation(pendingOperation, operation)) {
       return false;
     }
@@ -258,16 +264,16 @@
   function applySnapshot(loaded: ProjectSnapshot, keep: Selection | null): void {
     snapshot = loaded;
     projectPath = loaded.root;
-    shown = null;
-    const example = freshCloneExample(loaded);
+    revealed = null;
+    const example = findExampleToCopy(loaded);
 
     if (keep) {
-      if (keep.path === FRESH_TAB && example) {
-        selectedPath = FRESH_TAB;
+      if (keep.path === NEW_ENV_TAB && example) {
+        selectedPath = NEW_ENV_TAB;
         selectedRowId = '';
         return;
       }
-      if (keep.path.startsWith(UNREAD_TAB) && loaded.incomplete.some((item) => UNREAD_TAB + item.name === keep.path)) {
+      if (keep.path.startsWith(UNREADABLE_TAB) && loaded.incomplete.some((item) => UNREADABLE_TAB + item.name === keep.path)) {
         selectedPath = keep.path;
         selectedRowId = '';
         return;
@@ -282,12 +288,12 @@
     }
 
     if (example && !loaded.files.some((file) => !isExampleFile(file))) {
-      selectedPath = FRESH_TAB;
+      selectedPath = NEW_ENV_TAB;
       selectedRowId = '';
       return;
     }
     const initial = initialSelection(loaded);
-    selectedPath = initial?.path ?? (loaded.incomplete[0] ? UNREAD_TAB + loaded.incomplete[0].name : '');
+    selectedPath = initial?.path ?? (loaded.incomplete[0] ? UNREADABLE_TAB + loaded.incomplete[0].name : '');
     selectedRowId = initial?.rowId ?? '';
   }
 
@@ -295,21 +301,21 @@
     if (!path) {
       return;
     }
-    const operation = begin('load-project');
+    const operation = beginOperation('load-project');
     if (!operation) {
       return;
     }
     loading = !quiet;
     try {
       const loaded = await loadProject(path);
-      if (!settle(operation)) {
+      if (!settleOperation(operation)) {
         return;
       }
       loadError = '';
       applySnapshot(loaded, keep);
       retargetEdit();
     } catch (error) {
-      if (settle(operation)) {
+      if (settleOperation(operation)) {
         if (snapshot) {
           message = { tone: 'danger', text: `! could not reload: ${errorMessage(error)}` };
         } else {
@@ -342,7 +348,7 @@
       message = { tone: 'warning', text: 'Choosing a folder is available in the desktop app.' };
       return;
     }
-    const operation = begin('browse-project');
+    const operation = beginOperation('browse-project');
     if (!operation) {
       return;
     }
@@ -352,7 +358,7 @@
     } catch (error) {
       message = { tone: 'danger', text: `! ${errorMessage(error)}` };
     }
-    if (!settle(operation) || !picked) {
+    if (!settleOperation(operation) || !picked) {
       return;
     }
     snapshot = null;
@@ -404,7 +410,7 @@
     if (edit || pendingOperation || id === selectedPath) {
       return;
     }
-    shown = null;
+    revealed = null;
     message = null;
     savedRowId = '';
     selectedPath = id;
@@ -417,13 +423,13 @@
     if (edit || pendingOperation || rowId === selectedRowId) {
       return;
     }
-    shown = null;
+    revealed = null;
     message = null;
     savedRowId = '';
     selectedRowId = rowId;
   }
 
-  function move(delta: number): void {
+  function moveSelection(delta: number): void {
     if (rows.length === 0) {
       return;
     }
@@ -442,11 +448,18 @@
     input?.focus({ preventScroll: true });
   }
 
-  function primaryAction(): void {
+  async function afterQuietLoad(): Promise<void> {
+    if (quietLoad) {
+      await quietLoad;
+    }
+  }
+
+  async function primaryAction(): Promise<void> {
+    await afterQuietLoad();
     if (!snapshot || edit || pendingOperation) {
       return;
     }
-    if (selectedPath === FRESH_TAB) {
+    if (selectedPath === NEW_ENV_TAB) {
       void createFromExample();
       return;
     }
@@ -463,7 +476,7 @@
     if (!snapshot || edit || pendingOperation) {
       return;
     }
-    shown = null;
+    revealed = null;
     message = null;
     savedRowId = '';
     selectedPath = file.path;
@@ -504,6 +517,7 @@
   }
 
   async function startAdd(): Promise<void> {
+    await afterQuietLoad();
     if (!selectedFile || edit || pendingOperation) {
       return;
     }
@@ -550,7 +564,7 @@
         message = { tone: 'danger', text: `! ${name.split('=')[0]}=… looks like KEY=VALUE. Type the name alone, then the value.` };
         return;
       }
-      if (!KEY_NAME.test(name)) {
+      if (!VALID_KEY_NAME.test(name)) {
         message = { tone: 'danger', text: `! ${name} is not a valid key name. Start with a letter or _, then letters, digits, _ . or -.` };
         return;
       }
@@ -571,12 +585,12 @@
       return;
     }
     if (active.value === '' || active.value === active.baseline) {
-      await moveOn(file, buildRows(snapshot, file), active);
+      await openNextNeeding(file, buildRows(snapshot, file), active);
       return;
     }
 
     const root = snapshot.root;
-    const operation = begin(active.target ? 'save-entry' : 'add-entry', active.target);
+    const operation = beginOperation(active.target ? 'save-entry' : 'add-entry', active.target);
     if (!operation) {
       return;
     }
@@ -584,11 +598,11 @@
       const loaded = active.target
         ? await saveEnvValue(root, active.filePath, active.key, active.target.lineNumber, active.value)
         : await addEnvKey(root, active.filePath, active.key, active.value);
-      if (!settle(operation)) {
+      if (!settleOperation(operation)) {
         return;
       }
       snapshot = loaded;
-      shown = null;
+      revealed = null;
       const savedFile = loaded.files.find((candidate) => candidate.path === active.filePath);
       const savedRows = savedFile ? buildRows(loaded, savedFile) : [];
       const saved = active.target
@@ -602,10 +616,10 @@
       savedRowId = saved?.id ?? '';
       message = { tone: 'ok', text: `✓ saved ${active.key}` };
       if (savedFile && saved) {
-        await moveOn(savedFile, savedRows, { ...active, rowId: saved.id }, true);
+        await openNextNeeding(savedFile, savedRows, { ...active, rowId: saved.id }, true);
       }
     } catch (error) {
-      if (settle(operation)) {
+      if (settleOperation(operation)) {
         edit = { ...active, refused: true };
         message = { tone: 'danger', text: refusalText(active, errorMessage(error)) };
       }
@@ -613,7 +627,7 @@
   }
 
   /** After a row needing a value is saved or skipped, the next one opens. */
-  async function moveOn(file: EnvFile, fileRows: Row[], active: Edit, keepMessage = false): Promise<void> {
+  async function openNextNeeding(file: EnvFile, fileRows: Row[], active: Edit, keepMessage = false): Promise<void> {
     edit = null;
     if (!keepMessage) {
       message = null;
@@ -638,20 +652,23 @@
   }
 
   async function createFromExample(): Promise<void> {
-    const example = fresh;
-    const operation = begin('create-from-example');
-    if (!operation || !example) {
+    const example = exampleToCopy;
+    if (!example) {
+      return;
+    }
+    const operation = beginOperation('create-from-example');
+    if (!operation) {
       return;
     }
     try {
       const loaded = await createEnvFromExample();
-      if (!settle(operation)) {
+      if (!settleOperation(operation)) {
         return;
       }
       applySnapshot(loaded, null);
       message = { tone: 'ok', text: `✓ created .env from ${example.name}` };
     } catch (error) {
-      if (settle(operation)) {
+      if (settleOperation(operation)) {
         message = { tone: 'danger', text: `! ${errorMessage(error)}` };
       }
     }
@@ -662,58 +679,60 @@
       return;
     }
     const root = snapshot.root;
-    const operation = begin('create-file');
+    const operation = beginOperation('create-file');
     if (!operation) {
       return;
     }
     try {
       const outcome = await ensureEnvFile(root, '.env');
-      if (!settle(operation)) {
+      if (!settleOperation(operation)) {
         return;
       }
       await loadProjectPath(root, { path: outcome.path, rowId: ADD_ROW_ID });
       message = { tone: 'ok', text: '✓ created .env' };
     } catch (error) {
-      if (settle(operation)) {
+      if (settleOperation(operation)) {
         message = { tone: 'danger', text: `! ${errorMessage(error)}` };
       }
     }
   }
 
-  async function pressShow(): Promise<void> {
+  async function startReveal(): Promise<void> {
     if (optionHeld) {
       return;
     }
     optionHeld = true;
+    await afterQuietLoad();
     const row = selectedRow;
     const target = selectedTarget;
     if (edit || !target || row?.kind !== 'entry' || !row.entry.shape.redactedByDefault || row.entry.valueState === 'empty') {
       return;
     }
-    const operation = begin('reveal-entry', target);
+    const operation = beginOperation('reveal-entry', target);
     if (!operation) {
       return;
     }
     try {
       const value = await revealEnvValue(target.root, target.filePath, target.key, target.lineNumber);
       const current = canApplyTargetedOperation(pendingOperation, operation, selectedTarget);
-      settle(operation);
+      settleOperation(operation);
       if (current && optionHeld) {
-        shown = { target, value };
+        revealed = { target, value };
       }
     } catch (error) {
-      if (settle(operation)) {
+      if (settleOperation(operation)) {
         message = { tone: 'danger', text: `! ${errorMessage(error)}` };
       }
     }
   }
 
-  function releaseShow(): void {
+  function endReveal(): void {
     optionHeld = false;
-    shown = null;
+    revealed = null;
   }
 
   async function copySelected(): Promise<void> {
+    await afterQuietLoad();
     if (edit || pendingOperation || !selectedRow || selectedRow.kind === 'add') {
       return;
     }
@@ -725,25 +744,25 @@
     if (!target) {
       return;
     }
-    const operation = begin('copy-entry', target);
+    const operation = beginOperation('copy-entry', target);
     if (!operation) {
       return;
     }
     try {
       const outcome = await copyEnvValue(target.root, target.filePath, target.key, target.lineNumber);
-      if (!settle(operation)) {
+      if (!settleOperation(operation)) {
         return;
       }
       message = null;
-      if (outcome.clearsInSeconds) {
+      if (outcome.copyId !== null && outcome.clearsInSeconds !== null) {
         now = Date.now();
-        copyClock = { key: outcome.key, endsAt: now + outcome.clearsInSeconds * 1000 };
+        pendingClear = { key: target.key, copyId: outcome.copyId, endsAt: now + outcome.clearsInSeconds * 1000 };
       } else {
-        copyClock = null;
-        message = { tone: 'ok', text: `✓ copied ${outcome.key}` };
+        pendingClear = null;
+        message = { tone: 'ok', text: `✓ copied ${target.key}` };
       }
     } catch (error) {
-      if (settle(operation)) {
+      if (settleOperation(operation)) {
         message = { tone: 'danger', text: `! ${errorMessage(error)}` };
       }
     }
@@ -751,7 +770,7 @@
 
   function handleWindowKeydown(event: KeyboardEvent): void {
     if (event.key === 'Alt') {
-      void pressShow();
+      void startReveal();
       return;
     }
     const command = event.metaKey || event.ctrlKey;
@@ -762,7 +781,18 @@
       return;
     }
     const typing = event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement;
-    if (typing || edit || !snapshot) {
+    if (edit && !typing) {
+      // The field lost focus, for example to a click; its keys still apply.
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        void commitEdit();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        cancelEdit();
+      }
+      return;
+    }
+    if (typing || !snapshot) {
       if (!snapshot && command && key === 'o') {
         event.preventDefault();
         void browse();
@@ -787,23 +817,26 @@
     }
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
-      move(event.key === 'ArrowDown' ? 1 : -1);
-    } else if (event.key === 'Enter') {
+      const delta = event.key === 'ArrowDown' ? 1 : -1;
+      void afterQuietLoad().then(() => moveSelection(delta));
+    } else if (event.key === 'Enter' && !(event.target instanceof HTMLButtonElement)) {
       event.preventDefault();
-      primaryAction();
+      void primaryAction();
     }
   }
 
   function handleWindowKeyup(event: KeyboardEvent): void {
     if (event.key === 'Alt') {
-      releaseShow();
+      endReveal();
     }
   }
 
   function handleWindowFocus(): void {
     // Picks up changes made in a terminal while the window was in the background.
     if (snapshot && !edit && !pendingOperation) {
-      void loadProjectPath(snapshot.root, currentSelection(), true);
+      quietLoad = loadProjectPath(snapshot.root, currentSelection(), true).finally(() => {
+        quietLoad = null;
+      });
     }
   }
 
@@ -837,26 +870,34 @@
     if (row.kind !== 'entry') {
       return '';
     }
-    if (isShown(row, revealed, file) && revealed) {
-      return revealed.value;
-    }
-    if (row.entry.valueState === 'empty') {
-      return '';
-    }
-    return row.entry.shape.redactedByDefault ? '••••••••' : row.entry.value;
+    return isRevealed(row, revealed, file) && revealed ? revealed.value : entryDisplay(row.entry);
   }
 
-  function isShown(row: Row, revealed: RevealedEntry | null, file: EnvFile | null): boolean {
+  /** What a row shows without a reveal: a secret is masked, an empty value blank. */
+  function entryDisplay(entry: EnvEntry): string {
+    if (entry.valueState === 'empty') {
+      return '';
+    }
+    return entry.shape.redactedByDefault ? '••••••••' : entry.value;
+  }
+
+  function isRevealed(row: Row, revealed: RevealedEntry | null, file: EnvFile | null): boolean {
     return Boolean(
       revealed && file && row.kind === 'entry' && revealed.target.filePath === file.path && revealed.target.entryId === row.entry.id
     );
   }
 
-  function noteFor(row: Row, active: Edit | null, revealed: RevealedEntry | null, file: EnvFile | null, saved: string): { tone: string; text: string } | null {
+  function noteFor(
+    row: Row,
+    active: Edit | null,
+    revealed: RevealedEntry | null,
+    file: EnvFile | null,
+    saved: string
+  ): { tone: NoteTone | MessageTone; text: string } | null {
     if (saved === row.id) {
       return { tone: 'ok', text: '✓ saved' };
     }
-    if (isShown(row, revealed, file)) {
+    if (isRevealed(row, revealed, file)) {
       return { tone: 'info', text: 'shown while ⌥ is held' };
     }
     if (active?.rowId === row.id && active.lines > 1) {
@@ -886,10 +927,6 @@
     return row?.key ?? '';
   }
 
-  function baseName(path: string): string {
-    return path.split(/[\\/]/).pop() ?? path;
-  }
-
   function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
   }
@@ -897,15 +934,21 @@
   onMount(() => {
     void bootProject();
     const timer = window.setInterval(() => {
-      if (copyClock) {
+      if (pendingClear) {
         now = Date.now();
       }
     }, 250);
-    const unlisten = onClipboardCleared((event) => {
-      copyClock = null;
-      message = event.cleared
-        ? { tone: 'info', text: 'clipboard cleared' }
-        : { tone: 'info', text: 'clipboard left alone: something else was copied after it' };
+    const unlisten = onConcealedCopyExpired((event) => {
+      // An earlier copy's timer must not end the countdown of a later one.
+      if (event.copyId !== pendingClear?.copyId) {
+        return;
+      }
+      pendingClear = null;
+      if (!edit) {
+        message = event.cleared
+          ? { tone: 'info', text: 'clipboard cleared' }
+          : { tone: 'info', text: 'clipboard left alone: something else was copied after it' };
+      }
     });
     return () => {
       window.clearInterval(timer);
@@ -918,7 +961,7 @@
   <title>vne</title>
 </svelte:head>
 
-<svelte:window onkeydown={handleWindowKeydown} onkeyup={handleWindowKeyup} onblur={releaseShow} onfocus={handleWindowFocus} />
+<svelte:window onkeydown={handleWindowKeydown} onkeyup={handleWindowKeyup} onblur={endReveal} onfocus={handleWindowFocus} />
 
 <main class="app" aria-busy={isBusy}>
   <nav class="tabline" aria-label="Env files">
@@ -928,6 +971,7 @@
         class="tb"
         class:on={tab.id === selectedPath}
         class:ghost={tab.ghost}
+        aria-current={tab.id === selectedPath ? 'page' : undefined}
         title={index < 9 ? `⌘${index + 1}` : undefined}
         onclick={() => chooseTab(tab.id)}
       >
@@ -947,28 +991,28 @@
           No folder open.
         {/if}
       </p>
-    {:else if selectedPath === FRESH_TAB && fresh}
+    {:else if selectedPath === NEW_ENV_TAB && exampleToCopy}
       <p class="lead">
-        No <b>.env</b> yet. ⏎ creates it as a copy of <b>{fresh.name}</b> ({fresh.entries.length} keys).<br />
-        Then <span class="warning">{freshNeeds} need a value</span>{#if freshNeeds < fresh.entries.length}; the rest keep the example's values{/if}.
+        No <b>.env</b> yet. ⏎ creates it as a copy of <b>{exampleToCopy.name}</b> ({exampleToCopy.entries.length} keys).<br />
+        Then <span class="warning">{newEnvNeeds} need a value</span>{#if newEnvNeeds < exampleToCopy.entries.length}; the rest keep the example's values{/if}.
       </p>
       <table class="rows preview">
         <tbody>
-          {#each fresh.entries as entry (entry.id)}
+          {#each exampleToCopy.entries as entry (entry.id)}
             <tr>
               <td class="n">{entry.lineNumber}</td>
               <td class="k" title={entry.key}>{entry.key}</td>
               <td class="val" class:masked={entry.shape.redactedByDefault}>
-                {entry.valueState === 'empty' ? '' : entry.shape.redactedByDefault ? '••••••••' : entry.value}
+                {entryDisplay(entry)}
               </td>
               <td class="vt warning">{entry.valueState === 'set' ? '' : entry.valueState}</td>
             </tr>
           {/each}
         </tbody>
       </table>
-    {:else if unread}
+    {:else if unreadable}
       <p class="lead">
-        vne could not read <b>{unread.name}</b> <span class="warning">({unread.reason})</span>.<br />
+        vne could not read <b>{unreadable.name}</b> <span class="warning">({unreadable.reason})</span>.<br />
         Nothing in it can be shown, copied or edited here.
       </p>
     {:else if snapshot.files.length === 0}
@@ -978,13 +1022,12 @@
         <tbody aria-label={`Keys in ${selectedFile.name}`}>
           {#each rows as row (row.id)}
             {@const editing = edit !== null && edit.rowId === row.id}
-            {@const note = noteFor(row, edit, shown, selectedFile, savedRowId)}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            {@const note = noteFor(row, edit, revealed, selectedFile, savedRowId)}
             <tr
               class:sel={row.id === selectedRowId}
               class:ghost={row.kind === 'missing'}
               class:add={row.kind === 'add'}
-              class:wrap={isShown(row, shown, selectedFile)}
+              class:wrap={isRevealed(row, revealed, selectedFile)}
               aria-current={row.id === selectedRowId ? 'true' : undefined}
               onclick={() => select(row.id)}
               ondblclick={() => selectedFile && void startEdit(selectedFile, row)}
@@ -1010,7 +1053,7 @@
                   {row.key}
                 {/if}
               </td>
-              <td class="val" class:masked={row.kind === 'entry' && row.entry.shape.redactedByDefault && !isShown(row, shown, selectedFile)}>
+              <td class="val" class:masked={row.kind === 'entry' && row.entry.shape.redactedByDefault && !isRevealed(row, revealed, selectedFile)}>
                 {#if editing && edit && edit.phase === 'value'}
                   <input
                     bind:this={valueInput}
@@ -1026,7 +1069,7 @@
                     onkeydown={handleEditKeydown}
                   />
                 {:else}
-                  {valueText(row, shown, selectedFile)}
+                  {valueText(row, revealed, selectedFile)}
                 {/if}
               </td>
               <td class="vt {note?.tone ?? ''}">{note?.text ?? ''}</td>
@@ -1039,7 +1082,7 @@
 
   <div class="status">
     <span class="mode" class:edit={edit !== null}>{edit ? 'edit' : 'view'}</span>
-    <span class="seg"><b>{selectedPath === FRESH_TAB ? '.env (not created yet)' : selectedFile?.name ?? unread?.name ?? snapshot?.root ?? ''}</b></span>
+    <span class="seg"><b>{selectedPath === NEW_ENV_TAB ? '.env (not created yet)' : selectedFile?.name ?? unreadable?.name ?? snapshot?.root ?? ''}</b></span>
     {#if selectedRow}
       <span class="seg">ln {lineLabel(selectedRow)}</span>
       <span class="seg"><b>{keyLabel(selectedRow, edit)}</b></span>
@@ -1048,25 +1091,29 @@
     {#if needs > 0}<span class="rv">{needs} need a value</span>{/if}
   </div>
 
+  <!-- Always present, so screen readers announce changes; the copy countdown stays out of it. -->
+  <p class="sr-only" role="status" aria-live="polite">{message?.text ?? ''}</p>
+
   <div class="cmd">
     {#if promptMessage}
-      <span class="msg {promptMessage.tone}" role={promptMessage.tone === 'danger' ? 'alert' : 'status'}>{promptMessage.text}</span>
+      <span class="msg {promptMessage.tone}">{promptMessage.text}</span>
     {:else if edit && tracked && edit.phase === 'value'}
       <span class="msg warning">! git tracks {selectedFile?.name}; a commit would publish this value.</span>
     {:else if !edit}
       <span class="p">›</span>
     {/if}
-    {#each verbs as verb (verb.keys + verb.label)}
+    {#each verbs as verb (verb.shortcut + verb.label)}
       {#if verb.hold}
         <button
           type="button"
           class="verb"
-          onpointerdown={() => void pressShow()}
-          onpointerup={releaseShow}
-          onpointerleave={releaseShow}
-        ><b>{verb.keys}</b>{verb.label}</button>
+          onpointerdown={(event) => event.button === 0 && void startReveal()}
+          onpointerup={endReveal}
+          onpointerleave={endReveal}
+          onpointercancel={endReveal}
+        ><b>{verb.shortcut}</b>{verb.label}</button>
       {:else}
-        <button type="button" class="verb" disabled={isBusy} onclick={verb.run}><b>{verb.keys}</b>{verb.label}</button>
+        <button type="button" class="verb" disabled={isBusy} onclick={verb.run}><b>{verb.shortcut}</b>{verb.label}</button>
       {/if}
     {/each}
     {#if hint}<span class="hint {hint.tone}">{hint.text}</span>{/if}

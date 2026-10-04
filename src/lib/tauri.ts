@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { relativePath } from './paths';
 import { sampleProject } from './sample';
-import type { ClipboardCleared, CopyOutcome, EnsureEnvFileOutcome, ProjectSnapshot } from './types';
+import type { ClipboardCopyOutcome, ConcealedCopyExpired, EnsureEnvFileOutcome, ProjectSnapshot } from './types';
 
 export function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
@@ -40,24 +41,25 @@ export async function revealEnvValue(root: string, path: string, key: string, li
     return entry.value;
   }
 
-  return invoke<string>('reveal_env_value', { path: relativeIdentifier(root, path), key, lineNumber });
+  return invoke<string>('reveal_env_value', { path: relativePath(root, path), key, lineNumber });
 }
 
-export async function copyEnvValue(root: string, path: string, key: string, lineNumber: number): Promise<CopyOutcome> {
+export async function copyEnvValue(root: string, path: string, key: string, lineNumber: number): Promise<ClipboardCopyOutcome> {
   if (!isTauriRuntime()) {
     await delay(180);
     throw new Error('Copying is available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
-  return invoke<CopyOutcome>('copy_env_value', { path: relativeIdentifier(root, path), key, lineNumber });
+  const outcome = await invoke<unknown>('copy_env_value', { path: relativePath(root, path), key, lineNumber });
+  return parseClipboardCopyOutcome(outcome);
 }
 
-export async function onClipboardCleared(handler: (event: ClipboardCleared) => void): Promise<UnlistenFn> {
+export async function onConcealedCopyExpired(handler: (event: ConcealedCopyExpired) => void): Promise<UnlistenFn> {
   if (!isTauriRuntime()) {
     return () => {};
   }
 
-  return listen<ClipboardCleared>('clipboard-cleared', (event) => handler(event.payload));
+  return listen<unknown>('concealed-copy-expired', (event) => handler(parseConcealedCopyExpired(event.payload)));
 }
 
 export async function saveEnvValue(
@@ -72,7 +74,7 @@ export async function saveEnvValue(
     throw new Error('Saving is available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
-  return invoke<ProjectSnapshot>('save_env_value', { path: relativeIdentifier(root, path), key, lineNumber, value });
+  return invoke<ProjectSnapshot>('save_env_value', { path: relativePath(root, path), key, lineNumber, value });
 }
 
 export async function addEnvKey(root: string, path: string, key: string, value: string): Promise<ProjectSnapshot> {
@@ -81,7 +83,7 @@ export async function addEnvKey(root: string, path: string, key: string, value: 
     throw new Error('Adding missing keys is available in the Tauri desktop app. Browser preview uses read-only sample data.');
   }
 
-  return invoke<ProjectSnapshot>('add_env_key', { path: relativeIdentifier(root, path), key, value });
+  return invoke<ProjectSnapshot>('add_env_key', { path: relativePath(root, path), key, value });
 }
 
 export async function ensureEnvFile(root: string, name: string): Promise<EnsureEnvFileOutcome> {
@@ -114,16 +116,38 @@ export async function pickProjectDirectory(defaultPath: string): Promise<string 
   return invoke<string | null>('choose_authorized_root');
 }
 
-function relativeIdentifier(root: string, path: string): string {
-  const normalizedRoot = root.endsWith('/') ? root : `${root}/`;
-  if (path.startsWith(normalizedRoot)) {
-    return path.slice(normalizedRoot.length);
-  }
-  return path.replace(/^\\/g, '/').split('/').pop() ?? path;
-}
-
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+/** A secret's copy must carry both its id and its clear delay, or neither. */
+export function parseClipboardCopyOutcome(value: unknown): ClipboardCopyOutcome {
+  if (!value || typeof value !== 'object' || !('copyId' in value) || !('clearsInSeconds' in value)) {
+    throw new Error('The native copy response was malformed.');
+  }
+
+  const { copyId, clearsInSeconds } = value;
+  if (copyId === null && clearsInSeconds === null) {
+    return { copyId, clearsInSeconds };
+  }
+  if (typeof copyId !== 'number' || !Number.isInteger(copyId) || typeof clearsInSeconds !== 'number' || !(clearsInSeconds > 0)) {
+    throw new Error('The native copy response was malformed.');
+  }
+
+  return { copyId, clearsInSeconds };
+}
+
+export function parseConcealedCopyExpired(value: unknown): ConcealedCopyExpired {
+  if (!value || typeof value !== 'object' || !('copyId' in value) || !('cleared' in value)) {
+    throw new Error('The native clipboard event was malformed.');
+  }
+
+  const { copyId, cleared } = value;
+  if (typeof copyId !== 'number' || !Number.isInteger(copyId) || typeof cleared !== 'boolean') {
+    throw new Error('The native clipboard event was malformed.');
+  }
+
+  return { copyId, cleared };
 }
 
 export function parseEnsureEnvFileOutcome(value: unknown): EnsureEnvFileOutcome {
