@@ -2,7 +2,7 @@
 name = "vne"
 version = "0.1.0"
 license = "MIT"
-description = "A local private .env viewer and editor"
+description = "A .env CLI for coding agents that keeps stored values out of its default output"
 authors = ["vne contributors"]
 edition = "2021"
 rust-version = "1.90"
