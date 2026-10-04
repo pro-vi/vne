@@ -94,6 +94,8 @@
   $: selectedTarget = targetFor(snapshot, selectedFile, selectedRow);
   $: needs = needCount(rows);
   $: tracked = selectedFile?.gitStatus === 'tracked';
+  // Template only: inside handlers the reactive copy can lag a just-settled
+  // operation, so they read pendingOperation directly.
   $: isBusy = pendingOperation !== null;
   $: unread = selectedPath.startsWith(UNREAD_TAB)
     ? snapshot?.incomplete.find((item) => UNREAD_TAB + item.name === selectedPath) ?? null
@@ -333,7 +335,7 @@
   }
 
   async function browse(): Promise<void> {
-    if (edit || isBusy) {
+    if (edit || pendingOperation) {
       return;
     }
     if (!isTauriRuntime()) {
@@ -399,7 +401,7 @@
   }
 
   function chooseTab(id: string): void {
-    if (edit || isBusy || id === selectedPath) {
+    if (edit || pendingOperation || id === selectedPath) {
       return;
     }
     shown = null;
@@ -412,7 +414,7 @@
   }
 
   function select(rowId: string): void {
-    if (edit || isBusy || rowId === selectedRowId) {
+    if (edit || pendingOperation || rowId === selectedRowId) {
       return;
     }
     shown = null;
@@ -441,7 +443,7 @@
   }
 
   function primaryAction(): void {
-    if (!snapshot || edit || isBusy) {
+    if (!snapshot || edit || pendingOperation) {
       return;
     }
     if (selectedPath === FRESH_TAB) {
@@ -458,7 +460,7 @@
   }
 
   async function startEdit(file: EnvFile, row: Row): Promise<void> {
-    if (!snapshot || edit || isBusy) {
+    if (!snapshot || edit || pendingOperation) {
       return;
     }
     shown = null;
@@ -502,7 +504,7 @@
   }
 
   async function startAdd(): Promise<void> {
-    if (!selectedFile || edit || isBusy) {
+    if (!selectedFile || edit || pendingOperation) {
       return;
     }
     const addRow = rows.find((row) => row.id === ADD_ROW_ID);
@@ -512,7 +514,7 @@
   }
 
   function cancelEdit(): void {
-    if (isBusy) {
+    if (pendingOperation) {
       return;
     }
     edit = null;
@@ -520,7 +522,7 @@
   }
 
   async function commitEdit(): Promise<void> {
-    if (!edit || !snapshot || isBusy) {
+    if (!edit || !snapshot || pendingOperation) {
       return;
     }
     const active = edit;
@@ -712,7 +714,7 @@
   }
 
   async function copySelected(): Promise<void> {
-    if (edit || isBusy || !selectedRow || selectedRow.kind === 'add') {
+    if (edit || pendingOperation || !selectedRow || selectedRow.kind === 'add') {
       return;
     }
     if (selectedRow.need !== null) {
@@ -800,7 +802,7 @@
 
   function handleWindowFocus(): void {
     // Picks up changes made in a terminal while the window was in the background.
-    if (snapshot && !edit && !isBusy) {
+    if (snapshot && !edit && !pendingOperation) {
       void loadProjectPath(snapshot.root, currentSelection(), true);
     }
   }
@@ -816,7 +818,7 @@
   }
 
   function handleValueInput(value: string): void {
-    if (edit && !isBusy) {
+    if (edit && !pendingOperation) {
       edit = { ...edit, value };
     }
   }
@@ -948,7 +950,7 @@
     {:else if selectedPath === FRESH_TAB && fresh}
       <p class="lead">
         No <b>.env</b> yet. ⏎ creates it as a copy of <b>{fresh.name}</b> ({fresh.entries.length} keys).<br />
-        Then <span class="warning">{freshNeeds} need a value</span>; the rest keep the example's values.
+        Then <span class="warning">{freshNeeds} need a value</span>{#if freshNeeds < fresh.entries.length}; the rest keep the example's values{/if}.
       </p>
       <table class="rows preview">
         <tbody>
