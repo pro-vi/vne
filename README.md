@@ -173,6 +173,25 @@ Don't allow `Bash(vne run *)`. Claude Code matches it against whatever follows `
 
 A `Read` deny rule covers Claude Code's file tools and the shell commands it recognizes, such as `cat` and `head`. It does not cover a program that opens the file itself. That is why `vne` keeps working, and why none of this is a sandbox.
 
+## How much this protects
+
+| | Setup | The agent | A value reaches the model when | Your work |
+| --- | --- | --- | --- | --- |
+| 1 | Nothing | Reads `.env` and does everything | Always | None |
+| 2 | A deny rule or hook | Can't see which keys exist | It runs a program that opens the file itself | Open `.env` in an editor, copy keys between files, tell the agent where each key is, set variables before it runs a command |
+| **3** | **A deny rule, and vne** | **Finds, checks, copies and runs keys without opening the file** | **It, or text that tricked it, makes a command print a key** | **Type a secret when it asks; run a copy between folders; approve a `vne run` you haven't allowed** |
+| 4 | The agent in a sandbox without your keys | Can't use real keys | Never: the keys aren't there | Set up the sandbox; run whatever needs real keys yourself |
+
+Rungs 2 and 3 are equally strong against an agent that sets out to read a value, including one following instructions it found in a file or a web page. vne doesn't make the block stronger. It lets the agent do its work without getting past the block, and takes the hand work off you. Only rung 4 is a wall.
+
+`vne run` is where rung 3 is thinnest: even a command you allowed, such as `npm test`, runs code the agent may have edited.
+
+A secrets server moves keys out of files but doesn't change the rung by itself. An agent using your login is on rung 3. An agent holding a token that can't read values, and kept away from your files, is on rung 4, at rung 4's cost.
+
+### How it was tested
+
+In September 2026, attacker agents got a fake secret and vne's commands, and tried to get the secret out. Six ways out turned up, through `--values` and `copy`; all six are fixed and kept as tests. The 12 attempts on the fixed build found nothing.
+
 ## The window
 
 `vne .` opens the project in a macOS window that does three things:
