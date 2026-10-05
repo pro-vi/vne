@@ -9,7 +9,7 @@ vne lets your coding agent work on `.env` files without reading them.
 
 ![An agent finds a deploy token, calls an API and runs benchmarks with keys it never sees, then hands its owner two commands for the missing secrets](docs/assets/vne-demo.gif)
 
-**Without vne** you pick one of two. Let the agent read `.env`, and every value in it goes to the model. Or block it with a [deny rule or a hook](#pick-how-much-your-agent-may-do), and become its hands: you open `.env` in an editor, copy keys between files, tell it which file holds a key, and set variables before it runs a command.
+**Without vne** you pick one of two. Let the agent read `.env`, and every value in it goes to the model. Or block it with a [deny rule or a hook](#set-up-your-agent), and become its hands: you open `.env` in an editor, copy keys between files, tell it which file holds a key, and set variables before it runs a command.
 
 **With vne** the block stays on and the agent does that work itself. vne answers it with key names, file paths, line numbers and whether each value is set, and keeps secret values out of its answers. It comes back to you only when a secret has to be typed in or moved to another folder, and then it gives you one command to run.
 
@@ -25,103 +25,15 @@ vne add .env OPENAI_API_KEY --prompt          # for you: type the secret, hidden
 
 ## Install
 
-macOS on Apple Silicon:
-
 ```sh
 brew install pro-vi/de/vne
 ```
 
-Use the full name. As of Homebrew 7.0, installing a formula by its full name trusts it, and Homebrew ignores formulae from a third-party tap it has not been told to trust.
+macOS on Apple Silicon. Use the full name: as of Homebrew 7.0, installing a formula by its full name trusts it, and Homebrew ignores formulae from a third-party tap it has not been told to trust. Other platforms [build from source](#development).
 
-From source, which needs Rust 1.90 or newer, Node matching `^20.19.0 || >=22.12.0` (the engine range for Vite 8.2.2), and the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/):
+## Set up your agent
 
-```sh
-npm install
-npm run install:local
-```
-
-Use `install:local` rather than plain `cargo install --path src-tauri`: Tauri release binaries need the `custom-protocol` feature to load the bundled interface, and the script sets it.
-
-## What an agent does with it
-
-The commands below print key names, paths, line numbers and states, not stored values. On a terminal the output is text; piped, which is what an agent sees, it is JSON.
-
-### Find a key
-
-```sh
-vne where STRIPE_SECRET_KEY . ../shop-main ~/.config/keys
-```
-
-```text
-STRIPE_SECRET_KEY
-  ~/vne-demo/shop/.env.example:4  empty, git untracked
-  ~/vne-demo/keys/stripe.env:1  set, outside git
-```
-
-Run it before telling the user a key is missing. Each match gives the file, the line, `set`, `empty` or `placeholder`, and git status. With no path it searches the current directory; otherwise only the paths you name. Directories are not searched recursively. Exit 0 means found, 1 not found, 2 a file could not be read.
-
-### See what a project needs
-
-```sh
-vne check .env --example .env.example
-```
-
-```text
-contract: 2 shared, 3 missing, 0 extra, 0 duplicate
-  missing DATABASE_URL
-  missing NEXTAUTH_SECRET
-  missing STRIPE_SECRET_KEY
-```
-
-`check` compares one file with its example and exits 1 when keys are missing, extra or duplicated, so an agent or a script can branch on it. `vne inspect .` covers every env file in the project: the keys in each, overrides between layers, and whether git tracks each file.
-
-### Change the files
-
-| To | Run | Notes |
-| --- | --- | --- |
-| Start a `.env` | `vne create .env` | Empty and owner-private; never overwrites. |
-| Add a key that is not secret | `vne add .env FEATURE_SEARCH=true` | Refuses a key that already exists. Warns when a secret-looking value arrives as an argument. |
-| Change a value that is not secret | `printf '%s' 4000 \| vne set .env PORT --stdin` | `set` refuses values given as arguments. |
-| Rename a key | `vne rename .env OPENAI_KEY OPENAI_API_KEY` | Value, quotes, comment and line position stay byte-identical. One file per run. |
-| Remove a key | `vne rm .env STALE_FLAG --expect present` | A duplicated key needs `--line N` or `--all`. `--expect` turns a wrong belief about the key into exit 2. |
-| Keep the example in step | `vne example .env` | Adds keys missing from `.env.example` as blanks, never values. |
-| Copy a value between files | `vne copy .env DATABASE_URL apps/web/.env` | The value stays inside vne. Replacing a different value needs `--overwrite`. |
-
-Comments, order, quoting and `export` prefixes around the change stay as they were. A write to a file git tracks prints a warning on stderr.
-
-When its output is not a terminal, as with an agent or a script, `copy` writes a secret-looking value only into a file under the source file's folder, and refuses anything else. To bring a secret from another project, the agent hands you the command; run from your terminal, it copies between projects.
-
-### Run commands with keys
-
-```sh
-vne run .env -- npm test
-vne run .env -- npx prisma migrate dev
-vne run .env .env.local -- npm run dev
-vne run keys.env -- sh -c 'printf "Authorization: Bearer %s\n" "$API_KEY" | curl -H @- https://api.example.com'
-```
-
-`run` starts one command with the files' keys in its environment. The calling shell does not receive them, and the command can pass them to its own child processes. The last example hands a key to `curl` on stdin, so it never appears in a process list.
-
-- A key defined in two of the files refuses the run rather than picking one. A key from a file replaces an inherited variable of the same name.
-- Files are read as data, not shell code: nothing is expanded or executed. A line that is not an entry, a malformed or repeated entry, or a quoted value with an escape other than `\\` and an escaped quote refuses the run.
-- `env`, `printenv`, and `sh -c` scripts that list the environment are refused. That catches a slip, not a command that wants to print what it receives.
-- The exit status is the command's own. A refusal exits 2; a command that cannot start exits 127 or 126, as a shell would.
-
-This replaces `set -a; source .env`, which puts every key into every later process, where `env`, `ps eww`, or a crash dump can print them. Reasoning: [ADR 0005](docs/adr/0005-run-loads-env-files-into-one-child.md).
-
-### Hand a secret to you
-
-When a step needs a value the agent should not see, it gives you a command for your own terminal:
-
-```sh
-vne add .env STRIPE_SECRET_KEY --prompt        # new key; what you type is hidden
-vne set .env STRIPE_SECRET_KEY --prompt        # replace an existing value
-vne copy ../shop-main/.env DATABASE_URL .env   # a secret from another folder
-```
-
-`--prompt` needs an interactive terminal. You can also fill values in the window (`vne .`).
-
-## Pick how much your agent may do
+Pick how much it may do:
 
 | Level | The agent may run | Writes files | A command receives values |
 | --- | --- | --- | --- |
@@ -131,37 +43,15 @@ vne copy ../shop-main/.env DATABASE_URL .env   # a secret from another folder
 
 At every level these stay yours: `add --prompt`, `set --prompt`, copying a secret from another folder, `--values`, `format --dry-run`, and the window.
 
-Put this in `AGENTS.md` or `CLAUDE.md`, and delete the levels you don't grant:
+**Tell it.** Paste the [agent rules](#agent-rules) into `AGENTS.md` or `CLAUDE.md`, and delete the levels you don't grant. `vne help` opens with a shorter version, for an agent that reads help first.
 
-```markdown
-## .env files
-
-Use `vne` for env files. Don't open them with file tools, `cat` or `source`.
-
-Look:
-- Before saying a key is missing, run `vne where <KEY> . <other folders with env files>`.
-- Use `vne check <file> --example <example>` and `vne inspect .` to see which keys exist or are missing. They print key names, line numbers and a `valueState` of set, empty or placeholder; `[value withheld by output policy]` is a marker, not a value.
-
-Edit:
-- When I ask for a change, run `create`, `rename`, `rm`, `example` and `copy` yourself, and `add` or `set --stdin` for a value that is not a secret.
-
-Run:
-- Start a command that needs keys with `vne run <file> -- <command>`, and only a command that doesn't print its environment.
-
-Mine:
-- For a secret, give me `vne add <file> <KEY> --prompt` or `vne set <file> <KEY> --prompt` to run in my terminal. Do the same for a `vne copy` of a secret from another folder; vne refuses that copy when you run it.
-- Don't use `--values` or `format --dry-run`; they print values.
-```
-
-`vne help` opens with a shorter version of these rules, for an agent that reads help first.
-
-In Claude Code, add matching rules to `.claude/settings.json` (rule syntax as of Claude Code 2.1.289). At every level, deny the file tools on env files:
+**Block reads of env files.** In Claude Code, add to `.claude/settings.json` (rule syntax as of Claude Code 2.1.289):
 
 ```json
 "deny": ["Read(.env)", "Read(.env.*)", "Read(!.env.example)"]
 ```
 
-Then allow the commands of your level, so they run without asking:
+**Let your level run without asking:**
 
 | Level | Add to `allow` |
 | --- | --- |
@@ -186,6 +76,8 @@ A `Read` deny rule covers Claude Code's file tools and the shell commands it rec
 
 A secrets server moves keys out of files but doesn't change the row by itself. An agent using your login is on vne's row; one holding a token that can't read values, kept away from your files, is on the sandbox row.
 
+vne doesn't encrypt: your `.env` files stay plain text, where your framework expects them. Its secret detection is a heuristic; default output withholds every value regardless, while `--values` and the window rely on it. Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md). Design decisions: [docs/adr](docs/adr).
+
 ### How it was tested
 
 In September 2026, attacker agents got a fake secret and vne's commands, and tried to get the secret out. Six ways out turned up, through `--values` and `copy`; all six are fixed and kept as tests. The 12 attempts on the fixed build found nothing.
@@ -200,7 +92,114 @@ In September 2026, attacker agents got a fake secret and vne's commands, and tri
 
 Removing and renaming keys stay in the CLI. For a duplicated key, the window shows the `vne rm` command that keeps the selected line.
 
-## Output and exit codes
+## Reference
+
+Command details, the rules to give your agent, and what each command prints.
+
+### Commands
+
+The commands below print key names, paths, line numbers and states, not stored values. On a terminal the output is text; piped, which is what an agent sees, it is JSON.
+
+#### Find a key
+
+```sh
+vne where STRIPE_SECRET_KEY . ../shop-main ~/.config/keys
+```
+
+```text
+STRIPE_SECRET_KEY
+  ~/vne-demo/shop/.env.example:4  empty, git untracked
+  ~/vne-demo/keys/stripe.env:1  set, outside git
+```
+
+Run it before telling the user a key is missing. Each match gives the file, the line, `set`, `empty` or `placeholder`, and git status. With no path it searches the current directory; otherwise only the paths you name. Directories are not searched recursively. Exit 0 means found, 1 not found, 2 a file could not be read.
+
+#### See what a project needs
+
+```sh
+vne check .env --example .env.example
+```
+
+```text
+contract: 2 shared, 3 missing, 0 extra, 0 duplicate
+  missing DATABASE_URL
+  missing NEXTAUTH_SECRET
+  missing STRIPE_SECRET_KEY
+```
+
+`check` compares one file with its example and exits 1 when keys are missing, extra or duplicated, so an agent or a script can branch on it. `vne inspect .` covers every env file in the project: the keys in each, overrides between layers, and whether git tracks each file.
+
+#### Change the files
+
+| To | Run | Notes |
+| --- | --- | --- |
+| Start a `.env` | `vne create .env` | Empty and owner-private; never overwrites. |
+| Add a key that is not secret | `vne add .env FEATURE_SEARCH=true` | Refuses a key that already exists. Warns when a secret-looking value arrives as an argument. |
+| Change a value that is not secret | `printf '%s' 4000 \| vne set .env PORT --stdin` | `set` refuses values given as arguments. |
+| Rename a key | `vne rename .env OPENAI_KEY OPENAI_API_KEY` | Value, quotes, comment and line position stay byte-identical. One file per run. |
+| Remove a key | `vne rm .env STALE_FLAG --expect present` | A duplicated key needs `--line N` or `--all`. `--expect` turns a wrong belief about the key into exit 2. |
+| Keep the example in step | `vne example .env` | Adds keys missing from `.env.example` as blanks, never values. |
+| Copy a value between files | `vne copy .env DATABASE_URL apps/web/.env` | The value stays inside vne. Replacing a different value needs `--overwrite`. |
+
+Comments, order, quoting and `export` prefixes around the change stay as they were. A write to a file git tracks prints a warning on stderr.
+
+When its output is not a terminal, as with an agent or a script, `copy` writes a secret-looking value only into a file under the source file's folder, and refuses anything else. To bring a secret from another project, the agent hands you the command; run from your terminal, it copies between projects.
+
+#### Run commands with keys
+
+```sh
+vne run .env -- npm test
+vne run .env -- npx prisma migrate dev
+vne run .env .env.local -- npm run dev
+vne run keys.env -- sh -c 'printf "Authorization: Bearer %s\n" "$API_KEY" | curl -H @- https://api.example.com'
+```
+
+`run` starts one command with the files' keys in its environment. The calling shell does not receive them, and the command can pass them to its own child processes. The last example hands a key to `curl` on stdin, so it never appears in a process list.
+
+- A key defined in two of the files refuses the run rather than picking one. A key from a file replaces an inherited variable of the same name.
+- Files are read as data, not shell code: nothing is expanded or executed. A line that is not an entry, a malformed or repeated entry, or a quoted value with an escape other than `\\` and an escaped quote refuses the run.
+- `env`, `printenv`, and `sh -c` scripts that list the environment are refused. That catches a slip, not a command that wants to print what it receives.
+- The exit status is the command's own. A refusal exits 2; a command that cannot start exits 127 or 126, as a shell would.
+
+This replaces `set -a; source .env`, which puts every key into every later process, where `env`, `ps eww`, or a crash dump can print them. Reasoning: [ADR 0005](docs/adr/0005-run-loads-env-files-into-one-child.md).
+
+#### Hand a secret to you
+
+When a step needs a value the agent should not see, it gives you a command for your own terminal:
+
+```sh
+vne add .env STRIPE_SECRET_KEY --prompt        # new key; what you type is hidden
+vne set .env STRIPE_SECRET_KEY --prompt        # replace an existing value
+vne copy ../shop-main/.env DATABASE_URL .env   # a secret from another folder
+```
+
+`--prompt` needs an interactive terminal. You can also fill values in the window (`vne .`).
+
+### Agent rules
+
+Put this in `AGENTS.md` or `CLAUDE.md`, and delete the levels you don't grant:
+
+```markdown
+## .env files
+
+Use `vne` for env files. Don't open them with file tools, `cat` or `source`.
+
+Look:
+- Before saying a key is missing, run `vne where <KEY> . <other folders with env files>`.
+- Use `vne check <file> --example <example>` and `vne inspect .` to see which keys exist or are missing. They print key names, line numbers and a `valueState` of set, empty or placeholder; `[value withheld by output policy]` is a marker, not a value.
+
+Edit:
+- When I ask for a change, run `create`, `rename`, `rm`, `example` and `copy` yourself, and `add` or `set --stdin` for a value that is not a secret.
+
+Run:
+- Start a command that needs keys with `vne run <file> -- <command>`, and only a command that doesn't print its environment.
+
+Mine:
+- For a secret, give me `vne add <file> <KEY> --prompt` or `vne set <file> <KEY> --prompt` to run in my terminal. Do the same for a `vne copy` of a secret from another folder; vne refuses that copy when you run it.
+- Don't use `--values` or `format --dry-run`; they print values.
+```
+
+### Output and exit codes
 
 - Text on a terminal; JSON when piped, unless `--text`. `--json` is compact, `--pretty` formatted.
 - Each JSON entry's `valueState` is `set`, `empty` or `placeholder` (such as `changeme`). The strings `[value withheld by output policy]` and `[raw content withheld by output policy]` are markers, not values; read `valueState` rather than testing `value`, `displayValue` or `content`.
@@ -208,7 +207,7 @@ Removing and renaming keys stay in the CLI. For a duplicated key, the window sho
 - Exit 0: done, or `check` / `inspect` found nothing to report. Exit 1: `check` or `inspect` found diagnostics or missing, extra or duplicate keys, or `where` did not find the key. Exit 2: an error or a refusal. `run` exits with its command's status.
 - `vne --version` prints the version and the commit the binary was built from.
 
-## What vne understands
+### What vne understands
 
 - **Key meaning.** URL/DSN, secret, public frontend variable, bool, int, port, JSON, PEM, and common provider keys are labelled. A public-prefixed name that looks secret, such as `NEXT_PUBLIC_API_KEY`, is flagged as browser-exposed.
 - **Faithful edits.** One occurrence changes; comments, order, quote style, `export` prefixes, and multiline values around it do not. Tests cover CRLF, UTF-8 BOM, empty values, inline comments, `#` inside values, and the [adversarial corpus](fixtures/adversarial-dotenv).
@@ -219,7 +218,7 @@ Removing and renaming keys stay in the CLI. For a duplicated key, the window sho
 
 Named file reads require a regular UTF-8 file of at most 10 MiB. An explicitly named symlink may point to a regular file. Writes refuse an update that would make the file exceed that limit.
 
-## Privacy
+### What each command shows
 
 | Surface | What it shows |
 | --- | --- |
@@ -232,16 +231,16 @@ Named file reads require a regular UTF-8 file of at most 10 MiB. An explicitly n
 
 Some facts about values do appear. A disposition such as `alreadyPresent` tells the caller that the value it supplied equals the stored one, and `valueState` tells whether a value is empty or a template such as `changeme`.
 
-## What vne does not do
-
-- **Encrypt.** Your `.env` files stay plain text, where your framework expects them.
-- **Sandbox the agent.** Any program the agent runs can open `.env` directly. vne gives a well-behaved agent no reason to; enforcement belongs to your agent's sandbox or the operating system.
-- **Classify perfectly.** Secret detection is a heuristic. Default CLI output withholds every value regardless; `--values` and the window rely on it.
-- **Keep `run`'s command quiet.** The command receives the values and can print them.
-
-Threat model and release checklist: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md). Design decisions: [docs/adr](docs/adr).
-
 ## Development
+
+Build from source with Rust 1.90 or newer, Node matching `^20.19.0 || >=22.12.0` (the engine range for Vite 8.2.2), and the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/):
+
+```sh
+npm install
+npm run install:local
+```
+
+Use `install:local` rather than plain `cargo install --path src-tauri`: Tauri release binaries need the `custom-protocol` feature to load the bundled interface, and the script sets it.
 
 ```sh
 npm run dev          # browser preview on fake data (127.0.0.1:1420)
