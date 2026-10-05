@@ -1,6 +1,13 @@
-# vne
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/vne-wordmark-dark.svg">
+    <img alt="vne" src="docs/assets/vne-wordmark-light.svg" height="60">
+  </picture>
+</h1>
 
 Let your coding agent work on `.env` files without reading them.
+
+![An agent finds a deploy token, calls an API and runs benchmarks with keys it never sees, then hands its owner two commands for the missing secrets](docs/assets/vne-demo.gif)
 
 A coding agent that reads `.env` sends every value in it to the model. Block the file and the agent can't tell which keys exist, so it asks you to open the file and move keys around by hand.
 
