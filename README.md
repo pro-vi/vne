@@ -175,18 +175,16 @@ A `Read` deny rule covers Claude Code's file tools and the shell commands it rec
 
 ## How much this protects
 
-| | Setup | The agent | A value reaches the model when | Your work |
-| --- | --- | --- | --- | --- |
-| 1 | Nothing | Reads `.env` and does everything | Always | None |
-| 2 | A deny rule or hook | Can't see which keys exist | It runs a program that opens the file itself | Open `.env` in an editor, copy keys between files, tell the agent where each key is, set variables before it runs a command |
-| **3** | **A deny rule, and vne** | **Finds, checks, copies and runs keys without opening the file** | **It, or text that tricked it, makes a command print a key** | **Type a secret when it asks; run a copy between folders; approve a `vne run` you haven't allowed** |
-| 4 | The agent in a sandbox without your keys | Can't use real keys | Never: the keys aren't there | Set up the sandbox; run whatever needs real keys yourself |
+**vne takes the env work off you and narrows accidental leaks to commands that print a key. It does not stop an agent that sets out to read a value, including one following instructions it found in a file or a web page. Only a sandbox does that.**
 
-Rungs 2 and 3 are equally strong against an agent that sets out to read a value, including one following instructions it found in a file or a web page. vne doesn't make the block stronger. It lets the agent do its work without getting past the block, and takes the hand work off you. Only rung 4 is a wall.
+| Setup | Accidental leaks | An agent that tries | Who does the env work |
+| --- | --- | --- | --- |
+| Nothing | 🔴 Every time it reads `.env` | 🔴 Reads anything | 🟢 The agent, seeing every value |
+| Deny rule or hook | 🟡 When it prints an environment you loaded keys into | 🔴 Gets in: any program can open the file | 🔴 You, by hand |
+| Deny rule and vne | 🟡 When a command it starts prints a key | 🔴 Gets in the same way, or through a command `vne run` starts | 🟢 The agent, without seeing values |
+| Agent in a sandbox without your keys | 🟢 None | 🟢 Finds nothing: the keys aren't there | 🔴 You, for anything that needs real keys |
 
-`vne run` is where rung 3 is thinnest: even a command you allowed, such as `npm test`, runs code the agent may have edited.
-
-A secrets server moves keys out of files but doesn't change the rung by itself. An agent using your login is on rung 3. An agent holding a token that can't read values, and kept away from your files, is on rung 4, at rung 4's cost.
+A secrets server moves keys out of files but doesn't change the row by itself. An agent using your login is on vne's row; one holding a token that can't read values, kept away from your files, is on the sandbox row.
 
 ### How it was tested
 
