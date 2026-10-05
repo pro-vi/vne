@@ -5,13 +5,13 @@
   </picture>
 </h1>
 
-Let your coding agent work on `.env` files without reading them.
+vne lets your coding agent work on `.env` files without reading them.
 
 ![An agent finds a deploy token, calls an API and runs benchmarks with keys it never sees, then hands its owner two commands for the missing secrets](docs/assets/vne-demo.gif)
 
-A coding agent that reads `.env` sends every value in it to the model. Block the file and the agent can't tell which keys exist, so it asks you to open the file and move keys around by hand.
+**Without vne** you pick one of two. Let the agent read `.env`, and every value in it goes to the model. Or block it with a [deny rule or a hook](#pick-how-much-your-agent-may-do), and become its hands: you open `.env` in an editor, copy keys between files, tell it which file holds a key, and set variables before it runs a command.
 
-vne does the env-file work for the agent. It answers with key names, file paths, line numbers and whether each value is set, and it starts commands with the keys loaded. When a step needs a secret typed in, the agent gives you one command to run.
+**With vne** the block stays on and the agent does that work itself. vne answers it with key names, file paths, line numbers and whether each value is set, and keeps secret values out of its answers. It comes back to you only when a secret has to be typed in or moved to another folder, and then it gives you one command to run.
 
 ```sh
 vne where STRIPE_SECRET_KEY . ~/.config/keys   # which file holds it, and is it set
