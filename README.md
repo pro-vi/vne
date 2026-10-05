@@ -175,14 +175,14 @@ A `Read` deny rule covers Claude Code's file tools and the shell commands it rec
 
 ## How much this protects
 
-**vne takes the env work off you and narrows accidental leaks to commands that print a key. It does not stop an agent that sets out to read a value, including one following instructions it found in a file or a web page. Only a sandbox does that.**
+**vne takes the env work off you and narrows accidental leaks to commands that print a key. It does not stop an agent that sets out to read a value, including one following instructions it found in a file or a web page. Only a sandbox does that, and only for the keys you keep out of it.**
 
-| Setup | Accidental leaks | An agent that tries | Who does the env work |
-| --- | --- | --- | --- |
-| Nothing | 🔴 Every time it reads `.env` | 🔴 Reads anything | 🟢 The agent, seeing every value |
-| Deny rule or hook | 🟡 When it prints an environment you loaded keys into | 🔴 Gets in: any program can open the file | 🔴 You, by hand |
-| Deny rule and vne | 🟡 When a command it starts prints a key | 🔴 Gets in the same way, or through a command `vne run` starts | 🟢 The agent, without seeing values |
-| Agent in a sandbox without your keys | 🟢 None | 🟢 Finds nothing: the keys aren't there | 🔴 You, for anything that needs real keys |
+| Setup | Accidental leaks | Agent that tries | Env work | For you |
+| --- | --- | --- | --- | --- |
+| Nothing | 🔴 Every read | 🔴 Reads all | 🟢 Agent | 🟢 No setup |
+| Deny rule | 🟡 Env dumps | 🔴 Any program | 🔴 You | 🔴 Asked per key |
+| Deny rule + vne | 🟡 Printed keys | 🔴 Same, or `vne run` | 🟢 Agent | 🟢 Asked for secrets |
+| Sandbox | 🟢 Test keys only | 🟢 Test keys only | 🔴 Two key sets | 🔴 Build and sync |
 
 A secrets server moves keys out of files but doesn't change the row by itself. An agent using your login is on vne's row; one holding a token that can't read values, kept away from your files, is on the sandbox row.
 
