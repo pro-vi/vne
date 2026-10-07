@@ -7,7 +7,7 @@
 
 vne lets your coding agent work on `.env` files without reading them.
 
-![An agent finds a deploy token, calls an API and runs benchmarks with keys it never sees, then hands its owner two commands for the missing secrets](docs/assets/vne-demo.gif)
+![An agent finds a Render API key and runs the Render CLI with it without seeing the value. It then finds two keys missing from .env. vne refuses to let it copy one from another folder, so it hands its owner two commands: that copy, and one that prompts for a new secret. With both added, it runs the tests.](docs/assets/vne-demo.gif)
 
 **Without vne** you pick one of two. Let the agent read `.env`, and every value in it goes to the model. Or block it with a [deny rule or a hook](#set-up-your-agent), and become its hands: you open `.env` in an editor, copy keys between files, tell it which file holds a key, and set variables before it runs a command.
 
