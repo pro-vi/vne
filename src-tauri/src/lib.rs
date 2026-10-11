@@ -708,7 +708,7 @@ impl EnvKeyRemoveError {
                 line_number_label(line_numbers)
             ),
             Self::Malformed { line_number } => format!(
-                "`{key}` has a malformed value at line {line_number}; its extent is unclear, so vne will not remove it"
+                "`{key}` has a malformed value at line {line_number}; vne will not remove it"
             ),
             Self::StaleSelector {
                 line_number,
@@ -2206,7 +2206,7 @@ fn set_env_key_content(
             line_number: entry.line_number,
         });
     }
-    if entry.value == value {
+    if runtime_value(entry).as_deref() == Some(value) {
         return Ok((content.to_string(), EnvKeySetDisposition::AlreadyPresent));
     }
 
@@ -3351,7 +3351,11 @@ fn parse_env_entry_at(content: &str, line_start: usize, line_number: usize) -> O
             next_start = if found {
                 let comment_end = current_line_body_end(content, cursor);
                 if cursor < comment_end {
-                    comment = extract_inline_comment(&content[cursor + 1..comment_end]);
+                    let suffix = &content[cursor + 1..comment_end];
+                    comment = extract_inline_comment(suffix);
+                    if comment.is_none() && !suffix.trim_matches([' ', '\t']).is_empty() {
+                        diagnostic = Some("unexpected text after closing quote".to_string());
+                    }
                 }
                 next_line_start(content, cursor)
             } else {
@@ -5352,13 +5356,34 @@ mod tests {
     }
 
     #[test]
-    fn set_reports_an_identical_parsed_value_without_rewriting_content() {
-        let content = "TOKEN='same' # keep\n";
+    fn set_compares_literal_values_and_preserves_identical_input() {
+        use EnvKeySetDisposition::{AlreadyPresent, Updated};
 
-        let (unchanged, disposition) = set_env_key_content(content, "TOKEN", "same").unwrap();
-
-        assert_eq!(disposition, EnvKeySetDisposition::AlreadyPresent);
-        assert_eq!(unchanged, content);
+        let cases = [
+            ("TOKEN='same' # keep\n", "same", AlreadyPresent),
+            ("TOKEN=\n", "", AlreadyPresent),
+            ("TOKEN=\"a\\\\b\"\n", r"a\\b", Updated),
+            ("TOKEN=\"a\\\\b\"\n", r"a\b", AlreadyPresent),
+            ("TOKEN=\"a\\\"b\"\n", r#"a\"b"#, Updated),
+            ("TOKEN=\"a\\\"b\"\n", "a\"b", AlreadyPresent),
+            ("TOKEN='a\\'b'\n", r"a\'b", Updated),
+            ("TOKEN='a\\'b'\n", "a'b", AlreadyPresent),
+            ("TOKEN=\"a\\nb\"\n", r"a\nb", Updated),
+        ];
+        for (content, value, expected) in cases {
+            let (updated, disposition) = set_env_key_content(content, "TOKEN", value).unwrap();
+            assert_eq!(disposition, expected, "{content:?}");
+            assert_eq!(
+                runtime_pairs(&updated).unwrap(),
+                vec![("TOKEN".to_string(), value.to_string())],
+            );
+            if expected == AlreadyPresent {
+                assert_eq!(updated, content);
+            }
+            let (retry, retried) = set_env_key_content(&updated, "TOKEN", value).unwrap();
+            assert_eq!(retried, AlreadyPresent);
+            assert_eq!(retry, updated);
+        }
     }
 
     fn runtime_pairs(content: &str) -> Result<Vec<(String, String)>, RuntimeEnvError> {
@@ -5371,7 +5396,7 @@ mod tests {
 
     #[test]
     fn runtime_values_are_literal_and_read_only_the_writers_escapes() {
-        let content = "\u{feff}# keys\n\nexport PLAIN=a$HOME\\b # note\nDOUBLE=\"say \\\"hi\\\" \\\\ $(id)\"\nSINGLE='it\\'s'\nMULTI=\"one\ntwo\"\n";
+        let content = "\u{feff}# keys\n\nexport PLAIN=a$HOME\\b # note\nDOUBLE=\"say \\\"hi\\\" \\\\ $(id)\"\t # note\r\nSINGLE='it\\'s'# note\nMULTI=\"one\ntwo\" \t";
 
         assert_eq!(
             runtime_pairs(content).unwrap(),
@@ -5423,6 +5448,11 @@ mod tests {
                 "`TOKEN` at keys.env line 1 is malformed",
             ),
             ("TOKEN=a\0b\n", "holds a NUL byte"),
+            ("TOKEN=\"head\"tail\n", "`TOKEN` at keys.env line 1 is malformed"),
+            ("TOKEN='head' tail\n", "`TOKEN` at keys.env line 1 is malformed"),
+            ("TOKEN=\"head\"'tail'\n", "`TOKEN` at keys.env line 1 is malformed"),
+            ("TOKEN=\"head\"tail # note\n", "`TOKEN` at keys.env line 1 is malformed"),
+            ("# keys\nTOKEN=\"one\ntwo\"tail\nNEXT=okay\n", "`TOKEN` at keys.env line 2 is malformed"),
         ];
         for (content, expected) in cases {
             let message = runtime_pairs(content).unwrap_err().message();
@@ -5745,7 +5775,7 @@ mod tests {
         );
         assert_eq!(
             EnvKeyRemoveError::Malformed { line_number: 3 }.message("TOKEN"),
-            "`TOKEN` has a malformed value at line 3; its extent is unclear, so vne will not remove it"
+            "`TOKEN` has a malformed value at line 3; vne will not remove it"
         );
         assert_eq!(
             EnvKeyRemoveError::StaleSelector {

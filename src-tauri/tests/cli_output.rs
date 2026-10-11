@@ -2543,11 +2543,17 @@ fn run_refusals_start_nothing_and_name_no_value() {
     write(&sourced, &format!("set -a\nRUN_KEY={RUN_SENTINEL}\n"));
     let escaped = dir.path().join("escaped.env");
     write(&escaped, &format!("RUN_KEY=\"{RUN_SENTINEL}\\n\"\n"));
+    let trailing = dir.path().join("trailing.env");
+    write(&trailing, &format!("RUN_KEY=\"{RUN_SENTINEL}\"trailing\n"));
     let marker = dir.path().join("started");
     let marker = marker.to_str().unwrap();
     let touch = ["sh", "-c", r#": > "$1""#, "sh", marker];
+    let valid = run_vne_run(&[&keys], &touch);
+    assert_eq!(valid.status.code(), Some(0));
+    assert!(Path::new(marker).exists());
+    fs::remove_file(marker).unwrap();
 
-    let cases: [(Vec<&Path>, &[&str], &str); 5] = [
+    let cases: [(Vec<&Path>, &[&str], &str); 6] = [
         (vec![&keys], &["env"], "run refuses `env`"),
         (
             vec![&keys],
@@ -2557,6 +2563,7 @@ fn run_refusals_start_nothing_and_name_no_value() {
         (vec![&keys, &clash], &touch, "`RUN_KEY` is defined in both"),
         (vec![&sourced], &touch, "line 1 is not a KEY=value entry"),
         (vec![&escaped], &touch, "uses a backslash escape"),
+        (vec![&trailing], &touch, "line 1 is malformed"),
     ];
     for (files, command, expected) in cases {
         let output = run_vne_run(&files, command);
