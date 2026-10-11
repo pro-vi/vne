@@ -31,7 +31,7 @@ brew install pro-vi/de/vne
 
 macOS on Apple Silicon, with the window. Use the full name: as of Homebrew 7.0, installing a formula by its full name trusts it, and Homebrew ignores formulae from a third-party tap it has not been told to trust.
 
-**Linux, arm64 or x86_64, CLI only.** There is no prebuilt Linux binary yet. With a Rust toolchain installed:
+**Linux, arm64 or x86_64, CLI only.** There is no prebuilt Linux binary yet. With Rust 1.90 or newer:
 
 ```sh
 cargo install --git https://github.com/pro-vi/vne --locked --no-default-features --bin vne
