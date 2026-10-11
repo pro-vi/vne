@@ -9,22 +9,24 @@ rust-version = "1.90"
 default-run = "vne"
 
 [features]
-custom-protocol = ["tauri/custom-protocol"]
+default = ["desktop"]
+desktop = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:tauri-plugin-webdriver", "dep:tauri-build"]
+custom-protocol = ["desktop", "tauri/custom-protocol"]
 
 [lib]
 name = "vne_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.5.1", features = [] }
+tauri-build = { version = "2.5.1", features = [], optional = true }
 
 [dependencies]
 base64 = "0.22.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-tauri = { version = "2.11.2", features = [] }
-tauri-plugin-dialog = "2.7.1"
-tauri-plugin-webdriver = "0.2"
+tauri = { version = "2.11.2", features = [], optional = true }
+tauri-plugin-dialog = { version = "2.7.1", optional = true }
+tauri-plugin-webdriver = { version = "0.2", optional = true }
 xattr = "1"
 tempfile = "3.27.0"
 
@@ -36,7 +38,7 @@ rustix = { version = "1.1.4", features = ["fs"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2.186"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSString", "NSEnumerator"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2 = "0.6.4"

@@ -38,6 +38,6 @@ Env files named by `package.json` or Compose can sit in many directories, and ea
 
 ## public-release
 
-The repository is public at [pro-vi/vne](https://github.com/pro-vi/vne), with source-only distribution under MIT. macOS on Apple Silicon is documented as the tested platform.
+The repository is public at [pro-vi/vne](https://github.com/pro-vi/vne), with source-only distribution under MIT. macOS on Apple Silicon is documented as the tested platform. The Linux CLI build is described in ADR 0007.
 
 The initial public source is [260a3a6](https://github.com/pro-vi/vne/commit/260a3a6fe3f58a09001eb929e11ac9d9524c5f83). An anonymous clone verified the reviewed source tree and preserved commit dates. Private working records are excluded from the public history.

@@ -3189,3 +3189,16 @@ fn present_reference_after_discovery_limit_is_reported_incomplete() {
     assert_eq!(snapshot["incomplete"][0]["name"], "deploy/runtime.env");
     assert_eq!(snapshot["incomplete"][0]["reason"], "count-limit");
 }
+
+/// A build without the `desktop` feature has no window. `vne .` must say so and
+/// exit 2, not hang or panic. Every other test in this file already runs on
+/// that build, so the CLI is covered there.
+#[test]
+#[cfg(not(feature = "desktop"))]
+fn build_without_desktop_feature_says_it_has_no_window() {
+    let output = run_vne(["."]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("this build has no window"), "{stderr}");
+}

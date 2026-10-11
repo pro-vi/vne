@@ -8,4 +8,6 @@ npm run check
 npm run build
 npm run test
 npm run test:rust
+npm run test:cli-only
+scripts/check-cli-only.sh
 scripts/security-check.sh

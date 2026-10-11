@@ -869,9 +869,11 @@ enum KnownKeyProfile {
     Public(&'static str),
 }
 
+#[cfg(feature = "desktop")]
 #[derive(Clone)]
 struct InitialProjectPath(Option<String>);
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn initial_project_path(path: tauri::State<'_, InitialProjectPath>) -> Option<String> {
     path.0.clone()
@@ -916,6 +918,7 @@ pub fn load_project_authorized(root: Option<&Path>) -> Result<ProjectSnapshot, S
         .map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn load_project(root_state: tauri::State<'_, AuthorizedRoot>) -> Result<ProjectSnapshot, String> {
     load_project_authorized(root_state.0.lock().unwrap().as_deref())
@@ -924,6 +927,7 @@ fn load_project(root_state: tauri::State<'_, AuthorizedRoot>) -> Result<ProjectS
 /// Backend-owned re-anchor (VNE-SEC-001 remediation): the folder dialog
 /// runs NATIVELY and hands the selected path straight into Rust state —
 /// the webview never names a path. Returns the new root for display.
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn choose_authorized_root(
     root_state: tauri::State<'_, AuthorizedRoot>,
@@ -968,6 +972,7 @@ pub fn reveal_env_value_authorized(
     entry_at_authorized(root, identifier, key, line_number).map(|entry| entry.value)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn reveal_env_value(
     root_state: tauri::State<'_, AuthorizedRoot>,
@@ -997,6 +1002,7 @@ pub fn save_env_value_authorized(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn save_env_value(
     root_state: tauri::State<'_, AuthorizedRoot>,
@@ -1026,6 +1032,7 @@ pub fn add_env_key_authorized(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn add_env_key(
     root_state: tauri::State<'_, AuthorizedRoot>,
@@ -1044,6 +1051,7 @@ pub fn ensure_env_file_authorized(
     ensure_project_env_file(root, name).map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn ensure_env_file(
     root_state: tauri::State<'_, AuthorizedRoot>,
@@ -1085,6 +1093,7 @@ pub fn create_env_from_example_authorized(root: Option<&Path>) -> Result<Project
         .map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn create_env_from_example(root_state: tauri::State<'_, AuthorizedRoot>) -> Result<ProjectSnapshot, String> {
     create_env_from_example_authorized(root_state.0.lock().unwrap().as_deref())
@@ -1114,6 +1123,7 @@ pub struct ClipboardCopyOutcome {
 
 /// Sent when a concealed copy's time is up; `cleared` is false when the
 /// clipboard no longer held the value.
+#[cfg(feature = "desktop")]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConcealedCopyExpired {
@@ -1124,6 +1134,7 @@ struct ConcealedCopyExpired {
 /// The value goes from the file to the pasteboard and never reaches the
 /// webview; the window learns only the key and when it will be cleared.
 #[cfg(target_os = "macos")]
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn copy_env_value(
     app: tauri::AppHandle,
@@ -1164,14 +1175,17 @@ fn copy_env_value(
 }
 
 #[cfg(not(target_os = "macos"))]
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn copy_env_value(path: String, key: String, line_number: usize) -> Result<ClipboardCopyOutcome, String> {
     let _ = (path, key, line_number);
     Err("copying is available on macOS only".into())
 }
 
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 
+#[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     run_with_initial_project_path(None);
@@ -1184,6 +1198,7 @@ pub fn run() {
 /// A signal already ignored (as under `nohup`) stays ignored, and child
 /// processes start with the default handling because exec resets handlers.
 #[cfg(target_os = "macos")]
+#[cfg(feature = "desktop")]
 fn exit_on_termination_signals() -> std::sync::mpsc::Sender<tauri::AppHandle> {
     use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -1240,6 +1255,7 @@ fn exit_on_termination_signals() -> std::sync::mpsc::Sender<tauri::AppHandle> {
     sender
 }
 
+#[cfg(feature = "desktop")]
 pub fn run_with_initial_project_path(initial_path: Option<String>) {
     let builder = tauri::Builder::default()
         .manage(InitialProjectPath(initial_path.clone()))

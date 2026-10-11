@@ -12,6 +12,8 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:cli-only": "cargo test --manifest-path src-tauri/Cargo.toml --no-default-features",
+    "install:cli": "cargo install --path src-tauri --bin vne --locked --force --no-default-features",
     "tauri": "tauri"
   },
   "dependencies": {

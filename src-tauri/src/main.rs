@@ -11,6 +11,11 @@ fn main() -> ExitCode {
         return vne_lib::cli::run_from_args(args);
     }
 
+    desktop_main(&args)
+}
+
+#[cfg(feature = "desktop")]
+fn desktop_main(args: &[String]) -> ExitCode {
     if !desktop_assets_available(cfg!(debug_assertions), tauri::is_dev()) {
         let _ = print_desktop_usage_error(
             "this release was installed without bundled desktop assets; run `npm run install:local` from the vne project",
@@ -18,7 +23,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    match desktop_project_path(&args) {
+    match desktop_project_path(args) {
         Ok(initial_project_path) => {
             vne_lib::run_with_initial_project_path(initial_project_path);
             ExitCode::SUCCESS
@@ -28,6 +33,17 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+#[cfg(not(feature = "desktop"))]
+fn desktop_main(args: &[String]) -> ExitCode {
+    // Bad arguments get the same answer as in a build with a window; good ones get the reason there is no window.
+    let message = match desktop_project_path(args) {
+        Err(error) => error,
+        Ok(_) => "this build has no window (built without the `desktop` feature)".to_string(),
+    };
+    let _ = print_desktop_usage_error(&message);
+    ExitCode::from(2)
 }
 
 fn print_desktop_usage_error(error: &str) -> io::Result<()> {
@@ -78,6 +94,7 @@ fn project_path_for(arg: &str) -> Result<String, String> {
     Ok(project_path.to_string_lossy().to_string())
 }
 
+#[cfg(feature = "desktop")]
 fn desktop_assets_available(debug_build: bool, tauri_dev_mode: bool) -> bool {
     debug_build || !tauri_dev_mode
 }
@@ -124,6 +141,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "desktop")]
     #[test]
     fn desktop_release_requires_embedded_assets() {
         assert!(!desktop_assets_available(false, true));

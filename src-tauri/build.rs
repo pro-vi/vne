@@ -3,7 +3,8 @@ use std::process::Command;
 
 fn main() {
     record_git_commit();
-    tauri_build::build()
+    #[cfg(feature = "desktop")]
+    tauri_build::build();
 }
 
 /// Bakes the commit this binary was built from into `vne --version`, marked

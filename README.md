@@ -29,7 +29,17 @@ vne add .env OPENAI_API_KEY --prompt          # for you: type the secret, hidden
 brew install pro-vi/de/vne
 ```
 
-macOS on Apple Silicon. Use the full name: as of Homebrew 7.0, installing a formula by its full name trusts it, and Homebrew ignores formulae from a third-party tap it has not been told to trust. Other platforms [build from source](#development).
+macOS on Apple Silicon, with the window. Use the full name: as of Homebrew 7.0, installing a formula by its full name trusts it, and Homebrew ignores formulae from a third-party tap it has not been told to trust.
+
+**Linux, arm64 or x86_64, CLI only.** There is no prebuilt Linux binary yet. With a Rust toolchain installed:
+
+```sh
+cargo install --git https://github.com/pro-vi/vne --locked --no-default-features --bin vne
+```
+
+This build needs no GTK, WebKit or Node. It has every command except the window: `vne .` and ⌘C copy are macOS-only. To build from a checkout instead, see [Development](#development).
+
+Other platforms are unverified.
 
 ## Set up your agent
 
@@ -242,6 +252,14 @@ npm run install:local
 
 Use `install:local` rather than plain `cargo install --path src-tauri`: Tauri release binaries need the `custom-protocol` feature to load the bundled interface, and the script sets it.
 
+For the CLI alone, with no window, no Node and no Tauri prerequisites (this is the build Linux uses):
+
+```sh
+cargo install --path src-tauri --bin vne --locked --no-default-features
+```
+
+The window and Tauri sit behind the `desktop` feature, which is on by default. `npm run test:cli-only` runs the tests without it, and `scripts/check-cli-only.sh` fails if the window's dependencies leak into the CLI-only build.
+
 ```sh
 npm run dev          # browser preview on fake data (127.0.0.1:1420)
 npm run tauri dev    # desktop app
@@ -262,7 +280,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- inspect fixtures/dem
 
 ## Status
 
-Version 0.1.1, pre-release. Prebuilt for macOS on Apple Silicon, where native behavior is tested. Other platforms build from source and are unverified.
+Version 0.1.1, pre-release. Prebuilt for macOS on Apple Silicon, where native behavior is tested. The CLI also builds without the window on Linux, from source: tested on Ubuntu 24.04 on arm64, and an x86_64 build was run only under emulation. Windows and Intel Macs are unverified.
 
 ## License
 
