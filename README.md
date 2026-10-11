@@ -262,7 +262,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin vne -- inspect fixtures/dem
 
 ## Status
 
-Version 0.1.0, pre-release. Prebuilt for macOS on Apple Silicon, where native behavior is tested. Other platforms build from source and are unverified.
+Version 0.1.1, pre-release. Prebuilt for macOS on Apple Silicon, where native behavior is tested. Other platforms build from source and are unverified.
 
 ## License
 

@@ -1,6 +1,6 @@
 [package]
 name = "vne"
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT"
 description = "A .env CLI for coding agents that keeps stored values out of its default output"
 authors = ["vne contributors"]
