@@ -16,6 +16,7 @@ Checkbox marks a lane consumed (plan written, or direct commit landed).
 - [x] **public-release** — the GitHub repository is public with MIT-licensed source · verdict: direct
 - [x] **git-status-batching** — scans run one or two git listings per directory instead of up to three commands per file · verdict: direct · origin: /gate review of the `where` latency fix, 2026-10-02
 - [ ] **git-status-per-repository** — scans ask git once per repository instead of once per directory holding env files · verdict: direct · origin: /gate review of commit [5a36983](https://github.com/pro-vi/vne/commit/5a3698360f8e95b86d48622d65d208cbe3e0157c), 2026-10-02
+- [ ] **linux-ci** — every push builds the CLI without the window and runs its tests on Linux x86_64 and arm64 · verdict: pending · origin: launch-day check by hand, 2026-10-12
 
 ## agent-contract-docs
 
@@ -35,6 +36,12 @@ Env files named by `package.json` or Compose can sit in many directories, and ea
 
 - Needs a check for a nested repository between a file's directory and the top, so its files are asked in their own repository.
 - Done when `inspect` over env files in 50 directories of one repository takes under 200 ms.
+
+## linux-ci
+
+The repository has no CI. The Linux install line in the README was checked by hand on 2026-10-11: `cargo install --git https://github.com/pro-vi/vne --locked --no-default-features --bin vne` installed on macOS and on Ubuntu 24.04 arm64, `vne --version` printed, and `vne .` exited 2 with "this build has no window". x86_64 hardware was not checked. A later push can break that line without anyone noticing.
+
+- Done when a push that breaks the install line above, or the CLI-only tests (`npm run test:cli-only`), turns a check red on Linux before anyone installs it.
 
 ## public-release
 
