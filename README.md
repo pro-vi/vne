@@ -5,7 +5,7 @@
   </picture>
 </h1>
 
-vne lets your coding agent work on `.env` files without reading them.
+vne lets your coding agent work on `.env` files it is blocked from reading.
 
 ![An agent finds a Render API key and runs the Render CLI with it without seeing the value. It then finds two keys missing from .env. vne refuses to let it copy one from another folder, so it hands its owner two commands: that copy, and one that prompts for a new secret. With both added, it runs the tests.](docs/assets/vne-demo.gif)
 
@@ -14,11 +14,11 @@ vne lets your coding agent work on `.env` files without reading them.
 **With vne** the block stays on and the agent does that work itself. vne answers it with key names, file paths, line numbers and whether each value is set, and keeps secret values out of its answers. It comes back to you only when a secret has to be typed in or moved to another folder, and then it gives you one command to run.
 
 ```sh
-vne where STRIPE_SECRET_KEY . ~/.config/keys   # which file holds it, and is it set
-vne check .env --example .env.example         # which keys are missing
-vne copy .env DATABASE_URL apps/web/.env      # move a value; prints a receipt, not the value
-vne run .env -- npm test                      # start one command with the keys loaded
-vne add .env OPENAI_API_KEY --prompt          # for you: type the secret, hidden
+vne where STRIPE_SECRET_KEY . ~/.config/keys   # which file; set or empty
+vne check .env --example .env.example          # which keys are missing
+vne copy .env DATABASE_URL apps/web/.env       # move a key; no value shown
+vne run .env -- npm test                       # one command, keys loaded
+vne add .env OPENAI_API_KEY --prompt           # for you: type it, hidden
 ```
 
 `vne .` opens a small macOS window for when you want to look yourself: hold ⌥ to see a value, ⌘C to copy one, ⏎ to fill the empty ones.
@@ -34,7 +34,8 @@ macOS on Apple Silicon, with the window. Use the full name: as of Homebrew 7.0, 
 **Linux, arm64 or x86_64, CLI only.** There is no prebuilt Linux binary yet. With Rust 1.90 or newer:
 
 ```sh
-cargo install --git https://github.com/pro-vi/vne --locked --no-default-features --bin vne
+cargo install --git https://github.com/pro-vi/vne \
+  --locked --no-default-features --bin vne
 ```
 
 This build needs no GTK, WebKit or Node. It has every command except the window: `vne .` and ⌘C copy are macOS-only. To build from a checkout instead, see [Development](#development).
