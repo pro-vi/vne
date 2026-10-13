@@ -52,7 +52,7 @@ require "json"
 require "shellwords"
 
 class Vne < Formula
-  desc "Let your coding agent work on .env files without reading them"
+  desc "Let your coding agent work on .env files it is blocked from reading"
   homepage "https://github.com/pro-vi/vne"
   url "https://github.com/pro-vi/vne/releases/download/$tag/$name.tar.gz"
   sha256 "$sha"
