@@ -1,9 +1,9 @@
 # Backlog
 
-Lanes awaiting triage. Verdicts: architect | direct | drop | defer | pending.
-Checkbox marks a lane consumed (plan written, or direct commit landed).
+Tickets awaiting triage. Verdicts: architect | direct | drop | defer | pending.
+Checkbox marks a ticket consumed (plan written, or direct commit landed).
 
-## Lanes
+## Tickets
 
 - [x] **entry-value-state** — every JSON entry says whether its key is set, empty, or a placeholder, in default and `--values` output · verdict: direct
 - [x] **version-flag** — `vne --version` prints the crate version and the commit the binary was built from · verdict: direct
